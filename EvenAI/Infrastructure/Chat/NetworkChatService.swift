@@ -129,7 +129,11 @@ actor NetworkChatService: ChatServicing {
     }
 
     private func post(_ path: String, body: Data) async throws -> Data {
-        try await send(path: path, method: "POST", body: body)
+        // Not retried: POST /api/chats creates a new resource each time
+        // it succeeds. Retrying it risks creating a duplicate chat if the
+        // first attempt actually reached the server but the client timed
+        // out before seeing the response.
+        try await send(path: path, method: "POST", body: body, retryAttempts: 1)
     }
 
     private func patch(_ path: String, body: Data) async throws -> Data {
@@ -141,7 +145,7 @@ actor NetworkChatService: ChatServicing {
         try await send(path: path, method: "DELETE", body: nil)
     }
 
-    private func send(path: String, method: String, body: Data?) async throws -> Data {
+    private func send(path: String, method: String, body: Data?, retryAttempts: Int = 2) async throws -> Data {
         var mutableRequest = URLRequest(url: baseURL.appending(path: path))
         mutableRequest.httpMethod = method
         if let body {
@@ -150,7 +154,7 @@ actor NetworkChatService: ChatServicing {
         }
         let request = mutableRequest
 
-        let (data, response) = try await withRetry {
+        let (data, response) = try await withRetry(attempts: retryAttempts) {
             try await session.data(for: request)
         }
         try Self.validate(response)

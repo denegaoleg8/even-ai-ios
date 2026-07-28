@@ -37,6 +37,47 @@ actor EmptyChatService: ChatServicing {
     }
 }
 
+/// Everything succeeds except `deleteChat`, which always fails — used to
+/// verify a failed delete doesn't remove the chat from local state.
+actor DeleteFailingChatService: ChatServicing {
+    struct Failure: Error, Sendable {}
+
+    func fetchChats() async throws -> [Chat] { [] }
+    func fetchChat(id: Chat.ID) async throws -> Chat { Chat(id: id) }
+    func createChat(title: String) async throws -> Chat { Chat(title: title) }
+    func renameChat(id: Chat.ID, title: String) async throws -> Chat { Chat(id: id, title: title) }
+    func deleteChat(id: Chat.ID) async throws { throw Failure() }
+    func fetchMessages(chatID: Chat.ID) async throws -> [Message] { [] }
+
+    nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
+}
+
+/// Counts `createChat` calls and adds latency, so a test can verify a
+/// reentrancy guard actually prevents two concurrent calls from both
+/// succeeding.
+actor CountingCreateChatService: ChatServicing {
+    private(set) var createCallCount = 0
+
+    func fetchChats() async throws -> [Chat] { [] }
+    func fetchChat(id: Chat.ID) async throws -> Chat { Chat(id: id) }
+
+    func createChat(title: String) async throws -> Chat {
+        createCallCount += 1
+        try? await Task.sleep(for: .milliseconds(50))
+        return Chat(title: title)
+    }
+
+    func renameChat(id: Chat.ID, title: String) async throws -> Chat { Chat(id: id, title: title) }
+    func deleteChat(id: Chat.ID) async throws {}
+    func fetchMessages(chatID: Chat.ID) async throws -> [Message] { [] }
+
+    nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
+}
+
 /// Streams a user message and one delta, then the connection drops before
 /// the reply finishes — simulates a mid-stream network failure.
 actor PartialStreamThenFailChatService: ChatServicing {

@@ -3,8 +3,8 @@ import SwiftData
 
 /// Mock chat service backed by real SwiftData persistence, so conversations
 /// and messages survive app relaunch, but AI replies are canned/simulated
-/// rather than calling a real backend. Replaced by a real networked
-/// implementation once the backend integration phase begins.
+/// rather than calling a real backend. Used by tests and previews;
+/// `NetworkChatService` is what the running app actually talks to.
 actor MockChatService: ChatServicing {
     private let modelContainer: ModelContainer
 

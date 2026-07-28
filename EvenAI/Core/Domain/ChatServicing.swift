@@ -1,10 +1,10 @@
 import Foundation
 
-/// Abstraction over chat persistence/networking. `MockChatService` is a
-/// SwiftData-backed placeholder that simulates streaming AI replies;
-/// replaced by a real networked implementation once the backend
-/// integration phase begins (see the Even AI API specification's
-/// `/api/chats` and `/api/chat/stream` endpoints).
+/// Abstraction over chat persistence/networking. `NetworkChatService` is the
+/// live implementation, talking to the real backend (see the Even AI API
+/// specification's `/api/chats` and `/api/chat/stream` endpoints);
+/// `MockChatService` is a SwiftData-backed placeholder that simulates
+/// streaming AI replies, used by tests and previews.
 protocol ChatServicing: Sendable {
     func fetchChats() async throws -> [Chat]
     func fetchChat(id: Chat.ID) async throws -> Chat

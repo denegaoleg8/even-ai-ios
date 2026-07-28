@@ -10,6 +10,10 @@ final class ChatListViewModel {
     /// "no chats yet" apart from "couldn't reach the backend," which look
     /// identical if you only check `chats.isEmpty`.
     private(set) var loadFailed = false
+    /// Guards against a rapid double-tap on "New Chat" dispatching two
+    /// overlapping `createChat()` calls, which would otherwise both
+    /// succeed and create two chats from one tap.
+    private var isCreatingChat = false
 
     private let chatService: ChatServicing
 
@@ -30,14 +34,24 @@ final class ChatListViewModel {
 
     @discardableResult
     func createChat() async -> Chat? {
+        guard !isCreatingChat else { return nil }
+        isCreatingChat = true
+        defer { isCreatingChat = false }
+
         guard let newChat = try? await chatService.createChat(title: Chat.defaultTitle) else { return nil }
         chats.insert(newChat, at: 0)
         return newChat
     }
 
     func deleteChat(_ chat: Chat) async {
-        try? await chatService.deleteChat(id: chat.id)
-        chats.removeAll { $0.id == chat.id }
+        do {
+            try await chatService.deleteChat(id: chat.id)
+            chats.removeAll { $0.id == chat.id }
+        } catch {
+            // Leave local state untouched on failure — the chat still
+            // exists on the backend, so removing it here would make the
+            // list lie until the next reload silently brought it back.
+        }
     }
 
     func renameChat(_ chat: Chat, to newTitle: String) async {

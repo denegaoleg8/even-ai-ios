@@ -40,6 +40,26 @@ All notable changes to the Even AI product (both `even-ai-ios` and the chat port
   - Connected but no reply arrived: previously invisible. Now surfaced as a `.failed` assistant message ("No response received").
 - `MessageBubbleView` — failed-message label text now differs by role/case ("Couldn't send" / "Response incomplete" / "No response received") instead of a single generic "Failed to send," and no longer renders an empty content line for an empty failed assistant message.
 
+### Production readiness review — 2026-07-28
+
+A full senior-engineering pass over the entire codebase (not just the Milestone 2 diff), covering architecture consistency, thread safety, retry/error-handling correctness, SwiftData usage, memory management, and security. Six real issues found and fixed:
+
+**Backend**
+- **Crash risk**: the SSE stream's 15-second heartbeat kept writing to the response after the client disconnected (only a flag was set on close; the interval itself wasn't cleared until the whole request finished, which could be much later if OpenAI was still generating). Writing to a closed Node response can emit an unhandled `error` event and crash the process. Fixed: every write now checks a `clientClosed` guard, the heartbeat is cleared immediately on `close`, and an `error` listener on the response is a second line of defense. Verified against a real disconnect timed to land mid-generation — server survived with zero errors logged.
+- Removed an unused exported constant (`defaultTitle`) left over from `store.js` — dead code, nothing imported it.
+
+**iOS**
+- `ChatListViewModel.deleteChat` removed the chat from local state even when the backend delete call failed (`try?` swallowed the error unconditionally). The chat would then reappear on the next reload, looking like a bug to the user. Fixed to only remove locally on confirmed success.
+- `ChatListViewModel.createChat` had no reentrancy guard — a rapid double-tap on "New Chat" could dispatch two overlapping calls, both succeeding, creating two chats from one tap. Fixed with the same `isCreating`-style guard pattern already used by `ChatViewModel.sendDraft`. Covered by a new concurrency test using a call-counting test double.
+- `NetworkChatService` retried `POST /api/chats` (create) using the same retry-with-backoff as safely-idempotent calls (GET/PATCH/DELETE). Creating a chat is *not* idempotent — retrying risks a duplicate chat if the first attempt reached the server but the client timed out before seeing the response. Fixed: create is no longer retried; GET/PATCH/DELETE still are.
+- Two stale doc comments (`ChatServicing.swift`, `MockChatService.swift`) still described `NetworkChatService` as a future, not-yet-built thing. Updated to reflect current reality.
+- Added `DeleteFailingChatService` and `CountingCreateChatService` test doubles, plus tests for both fixes above.
+
+**Explicitly reviewed and left as-is** (documented, not bugs):
+- The backend's in-memory store has no per-chat locking — two truly concurrent writes to the *same* chat could theoretically interleave. Not reachable through the current app (a single iOS client, UI-guarded to one in-flight send per chat), and a real fix belongs with the eventual database migration rather than a hand-rolled lock over a `Map`. See `ARCHITECTURE.md`.
+- Title-derivation logic (first-message → chat title) is implemented twice, once in Swift (`MockChatService`) and once in JS (`store.js`/`routes.js`), because there's no way to share it across runtimes without disproportionate tooling. Kept in sync by inspection; noted for future maintainers.
+- Auto-scroll-to-bottom fires on every streamed token regardless of whether the user has manually scrolled up to read earlier messages — a UX nicety (matching how most chat apps suppress it once the user scrolls away), not a correctness bug; not implemented here to avoid scope creep into new feature work during a review pass.
+
 ## Milestone 1 — Conversations Feature (Mock) — 2026-07-28
 
 **Added**

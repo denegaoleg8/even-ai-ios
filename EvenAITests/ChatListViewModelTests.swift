@@ -32,4 +32,36 @@ struct ChatListViewModelTests {
         await workingViewModel.loadChats()
         #expect(!workingViewModel.loadFailed)
     }
+
+    @Test("A failed delete does not remove the chat from local state")
+    func failedDeleteLeavesLocalStateUntouched() async {
+        let viewModel = ChatListViewModel(chatService: DeleteFailingChatService())
+        guard let chat = await viewModel.createChat() else {
+            Issue.record("Expected createChat to succeed")
+            return
+        }
+        #expect(viewModel.chats.contains { $0.id == chat.id })
+
+        await viewModel.deleteChat(chat)
+
+        // The backend delete failed, so the chat must still be present —
+        // removing it locally would make the list lie until the next
+        // reload silently brought it back.
+        #expect(viewModel.chats.contains { $0.id == chat.id })
+    }
+
+    @Test("Two concurrent createChat calls only create one chat")
+    func rapidDoubleCreateIsGuarded() async {
+        let service = CountingCreateChatService()
+        let viewModel = ChatListViewModel(chatService: service)
+
+        async let first = viewModel.createChat()
+        async let second = viewModel.createChat()
+        let results = await [first, second]
+
+        let succeededCount = results.compactMap { $0 }.count
+        #expect(succeededCount == 1)
+        let callCount = await service.createCallCount
+        #expect(callCount == 1)
+    }
 }
