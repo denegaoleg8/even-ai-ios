@@ -55,12 +55,20 @@ Project is generated via **XcodeGen** (`project.yml` is the source of truth; `xc
 server.js                Entry point. Untouched ASR route (/session) + two additive lines mounting the chat router.
 src/
 ├── asr/, audio/, debug/, main.ts, ui.ts     Pre-existing G2 WebView ASR app — not touched by any chat work
-└── chat/
-    ├── store.js          Dependency-free persistence: in-memory Map + write-through JSON file (data/chats.json)
-    └── routes.js         Express router: REST (/api/chats*) + SSE streaming (/api/chat/stream)
+├── chat/
+│   ├── store.js          Dependency-free persistence: in-memory Map + write-through JSON file (data/chats.json)
+│   └── routes.js         Express router: REST (/api/chats*) + SSE streaming (/api/chat/stream)
+└── auth/  (Milestone 3, in progress)
+    ├── db.js             SQLite connection + schema (accounts, devices, sessions) — see decision note below
+    ├── store.js          Account/device/session data access
+    └── tokens.js         JWT access tokens, opaque refresh tokens, password hashing
 ```
 
-`/session` and the chat module share the same Express process and port but nothing in code — verified repeatedly during Milestone 2 that ASR behavior is byte-for-byte unchanged.
+`/session`, the chat module, and the auth module share the same Express process and port but nothing in code — verified repeatedly during Milestone 2 (and again as each Milestone 3 phase lands) that ASR behavior is byte-for-byte unchanged.
+
+**Why auth uses SQLite (`better-sqlite3`) instead of `src/chat/store.js`'s JSON-file pattern**: accounts/devices/sessions are genuinely relational (foreign keys, one-to-many), and this data is security-sensitive (password hashes, token hashes) in a way chat text isn't. A hand-rolled JSON `Map` store doesn't give real constraints, atomic multi-table writes, or the write-locking `better-sqlite3` provides — and unlike the chat store's decision (revisit later, optional Phase 3.8), auth's correctness bar justifies making that choice from its first line of code. `better-sqlite3` ships prebuilt binaries for all common platforms (including this environment's darwin-arm64) and required no source compilation once its install script was approved through npm 11's script-approval gate (`npm approve-scripts better-sqlite3` — a legitimate supply-chain security feature, not bypassed). Chat storage and auth storage are two separate SQLite/JSON files with no shared code; unifying them is still the optional, deferred Phase 3.8.
+
+`src/auth/db.js`'s connection is a lazy singleton (`getDb()`), reading `AUTH_DB_PATH` only on first actual use rather than at module-import time — the same fix already applied to `src/chat/routes.js`'s OpenAI client after that exact bug was found in the Milestone 2 review (ES module imports fully evaluate before the importing file's own top-level code runs, so reading an env var at import time can see it still unset).
 
 ## Data flow: sending a message (production path)
 

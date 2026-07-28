@@ -20,11 +20,21 @@ Milestones are implemented and verified strictly one at a time. Each requires ex
 - **Final freeze pass**: full re-verification (all 10 end-to-end backend checks re-run live, including a repeat of the mid-stream-disconnect crash regression check) and a project-wide cleanup scan (TODO/FIXME comments, dead code, duplicate files, unused imports) — nothing further found to fix or remove; both repos build clean with zero warnings. Tagged `v0.2.0`.
 - See `CHANGELOG.md` for the itemized list and `ARCHITECTURE.md` for the current implementation and engineering decisions in detail.
 
-## 🔜 Milestone 3 — Authentication (not started — awaiting approval)
-- Device identity (already scaffolded in `Infrastructure/Security/DeviceIdentityStore`, not yet wired up).
-- Backend device-auth endpoint issuing a bearer token.
-- Session restoration on relaunch.
-- Settings screen: account section.
+## 🚧 Milestone 3 — Authentication (in progress)
+
+Full design approved 2026-07-28 — anonymous-by-default accounts (never a forced gate), claimed in place on sign-up (zero data migration), explicit merge-on-sign-in for a second device's local chats, ecosystem-wide from day one (platform-agnostic REST/JWT design, ready for Android/Web/Voice/Vision/Glasses without another auth rewrite). Implemented one small phase at a time, verified before each next phase begins.
+
+- ✅ **Phase 3.1 — Backend: accounts, sessions, tokens (data model only, no endpoints yet)**. `src/auth/{db,store,tokens}.js`. Accounts (with subscription/settings/profile fields ready for future use), devices (platform-agnostic, one row per device per login), sessions (refresh tokens, hashed, revocable individually or all-at-once for "logout everywhere"). SQLite (`better-sqlite3`) chosen over the chat store's JSON-file pattern — see `ARCHITECTURE.md`. 17 new unit tests (Node's built-in test runner, zero new test-framework dependency), all passing. `/session` and existing chat endpoints re-verified live, unaffected; no new HTTP routes exposed yet.
+- 🔜 Phase 3.2 — Backend: auth endpoints (`/api/auth/{device,signup,login,refresh,logout,merge}`)
+- 🔜 Phase 3.3 — Backend: scope chat routes by account
+- 🔜 Phase 3.4 — iOS: Core/Infrastructure auth foundation
+- 🔜 Phase 3.5 — iOS: wire chat + app state to auth
+- 🔜 Phase 3.6 — iOS: Auth UI
+- 🔜 Phase 3.7 — Chat migration/merge UX
+- 🔜 Phase 3.8 (optional) — Backend persistence hardening (unify chat storage onto SQLite too)
+- 🔜 Phase 3.9 (optional) — SwiftData local cache (`CachingChatService` decorator)
+
+Each phase requires explicit approval before the next begins.
 
 ## 🔜 Milestone 4 — Even G2 Integration (not started — awaiting approval)
 - **`GlassesTransport` abstraction only** — no BLE implementation. Must be swappable later for an Even Hub bridge or `MentraBluetoothSDK` without touching Chat or backend code.
