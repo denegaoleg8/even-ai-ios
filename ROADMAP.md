@@ -2,6 +2,8 @@
 
 Milestones are implemented and verified strictly one at a time. Each requires explicit approval before the next begins.
 
+**Current version: `0.2.0`** — Milestone 2, frozen 2026-07-28. Tagged `v0.2.0` in both repos.
+
 ## ✅ Milestone 1 — Conversations Feature (Mock)
 - SwiftUI skeleton: `App/Core/Infrastructure/Features` architecture, XcodeGen-managed project.
 - Chat list: create, rename, delete, auto-title from first message.
@@ -15,6 +17,7 @@ Milestones are implemented and verified strictly one at a time. Each requires ex
 - End-to-end verification pass: found and fixed a startup crash (env-var load order), an information-disclosure bug (raw stack trace on malformed JSON), a Swift 6 concurrency violation, a Sendable warning, and three distinct silent-failure paths in message sending.
 - Full production readiness review (whole-codebase, not just the diff): found and fixed a second backend crash risk (SSE heartbeat writing after client disconnect), two iOS error-handling correctness bugs (a failed delete corrupting local state, a missing reentrancy guard on chat creation), a retry-idempotency gap (create was being retried), and two stale doc comments. Two further findings were reviewed and explicitly deferred as documented, non-blocking limitations (see below) rather than fixed, to avoid scope creep into new feature work.
 - All fixes covered by automated tests where the underlying logic is unit-testable (view-model layer); confirmed via live curl-based end-to-end testing for everything backend-observable, including a deliberately-timed mid-generation client disconnect.
+- **Final freeze pass**: full re-verification (all 10 end-to-end backend checks re-run live, including a repeat of the mid-stream-disconnect crash regression check) and a project-wide cleanup scan (TODO/FIXME comments, dead code, duplicate files, unused imports) — nothing further found to fix or remove; both repos build clean with zero warnings. Tagged `v0.2.0`.
 - See `CHANGELOG.md` for the itemized list and `ARCHITECTURE.md` for the current implementation and engineering decisions in detail.
 
 ## 🔜 Milestone 3 — Authentication (not started — awaiting approval)

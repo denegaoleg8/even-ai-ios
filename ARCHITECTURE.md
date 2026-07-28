@@ -1,6 +1,6 @@
 # Even AI — Architecture
 
-This document reflects the implementation as of **Milestone 2 (Production Backend Integration)**. Two repositories make up the product:
+This document reflects the implementation as of **Milestone 2 (Production Backend Integration), frozen at version `0.2.0`**. Two repositories make up the product:
 
 | Repo | Role |
 |---|---|

@@ -2,7 +2,7 @@
 
 All notable changes to the Even AI product (both `even-ai-ios` and the chat portion of `even-ai-assistant-asr`) are recorded here, grouped by milestone.
 
-## Milestone 2 — Production Backend Integration — 2026-07-28
+## [0.2.0] — Milestone 2 — Production Backend Integration — 2026-07-28 (frozen)
 
 ### Backend (`even-ai-assistant-asr`)
 
@@ -59,6 +59,10 @@ A full senior-engineering pass over the entire codebase (not just the Milestone 
 - The backend's in-memory store has no per-chat locking — two truly concurrent writes to the *same* chat could theoretically interleave. Not reachable through the current app (a single iOS client, UI-guarded to one in-flight send per chat), and a real fix belongs with the eventual database migration rather than a hand-rolled lock over a `Map`. See `ARCHITECTURE.md`.
 - Title-derivation logic (first-message → chat title) is implemented twice, once in Swift (`MockChatService`) and once in JS (`store.js`/`routes.js`), because there's no way to share it across runtimes without disproportionate tooling. Kept in sync by inspection; noted for future maintainers.
 - Auto-scroll-to-bottom fires on every streamed token regardless of whether the user has manually scrolled up to read earlier messages — a UX nicety (matching how most chat apps suppress it once the user scrolls away), not a correctness bug; not implemented here to avoid scope creep into new feature work during a review pass.
+
+### Final freeze verification — 2026-07-28
+
+Re-ran the full end-to-end backend checklist live (session/ASR, create, send+stream, history restore, list/auto-title, rename, 404, malformed-JSON 400, the mid-stream-disconnect crash regression check, delete) — all pass, zero errors logged. Ran a project-wide cleanup scan across both repos (TODO/FIXME comments, dead code, unused imports, duplicate files) — nothing further found. Both repos rebuild clean with zero warnings. Bumped `MARKETING_VERSION`/`CURRENT_PROJECT_VERSION` in `project.yml` to `0.2.0`/`2`. Tagged `v0.2.0` in both repos.
 
 ## Milestone 1 — Conversations Feature (Mock) — 2026-07-28
 
