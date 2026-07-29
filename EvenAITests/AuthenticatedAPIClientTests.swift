@@ -113,8 +113,8 @@ struct AuthenticatedAPIClientTests {
         #expect(refreshCount.value == 1)
     }
 
-    @Test("a refresh that itself fails throws sessionExpired and clears local state")
-    func refreshFailureClearsSession() async throws {
+    @Test("a request that hits a 401, then fails both recovery tiers, propagates an error and clears local state")
+    func requestFailsWhenBothRecoveryTiersFail() async throws {
         let tokenStore = InMemoryAuthTokenStore()
         tokenStore.save(refreshToken: "revoked-refresh")
         let client = makeClient(tokenStore: tokenStore)
@@ -124,41 +124,61 @@ struct AuthenticatedAPIClientTests {
             if request.url?.path.hasSuffix("/auth/refresh") == true {
                 return Self.jsonResponse(401, ["error": ["code": "INVALID_REFRESH_TOKEN", "message": "no"]])
             }
+            // Both the original "chats" call and the anonymous-fallback
+            // "auth/device" call land here — everything is unreachable,
+            // simulating a backend that's fully down rather than just
+            // rejecting one token.
             return Self.jsonResponse(401, ["error": ["code": "UNAUTHORIZED", "message": "no"]])
         }
 
         await #expect(throws: AuthenticatedAPIClientError.self) {
             try await client.get("chats")
         }
+        // The refresh token was still proven invalid along the way, even
+        // though the overall recovery failed for an unrelated reason
+        // (the fallback also being unreachable) — it must not survive to
+        // be retried later.
         #expect(tokenStore.currentRefreshToken() == nil)
     }
 
     // MARK: - restoreAccessToken
 
-    @Test("restoreAccessToken returns nil when there's no stored refresh token")
-    func restoreWithNoStoredToken() async {
+    @Test("recoverSession falls back to an anonymous device session when there's no stored refresh token")
+    func recoverWithNoStoredTokenFallsBackToAnonymous() async throws {
         let client = makeClient()
-        let user = await client.restoreAccessToken()
-        #expect(user == nil)
+        let anonymousAccountID = UUID()
+
+        StubURLProtocol.handler = { request in
+            #expect(request.url?.path.hasSuffix("/auth/device") == true)
+            return Self.jsonResponse(200, [
+                "accessToken": "anonymous-token",
+                "refreshToken": "anonymous-refresh",
+                "account": Self.accountJSON(id: anonymousAccountID),
+            ])
+        }
+
+        let user = try await client.recoverSession()
+        #expect(user.id == anonymousAccountID)
     }
 
-    @Test("restoreAccessToken succeeds and installs a fresh session from a stored refresh token")
-    func restoreWithStoredToken() async throws {
+    @Test("recoverSession succeeds and installs a fresh session from a stored refresh token")
+    func recoverWithStoredToken() async throws {
         let tokenStore = InMemoryAuthTokenStore()
         tokenStore.save(refreshToken: "stored-refresh")
         let client = makeClient(tokenStore: tokenStore)
         let accountID = UUID()
 
-        StubURLProtocol.handler = { _ in
-            Self.jsonResponse(200, [
+        StubURLProtocol.handler = { request in
+            #expect(request.url?.path.hasSuffix("/auth/refresh") == true)
+            return Self.jsonResponse(200, [
                 "accessToken": "restored-token",
                 "refreshToken": "rotated-refresh",
                 "account": Self.accountJSON(id: accountID),
             ])
         }
 
-        let user = await client.restoreAccessToken()
-        #expect(user?.id == accountID)
+        let user = try await client.recoverSession()
+        #expect(user.id == accountID)
         #expect(tokenStore.currentRefreshToken() == "rotated-refresh")
 
         // The restored access token is actually in effect for subsequent calls.
@@ -169,6 +189,52 @@ struct AuthenticatedAPIClientTests {
         _ = try await client.get("chats")
         let lastRequest = StubURLProtocol.recordedRequests().last
         #expect(lastRequest?.value(forHTTPHeaderField: "Authorization") == "Bearer restored-token")
+    }
+
+    @Test("recoverSession falls back to anonymous when the stored refresh token has been revoked")
+    func recoverFallsBackToAnonymousWhenRefreshTokenRevoked() async throws {
+        let tokenStore = InMemoryAuthTokenStore()
+        tokenStore.save(refreshToken: "revoked-refresh")
+        let client = makeClient(tokenStore: tokenStore)
+        let anonymousAccountID = UUID()
+
+        StubURLProtocol.handler = { request in
+            if request.url?.path.hasSuffix("/auth/refresh") == true {
+                return Self.jsonResponse(401, ["error": ["code": "INVALID_REFRESH_TOKEN", "message": "no"]])
+            }
+            #expect(request.url?.path.hasSuffix("/auth/device") == true)
+            return Self.jsonResponse(200, [
+                "accessToken": "anonymous-token",
+                "refreshToken": "anonymous-refresh",
+                "account": Self.accountJSON(id: anonymousAccountID),
+            ])
+        }
+
+        // "If refresh fails, cleanly transition to the signed-out
+        // state" — concretely, that means this resolves to a usable
+        // (anonymous) session rather than throwing, so chat can keep
+        // working without the caller having to do anything special.
+        let user = try await client.recoverSession()
+        #expect(user.id == anonymousAccountID)
+        #expect(tokenStore.currentRefreshToken() == "anonymous-refresh")
+    }
+
+    @Test("recoverSession throws only when both the refresh and the anonymous fallback fail")
+    func recoverThrowsWhenBothTiersFail() async {
+        let tokenStore = InMemoryAuthTokenStore()
+        tokenStore.save(refreshToken: "revoked-refresh")
+        let client = makeClient(tokenStore: tokenStore)
+
+        StubURLProtocol.handler = { request in
+            if request.url?.path.hasSuffix("/auth/refresh") == true {
+                return Self.jsonResponse(401, ["error": ["code": "INVALID_REFRESH_TOKEN", "message": "no"]])
+            }
+            return Self.jsonResponse(500, ["error": ["code": "INTERNAL_ERROR", "message": "down"]])
+        }
+
+        await #expect(throws: AuthenticatedAPIClientError.self) {
+            try await client.recoverSession()
+        }
     }
 
     // MARK: - clearSession

@@ -19,10 +19,11 @@ struct NetworkAuthService: AuthServicing {
     }
 
     func restoreSession() async throws -> User {
-        if let user = await apiClient.restoreAccessToken() {
-            return user
+        do {
+            return try await apiClient.recoverSession()
+        } catch {
+            throw Self.mapError(error)
         }
-        return try await authenticateDeviceAnonymously()
     }
 
     func signUp(email: String, password: String, displayName: String?) async throws -> User {
@@ -88,25 +89,6 @@ struct NetworkAuthService: AuthServicing {
     }
 
     // MARK: - Private
-
-    private func authenticateDeviceAnonymously() async throws -> User {
-        let deviceID = deviceIdentityStore.currentDeviceID()
-        let payload: [String: String] = [
-            "deviceId": deviceID.uuidString,
-            "platform": platform,
-            "appVersion": Self.appVersion,
-        ]
-
-        do {
-            let body = try JSONEncoder.evenAI.encode(payload)
-            let data = try await apiClient.post("auth/device", body: body)
-            let decoded = try JSONDecoder.evenAI.decode(DeviceAuthResponseDTO.self, from: data)
-            await apiClient.installSession(accessToken: decoded.accessToken, refreshToken: decoded.refreshToken)
-            return decoded.account.toDomain()
-        } catch {
-            throw Self.mapError(error)
-        }
-    }
 
     private static var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"

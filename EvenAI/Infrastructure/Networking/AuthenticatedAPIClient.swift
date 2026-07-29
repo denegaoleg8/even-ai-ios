@@ -2,40 +2,56 @@ import Foundation
 
 /// The single networking entry point for every authenticated request in
 /// the app. Owns the in-memory access token (never persisted — see
-/// `AuthTokenStoring`) and the refresh-token lifecycle: on a 401, it
-/// transparently refreshes and retries the original request once; on
-/// launch, `restoreAccessToken()` proactively does the same thing from
-/// whatever refresh token is in Keychain.
+/// `AuthTokenStoring`) and the whole session-recovery lifecycle: on a
+/// 401, it transparently recovers and retries the original request once;
+/// on launch, `recoverSession()` does the same thing proactively.
 ///
-/// Every future authenticated service (Chat in Phase 3.5; Voice, Vision,
-/// Glasses, cloud sync later) is expected to be constructed with the
-/// *same* `AuthenticatedAPIClient` instance (via `AppContainer`), not
+/// Recovery (Phase 3.5) is two-tiered, not just "refresh or fail": if the
+/// stored refresh token is missing, expired, or revoked, this falls back
+/// to re-authenticating as the device's anonymous session rather than
+/// surfacing a dead end. That's what makes "if refresh fails, cleanly
+/// transition to the signed-out state" and "continue chatting" true at
+/// the same time — a chat request that outlives its session doesn't
+/// throw a raw auth error at the caller, it transparently continues
+/// against a usable (now-anonymous) session. `AuthState` still learns
+/// about an explicit sign-out or sign-in the normal way, by awaiting the
+/// call it made; this fallback only matters for the *reactive*,
+/// mid-session case a caller never asked about.
+///
+/// Every future authenticated service (Chat as of this phase; Voice,
+/// Vision, Glasses, cloud sync later) is expected to be constructed with
+/// the *same* `AuthenticatedAPIClient` instance (via `AppContainer`), not
 /// its own copy — sharing one instance is what makes "signed in" a
 /// single, consistent fact across the whole app rather than N
 /// independently-tracked copies of it. No feature should ever attach its
-/// own `Authorization` header or implement its own refresh logic; that
-/// duplication is exactly what this type exists to prevent.
+/// own `Authorization` header, implement its own refresh logic, or retry
+/// a request itself; that duplication is exactly what this type exists
+/// to prevent.
 ///
 /// An `actor`, not a class with locks: every mutation of `accessToken`
-/// or `refreshTask` is already serialized by actor isolation, so the
-/// single-flight refresh guard below needs no additional synchronization
+/// or `recoveryTask` is already serialized by actor isolation, so the
+/// single-flight recovery guard below needs no additional synchronization
 /// primitive to be correct.
 actor AuthenticatedAPIClient {
     private let baseURL: URL
     private let session: URLSession
     private let tokenStore: AuthTokenStoring
+    private let deviceIdentityStore: DeviceIdentityStoring
+    private let platform = "ios"
 
     private var accessToken: String?
-    private var refreshTask: Task<User, Error>?
+    private var recoveryTask: Task<User, Error>?
 
     init(
         baseURL: URL = BackendConfiguration.baseURL,
         session: URLSession = .shared,
-        tokenStore: AuthTokenStoring = KeychainAuthTokenStore()
+        tokenStore: AuthTokenStoring = KeychainAuthTokenStore(),
+        deviceIdentityStore: DeviceIdentityStoring = KeychainDeviceIdentityStore()
     ) {
         self.baseURL = baseURL
         self.session = session
         self.tokenStore = tokenStore
+        self.deviceIdentityStore = deviceIdentityStore
     }
 
     // MARK: - Token state
@@ -52,9 +68,8 @@ actor AuthenticatedAPIClient {
     }
 
     /// Clears both the in-memory access token and the persisted refresh
-    /// token — used by sign-out and by a refresh that itself fails
-    /// (expired/revoked refresh token), so neither survives to be
-    /// reused.
+    /// token — used by sign-out, and internally by a refresh that itself
+    /// fails, so neither survives to be reused.
     func clearSession() {
         accessToken = nil
         tokenStore.clear()
@@ -68,51 +83,63 @@ actor AuthenticatedAPIClient {
         tokenStore.currentRefreshToken()
     }
 
-    /// Proactively obtains a fresh access token + user from the stored
-    /// refresh token, if one exists and is still valid. Returns nil (and
-    /// clears Keychain) if there's no stored refresh token, or the
-    /// backend rejects it as expired/revoked. Shares the same
-    /// single-flight refresh path a reactive 401 mid-session uses — one
-    /// place this logic can be wrong, not two.
+    /// Resolves to a valid, usable session on every call — the stored
+    /// refresh token's account if it's still good, otherwise this
+    /// device's anonymous account. Single-flight: concurrent callers
+    /// (whether from an explicit launch-time restore or several requests
+    /// independently hitting a 401 at once) share exactly one recovery
+    /// attempt, not N. Throws only if *both* tiers fail — typically means
+    /// no network at all.
     @discardableResult
-    func restoreAccessToken() async -> User? {
-        guard tokenStore.currentRefreshToken() != nil else { return nil }
-        return try? await ensureRefreshed()
+    func recoverSession() async throws -> User {
+        if let existing = recoveryTask {
+            return try await existing.value
+        }
+        let task = Task { try await performRecovery() }
+        recoveryTask = task
+        defer { recoveryTask = nil }
+        return try await task.value
     }
 
     // MARK: - REST
 
     func get(_ path: String) async throws -> Data {
-        try await send(path: path, method: "GET", body: nil)
+        try await send(path: path, method: "GET", body: nil, retryAttempts: 2)
     }
 
-    func post(_ path: String, body: Data?) async throws -> Data {
-        try await send(path: path, method: "POST", body: body)
+    /// Not retried on transient failure by default: a POST typically
+    /// creates a resource, and retrying risks duplicating it if the first
+    /// attempt actually reached the server but the client didn't see the
+    /// response. Callers whose POST is genuinely safe to retry (e.g. an
+    /// idempotent action) can raise `retryAttempts` explicitly.
+    func post(_ path: String, body: Data?, retryAttempts: Int = 1) async throws -> Data {
+        try await send(path: path, method: "POST", body: body, retryAttempts: retryAttempts)
     }
 
     func patch(_ path: String, body: Data) async throws -> Data {
-        try await send(path: path, method: "PATCH", body: body)
+        try await send(path: path, method: "PATCH", body: body, retryAttempts: 2)
     }
 
     @discardableResult
     func delete(_ path: String) async throws -> Data {
-        try await send(path: path, method: "DELETE", body: nil)
+        try await send(path: path, method: "DELETE", body: nil, retryAttempts: 2)
     }
 
     /// Opens an authenticated streaming (SSE) connection. Attaches the
-    /// current access token and refreshes once on a 401 before the
-    /// stream is ever opened — the same as `send`, just returning raw
-    /// bytes instead of buffered `Data`, since parsing the SSE format is
-    /// a concern for the caller (e.g. `NetworkChatService`), not this
-    /// generic transport layer. Not retried once bytes start flowing —
-    /// see `NetworkChatService` for why a partially-consumed stream is
-    /// never safe to silently retry.
+    /// current access token and recovers once on a 401 before the stream
+    /// is ever opened — the same as `send`, just returning raw bytes
+    /// instead of buffered `Data`, since parsing the SSE format is a
+    /// concern for the caller (`NetworkChatService`), not this generic
+    /// transport layer. Not retried once bytes start flowing, and not
+    /// retried on transient failure at all — a partially-consumed stream,
+    /// or one that failed to open due to a flaky connection, is never
+    /// safe to silently retry from here.
     func streamBytes(path: String, body: Data) async throws -> (URLSession.AsyncBytes, URLResponse) {
         let request = try await makeRequest(path: path, method: "POST", body: body, accept: "text/event-stream")
         do {
             let (bytes, response) = try await session.bytes(for: request)
             if let http = response as? HTTPURLResponse, http.statusCode == 401 {
-                _ = try await ensureRefreshed()
+                _ = try await recoverSession()
                 let retryRequest = try await makeRequest(path: path, method: "POST", body: body, accept: "text/event-stream")
                 return try await session.bytes(for: retryRequest)
             }
@@ -141,7 +168,30 @@ actor AuthenticatedAPIClient {
         return request
     }
 
-    private func send(path: String, method: String, body: Data?) async throws -> Data {
+    private func send(path: String, method: String, body: Data?, retryAttempts: Int) async throws -> Data {
+        var lastError: Error = AuthenticatedAPIClientError.invalidResponse
+
+        for attempt in 0..<retryAttempts {
+            do {
+                return try await performOnce(path: path, method: method, body: body)
+            } catch {
+                lastError = error
+                // Only transient/transport failures are worth retrying —
+                // an auth or HTTP error means the server actively
+                // answered, and retrying it would just get the same
+                // answer again.
+                guard Self.isRetryable(error), attempt < retryAttempts - 1 else { throw error }
+                try? await Task.sleep(for: .milliseconds(300 * (attempt + 1)))
+            }
+        }
+        throw lastError
+    }
+
+    /// One full attempt at a request, including the 401 → recover →
+    /// retry-once handling — that inner retry is about authentication,
+    /// not transient failure, so it happens on every attempt regardless
+    /// of `retryAttempts`.
+    private func performOnce(path: String, method: String, body: Data?) async throws -> Data {
         let request = try await makeRequest(path: path, method: method, body: body)
 
         do {
@@ -152,11 +202,11 @@ actor AuthenticatedAPIClient {
             }
 
             if http.statusCode == 401, accessToken != nil {
-                // Only worth a refresh-and-retry if we actually sent a
-                // token — a 401 on a call made with no token at all
-                // (e.g. login, device) means invalid credentials, not an
-                // expired session, and retrying would just loop.
-                _ = try await ensureRefreshed()
+                // Only worth recovering if we actually sent a token — a
+                // 401 on a call made with no token at all (e.g. login)
+                // means invalid credentials, not an expired session, and
+                // recovering would just loop.
+                _ = try await recoverSession()
                 let retryRequest = try await makeRequest(path: path, method: method, body: body)
                 let (retryData, retryResponse) = try await session.data(for: retryRequest)
                 try Self.validate(retryResponse, data: retryData)
@@ -170,20 +220,25 @@ actor AuthenticatedAPIClient {
         }
     }
 
-    // MARK: - Refresh (single-flight)
-
-    /// If a refresh is already in flight, awaits *that* one instead of
-    /// starting a second — concurrent requests that all hit a 401 at
-    /// once trigger exactly one call to `/api/auth/refresh`, not N.
-    @discardableResult
-    private func ensureRefreshed() async throws -> User {
-        if let existing = refreshTask {
-            return try await existing.value
+    private static func isRetryable(_ error: Error) -> Bool {
+        guard let clientError = error as? AuthenticatedAPIClientError else { return false }
+        switch clientError {
+        case .offline, .underlying, .invalidResponse:
+            return true
+        case .http(let status, _):
+            return status >= 500
+        case .notAuthenticated, .sessionExpired:
+            return false
         }
-        let task = Task { try await performRefresh() }
-        refreshTask = task
-        defer { refreshTask = nil }
-        return try await task.value
+    }
+
+    // MARK: - Recovery (single-flight, two-tiered)
+
+    private func performRecovery() async throws -> User {
+        if tokenStore.currentRefreshToken() != nil, let user = try? await performRefresh() {
+            return user
+        }
+        return try await performDeviceAuth()
     }
 
     private func performRefresh() async throws -> User {
@@ -196,26 +251,49 @@ actor AuthenticatedAPIClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder.evenAI.encode(["refreshToken": refreshToken])
 
-        do {
-            let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                throw AuthenticatedAPIClientError.invalidResponse
-            }
-            guard (200..<300).contains(http.statusCode) else {
-                // The refresh token itself is no longer usable — expired
-                // or revoked server-side. Clear it locally too, so we
-                // don't keep retrying a token that will never work again.
-                clearSession()
-                throw AuthenticatedAPIClientError.sessionExpired
-            }
-
-            let decoded = try JSONDecoder.evenAI.decode(RefreshResponseDTO.self, from: data)
-            accessToken = decoded.accessToken
-            tokenStore.save(refreshToken: decoded.refreshToken)
-            return decoded.account.toDomain()
-        } catch let urlError as URLError {
-            throw Self.classify(urlError)
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw AuthenticatedAPIClientError.invalidResponse
         }
+        guard (200..<300).contains(http.statusCode) else {
+            // The refresh token itself is no longer usable — expired or
+            // revoked server-side. Clear it locally too, so nothing keeps
+            // retrying a token that will never work again; the anonymous
+            // fallback in performRecovery takes over from here.
+            clearSession()
+            throw AuthenticatedAPIClientError.sessionExpired
+        }
+
+        let decoded = try JSONDecoder.evenAI.decode(RefreshResponseDTO.self, from: data)
+        accessToken = decoded.accessToken
+        tokenStore.save(refreshToken: decoded.refreshToken)
+        return decoded.account.toDomain()
+    }
+
+    private func performDeviceAuth() async throws -> User {
+        let deviceID = deviceIdentityStore.currentDeviceID()
+        let payload: [String: String] = [
+            "deviceId": deviceID.uuidString,
+            "platform": platform,
+            "appVersion": Self.appVersion,
+        ]
+
+        var request = URLRequest(url: baseURL.appending(path: "auth/device"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder.evenAI.encode(payload)
+
+        let (data, response) = try await session.data(for: request)
+        try Self.validate(response, data: data)
+
+        let decoded = try JSONDecoder.evenAI.decode(DeviceAuthResponseDTO.self, from: data)
+        accessToken = decoded.accessToken
+        tokenStore.save(refreshToken: decoded.refreshToken)
+        return decoded.account.toDomain()
+    }
+
+    private static var appVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
     }
 
     // MARK: - Response validation / error classification

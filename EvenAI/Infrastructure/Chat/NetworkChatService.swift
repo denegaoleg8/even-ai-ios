@@ -1,46 +1,55 @@
 import Foundation
 
 /// Real backend-backed implementation of `ChatServicing`, talking to the
-/// Even AI chat API over HTTPS (REST) and SSE (streaming replies). Drop-in
-/// replacement for `MockChatService` — `AppContainer.live` is the only
-/// place that needs to know which one is in use.
+/// Even AI chat API via the shared `AuthenticatedAPIClient` — no direct
+/// `URLSession` use anywhere in this file (Phase 3.5): token attachment,
+/// automatic refresh-on-401, retry, and offline/HTTP error classification
+/// are all the client's job, not this service's. Drop-in replacement for
+/// `MockChatService` — `AppContainer.live` is the only place that needs
+/// to know which one is in use.
+///
+/// Authentication is invisible from here up: every method below just
+/// calls `apiClient.get/post/patch/delete` and lets whatever it throws
+/// propagate — `ChatViewModel`/`ChatListViewModel`'s existing generic
+/// error handling (from Milestone 2) already treats "any thrown error"
+/// as a graceful failure, so a session that transparently refreshed, or
+/// even fell back to an anonymous one, looks identical to a request that
+/// never needed to from this service's callers.
 actor NetworkChatService: ChatServicing {
-    private let baseURL: URL
-    private let session: URLSession
+    private let apiClient: AuthenticatedAPIClient
 
-    init(baseURL: URL = BackendConfiguration.baseURL, session: URLSession = .shared) {
-        self.baseURL = baseURL
-        self.session = session
+    init(apiClient: AuthenticatedAPIClient) {
+        self.apiClient = apiClient
     }
 
     func fetchChats() async throws -> [Chat] {
-        let data = try await get("chats")
+        let data = try await apiClient.get("chats")
         return try JSONDecoder.evenAI.decode(ChatsResponseDTO.self, from: data).chats.map { $0.toDomain() }
     }
 
     func fetchChat(id: Chat.ID) async throws -> Chat {
-        let data = try await get("chats/\(id.uuidString)")
+        let data = try await apiClient.get("chats/\(id.uuidString)")
         return try JSONDecoder.evenAI.decode(ChatDTO.self, from: data).toDomain()
     }
 
     func createChat(title: String) async throws -> Chat {
         let body = try JSONEncoder.evenAI.encode(["title": title])
-        let data = try await post("chats", body: body)
+        let data = try await apiClient.post("chats", body: body)
         return try JSONDecoder.evenAI.decode(ChatDTO.self, from: data).toDomain()
     }
 
     func renameChat(id: Chat.ID, title: String) async throws -> Chat {
         let body = try JSONEncoder.evenAI.encode(["title": title])
-        let data = try await patch("chats/\(id.uuidString)", body: body)
+        let data = try await apiClient.patch("chats/\(id.uuidString)", body: body)
         return try JSONDecoder.evenAI.decode(ChatDTO.self, from: data).toDomain()
     }
 
     func deleteChat(id: Chat.ID) async throws {
-        try await delete("chats/\(id.uuidString)")
+        try await apiClient.delete("chats/\(id.uuidString)")
     }
 
     func fetchMessages(chatID: Chat.ID) async throws -> [Message] {
-        let data = try await get("chats/\(chatID.uuidString)/messages")
+        let data = try await apiClient.get("chats/\(chatID.uuidString)/messages")
         return try JSONDecoder.evenAI.decode(MessagesResponseDTO.self, from: data).messages.map { $0.toDomain() }
     }
 
@@ -60,19 +69,18 @@ actor NetworkChatService: ChatServicing {
 
     // MARK: - Streaming
 
+    // Unchanged from Milestone 2 except for how the byte stream itself is
+    // obtained (apiClient.streamBytes instead of session.bytes directly)
+    // — the SSE line-parsing (event:/data: framing, heartbeat comments)
+    // is a chat-specific concern that stays here, not something the
+    // generic transport client should know about.
     private func performStream(
         chatID: Chat.ID,
         content: String,
         continuation: AsyncThrowingStream<ChatStreamEvent, Error>.Continuation
     ) async throws {
-        var request = URLRequest(url: baseURL.appending(path: "chat/stream"))
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        request.httpBody = try JSONEncoder.evenAI.encode(["chatId": chatID.uuidString, "content": content])
-
-        let (bytes, response) = try await session.bytes(for: request)
-        try Self.validate(response)
+        let body = try JSONEncoder.evenAI.encode(["chatId": chatID.uuidString, "content": content])
+        let (bytes, _) = try await apiClient.streamBytes(path: "chat/stream", body: body)
 
         var eventName: String?
         var dataLines: [String] = []
@@ -121,83 +129,18 @@ actor NetworkChatService: ChatServicing {
             break
         }
     }
-
-    // MARK: - REST helpers
-
-    private func get(_ path: String) async throws -> Data {
-        try await send(path: path, method: "GET", body: nil)
-    }
-
-    private func post(_ path: String, body: Data) async throws -> Data {
-        // Not retried: POST /api/chats creates a new resource each time
-        // it succeeds. Retrying it risks creating a duplicate chat if the
-        // first attempt actually reached the server but the client timed
-        // out before seeing the response.
-        try await send(path: path, method: "POST", body: body, retryAttempts: 1)
-    }
-
-    private func patch(_ path: String, body: Data) async throws -> Data {
-        try await send(path: path, method: "PATCH", body: body)
-    }
-
-    @discardableResult
-    private func delete(_ path: String) async throws -> Data {
-        try await send(path: path, method: "DELETE", body: nil)
-    }
-
-    private func send(path: String, method: String, body: Data?, retryAttempts: Int = 2) async throws -> Data {
-        var mutableRequest = URLRequest(url: baseURL.appending(path: path))
-        mutableRequest.httpMethod = method
-        if let body {
-            mutableRequest.httpBody = body
-            mutableRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        }
-        let request = mutableRequest
-
-        let (data, response) = try await withRetry(attempts: retryAttempts) {
-            try await session.data(for: request)
-        }
-        try Self.validate(response)
-        return data
-    }
-
-    private func withRetry<T: Sendable>(
-        attempts: Int = 2,
-        _ operation: @Sendable () async throws -> T
-    ) async throws -> T {
-        var lastError: Error = NetworkChatServiceError.invalidResponse
-        for attempt in 0..<attempts {
-            do {
-                return try await operation()
-            } catch {
-                lastError = error
-                if attempt < attempts - 1 {
-                    try? await Task.sleep(for: .milliseconds(300 * (attempt + 1)))
-                }
-            }
-        }
-        throw lastError
-    }
-
-    private static func validate(_ response: URLResponse) throws {
-        guard let http = response as? HTTPURLResponse else {
-            throw NetworkChatServiceError.invalidResponse
-        }
-        guard (200..<300).contains(http.statusCode) else {
-            throw NetworkChatServiceError.http(status: http.statusCode)
-        }
-    }
 }
 
+/// The one chat-specific error case left: a business-level failure
+/// reported *inside* an already-open SSE stream (e.g. the backend's
+/// upstream LLM call failed). Transport-level failures (offline, HTTP
+/// status, session expiry) are `AuthenticatedAPIClientError` and
+/// propagate directly — wrapping them here would just be redundant.
 enum NetworkChatServiceError: Error, Sendable, LocalizedError {
-    case invalidResponse
-    case http(status: Int)
     case server(String)
 
     var errorDescription: String? {
         switch self {
-        case .invalidResponse: "The server returned an unexpected response."
-        case .http(let status): "The server returned an error (HTTP \(status))."
         case .server(let message): message
         }
     }
