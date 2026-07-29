@@ -2,6 +2,7 @@ import SwiftUI
 
 struct RootView: View {
     @Environment(AppState.self) private var appState
+    @Environment(AuthState.self) private var authState
 
     var body: some View {
         NavigationSplitView {
@@ -18,10 +19,20 @@ struct RootView: View {
                 )
             }
         }
+        // Fire-and-forget: the rest of the UI never blocks on this. Chat
+        // already works whether or not a session has been restored yet
+        // (anonymous-by-default), and each screen has its own
+        // network-failure handling if a chat call ends up unauthorized —
+        // there's nothing auth-specific to show here (no login gate, no
+        // loading screen), just the bootstrapping call itself.
+        .task {
+            await authState.restoreSession()
+        }
     }
 }
 
 #Preview {
     RootView()
         .environment(AppState())
+        .environment(AuthState())
 }
