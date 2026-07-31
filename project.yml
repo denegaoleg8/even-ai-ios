@@ -30,14 +30,29 @@ targets:
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         TARGETED_DEVICE_FAMILY: "1,2"
         DEVELOPMENT_ASSET_PATHS: "EvenAI/Resources/PreviewContent"
-        MARKETING_VERSION: "0.2.0"
-        CURRENT_PROJECT_VERSION: "2"
+        MARKETING_VERSION: "0.3.0"
+        CURRENT_PROJECT_VERSION: "3"
+      # Both configs point at the live Railway backend (verified working:
+      # /api/auth/*, /api/chats*, SSE streaming). Debug previously pointed
+      # at localhost:3001 for local-server development; running from Xcode
+      # uses the Debug config (see scheme's `run: config: Debug` below), so
+      # that required a local server to be running to work at all. Switched
+      # to Railway so a plain Xcode run reaches the same backend as
+      # TestFlight/App Store builds. To point at a local server again for
+      # backend development, override EVEN_AI_API_BASE_URL back to
+      # http://localhost:3001/api here (or via an xcconfig override).
+      configs:
+        Debug:
+          EVEN_AI_API_BASE_URL: "https://even-ai-assistant-asr-production.up.railway.app/api"
+        Release:
+          EVEN_AI_API_BASE_URL: "https://even-ai-assistant-asr-production.up.railway.app/api"
     info:
       path: EvenAI/Resources/Info.plist
       properties:
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
-        EVEN_AI_API_BASE_URL: "http://localhost:3001/api"
+        EVEN_AI_API_BASE_URL: "$(EVEN_AI_API_BASE_URL)"
+        ITSAppUsesNonExemptEncryption: false
   EvenAITests:
     type: bundle.unit-test
     platform: iOS
