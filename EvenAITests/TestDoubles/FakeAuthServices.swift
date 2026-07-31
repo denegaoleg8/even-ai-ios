@@ -95,8 +95,59 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
             headerFields: ["Content-Type": "application/json"]
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: result.body)
-        client?.urlProtocolDidFinishLoading(self)
+
+        // Delivered across several `didLoad:` calls with a small real
+        // delay between them, not one synchronous call — a genuinely
+        // streamed connection never hands the whole body to
+        // `URLSessionDataDelegate` in one shot. This turned out NOT to be
+        // what caused `NetworkChatServiceTests.streamReplyParsesEvents`
+        // to fail (confirmed by direct experiment: `bytes.lines` drops
+        // blank lines identically whether delivered as one chunk or many,
+        // with or without delays — the real cause and fix are in
+        // `NetworkChatService.performStream`, which no longer uses
+        // `.lines` at all). Kept anyway because it's still a more
+        // faithful stand-in for a real connection than one atomic blob,
+        // and it now exercises something that matters for the *new*
+        // manual byte-buffering parser: a line (or a blank-line
+        // separator) arriving split across two underlying reads has to
+        // reassemble correctly, which a single-chunk delivery would never
+        // test.
+        let client = self.client
+        Task {
+            for chunk in Self.chunked(result.body) {
+                client?.urlProtocol(self, didLoad: chunk)
+                try? await Task.sleep(for: .milliseconds(1))
+            }
+            client?.urlProtocolDidFinishLoading(self)
+        }
+    }
+
+    /// Splits on line boundaries (keeping each `\n` with the line before
+    /// it) rather than fixed-size byte windows — deliberately preserves
+    /// blank lines as their own single-byte ("\n") chunk instead of
+    /// merging them into a neighboring chunk, so a line split across two
+    /// deliveries is actually exercised. Falls back to delivering
+    /// non-line-structured bodies (ordinary JSON REST responses) in one
+    /// piece; splitting those wouldn't change anything since
+    /// `URLSession.data(for:)` buffers the whole response before
+    /// returning regardless.
+    private static func chunked(_ data: Data) -> [Data] {
+        guard let text = String(data: data, encoding: .utf8), text.contains("\n") else {
+            return [data]
+        }
+        var chunks: [Data] = []
+        var current = ""
+        for character in text {
+            current.append(character)
+            if character == "\n" {
+                chunks.append(Data(current.utf8))
+                current = ""
+            }
+        }
+        if !current.isEmpty {
+            chunks.append(Data(current.utf8))
+        }
+        return chunks
     }
 
     override func stopLoading() {}
