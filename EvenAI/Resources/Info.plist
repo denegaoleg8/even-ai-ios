@@ -19,7 +19,7 @@
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>EVEN_AI_API_BASE_URL</key>
-	<string>http://localhost:3001/api</string>
+	<string>$(EVEN_AI_API_BASE_URL)</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

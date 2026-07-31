@@ -104,7 +104,7 @@ actor AuthenticatedAPIClient {
     // MARK: - REST
 
     func get(_ path: String) async throws -> Data {
-        try await send(path: path, method: "GET", body: nil, retryAttempts: 2)
+        try await send(path: path, method: "GET", body: nil, retryAttempts: 2, recoverOn401: true)
     }
 
     /// Not retried on transient failure by default: a POST typically
@@ -112,17 +112,26 @@ actor AuthenticatedAPIClient {
     /// attempt actually reached the server but the client didn't see the
     /// response. Callers whose POST is genuinely safe to retry (e.g. an
     /// idempotent action) can raise `retryAttempts` explicitly.
-    func post(_ path: String, body: Data?, retryAttempts: Int = 1) async throws -> Data {
-        try await send(path: path, method: "POST", body: body, retryAttempts: retryAttempts)
+    ///
+    /// `recoverOn401` defaults to `true` for the same reason `get` always
+    /// is: most POSTs (chat creation, signup, logout, merge...) are made
+    /// by a caller that's *supposed* to already have a session, so a 401
+    /// is worth trying to recover from before giving up. `login` is the
+    /// one call that should never do this — a 401 there always means
+    /// wrong credentials, never "session not established yet," since
+    /// login doesn't depend on any existing session at all — so
+    /// `NetworkAuthService.signIn` passes `false` explicitly.
+    func post(_ path: String, body: Data?, retryAttempts: Int = 1, recoverOn401: Bool = true) async throws -> Data {
+        try await send(path: path, method: "POST", body: body, retryAttempts: retryAttempts, recoverOn401: recoverOn401)
     }
 
     func patch(_ path: String, body: Data) async throws -> Data {
-        try await send(path: path, method: "PATCH", body: body, retryAttempts: 2)
+        try await send(path: path, method: "PATCH", body: body, retryAttempts: 2, recoverOn401: true)
     }
 
     @discardableResult
     func delete(_ path: String) async throws -> Data {
-        try await send(path: path, method: "DELETE", body: nil, retryAttempts: 2)
+        try await send(path: path, method: "DELETE", body: nil, retryAttempts: 2, recoverOn401: true)
     }
 
     /// Opens an authenticated streaming (SSE) connection. Attaches the
@@ -168,12 +177,12 @@ actor AuthenticatedAPIClient {
         return request
     }
 
-    private func send(path: String, method: String, body: Data?, retryAttempts: Int) async throws -> Data {
+    private func send(path: String, method: String, body: Data?, retryAttempts: Int, recoverOn401: Bool) async throws -> Data {
         var lastError: Error = AuthenticatedAPIClientError.invalidResponse
 
         for attempt in 0..<retryAttempts {
             do {
-                return try await performOnce(path: path, method: method, body: body)
+                return try await performOnce(path: path, method: method, body: body, recoverOn401: recoverOn401)
             } catch {
                 lastError = error
                 // Only transient/transport failures are worth retrying —
@@ -191,7 +200,7 @@ actor AuthenticatedAPIClient {
     /// retry-once handling — that inner retry is about authentication,
     /// not transient failure, so it happens on every attempt regardless
     /// of `retryAttempts`.
-    private func performOnce(path: String, method: String, body: Data?) async throws -> Data {
+    private func performOnce(path: String, method: String, body: Data?, recoverOn401: Bool) async throws -> Data {
         let request = try await makeRequest(path: path, method: method, body: body)
 
         do {
@@ -201,11 +210,15 @@ actor AuthenticatedAPIClient {
                 throw AuthenticatedAPIClientError.invalidResponse
             }
 
-            if http.statusCode == 401, accessToken != nil {
-                // Only worth recovering if we actually sent a token — a
-                // 401 on a call made with no token at all (e.g. login)
-                // means invalid credentials, not an expired session, and
-                // recovering would just loop.
+            if http.statusCode == 401, recoverOn401 {
+                // Deliberately not gated on `accessToken != nil` — a 401
+                // with no token attached can legitimately mean "no
+                // session has been established yet" (e.g. a chat request
+                // racing the launch-time restore, before it's installed
+                // anything), and that case is exactly as recoverable as
+                // an expired one. `recoverOn401` is what lets `login`
+                // opt out instead, since a 401 there always means wrong
+                // credentials regardless of whether a token was sent.
                 _ = try await recoverSession()
                 let retryRequest = try await makeRequest(path: path, method: method, body: body)
                 let (retryData, retryResponse) = try await session.data(for: retryRequest)

@@ -51,7 +51,12 @@ struct NetworkAuthService: AuthServicing {
 
         do {
             let body = try JSONEncoder.evenAI.encode(payload)
-            let data = try await apiClient.post("auth/login", body: body)
+            // recoverOn401: false — a 401 here always means wrong
+            // credentials (login doesn't depend on any existing
+            // session), never "no session established yet," so
+            // attempting recovery would just waste a round trip before
+            // surfacing the same invalid-credentials error.
+            let data = try await apiClient.post("auth/login", body: body, recoverOn401: false)
             let decoded = try JSONDecoder.evenAI.decode(LoginResponseDTO.self, from: data)
             await apiClient.installSession(accessToken: decoded.accessToken, refreshToken: decoded.refreshToken)
             return AuthResult(user: decoded.account.toDomain(), mergeAvailableFrom: decoded.mergeAvailableFrom)

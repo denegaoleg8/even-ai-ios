@@ -141,6 +141,59 @@ struct AuthenticatedAPIClientTests {
         #expect(tokenStore.currentRefreshToken() == nil)
     }
 
+    @Test("a 401 with no access token at all still triggers recovery (the cold-launch race) — Stabilization Sprint H-3")
+    func recoversOnUnauthenticated401WithNoTokenAttached() async throws {
+        // No installSession call: this is the exact state a chat request
+        // can be in if it races the launch-time restoreSession() call
+        // and loses — no token has been installed yet.
+        let tokenStore = InMemoryAuthTokenStore()
+        tokenStore.save(refreshToken: "still-good-refresh")
+        let client = makeClient(tokenStore: tokenStore)
+        let accountID = UUID()
+
+        StubURLProtocol.handler = { request in
+            if request.url?.path.hasSuffix("/auth/refresh") == true {
+                return Self.jsonResponse(200, [
+                    "accessToken": "recovered-token", "refreshToken": "rotated-refresh",
+                    "account": Self.accountJSON(id: accountID),
+                ])
+            }
+            let hasRecoveredToken = request.value(forHTTPHeaderField: "Authorization") == "Bearer recovered-token"
+            return Self.jsonResponse(hasRecoveredToken ? 200 : 401, ["ok": hasRecoveredToken])
+        }
+
+        // Before the fix, a token-less 401 was never recovered from —
+        // this would have thrown .http(status: 401, ...) instead of
+        // succeeding.
+        let data = try await client.get("chats")
+        let decoded = try JSONSerialization.jsonObject(with: data) as? [String: Bool]
+        #expect(decoded?["ok"] == true)
+    }
+
+    @Test("login's 401 never triggers recovery, even with no token — it always means wrong credentials")
+    func loginDoesNotRecoverOn401() async throws {
+        let tokenStore = InMemoryAuthTokenStore()
+        tokenStore.save(refreshToken: "unrelated-refresh-token")
+        let client = makeClient(tokenStore: tokenStore)
+
+        let refreshCount = Counter()
+        StubURLProtocol.handler = { request in
+            if request.url?.path.hasSuffix("/auth/refresh") == true {
+                refreshCount.increment()
+                return Self.jsonResponse(200, [
+                    "accessToken": "should-not-be-used", "refreshToken": "should-not-be-used",
+                    "account": Self.accountJSON(),
+                ])
+            }
+            return Self.jsonResponse(401, ["error": ["code": "INVALID_CREDENTIALS", "message": "no"]])
+        }
+
+        await #expect(throws: AuthenticatedAPIClientError.self) {
+            try await client.post("auth/login", body: Data("{}".utf8), recoverOn401: false)
+        }
+        #expect(refreshCount.value == 0)
+    }
+
     // MARK: - restoreAccessToken
 
     @Test("recoverSession falls back to an anonymous device session when there's no stored refresh token")
