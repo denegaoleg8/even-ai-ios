@@ -28,7 +28,7 @@ actor NetworkChatService: ChatServicing {
     }
 
     func fetchChat(id: Chat.ID) async throws -> Chat {
-        let data = try await apiClient.get("chats/\(id.uuidString)")
+        let data = try await apiClient.get("chats/\(id.lowercaseUUIDString)")
         return try JSONDecoder.evenAI.decode(ChatDTO.self, from: data).toDomain()
     }
 
@@ -40,16 +40,16 @@ actor NetworkChatService: ChatServicing {
 
     func renameChat(id: Chat.ID, title: String) async throws -> Chat {
         let body = try JSONEncoder.evenAI.encode(["title": title])
-        let data = try await apiClient.patch("chats/\(id.uuidString)", body: body)
+        let data = try await apiClient.patch("chats/\(id.lowercaseUUIDString)", body: body)
         return try JSONDecoder.evenAI.decode(ChatDTO.self, from: data).toDomain()
     }
 
     func deleteChat(id: Chat.ID) async throws {
-        try await apiClient.delete("chats/\(id.uuidString)")
+        try await apiClient.delete("chats/\(id.lowercaseUUIDString)")
     }
 
     func fetchMessages(chatID: Chat.ID) async throws -> [Message] {
-        let data = try await apiClient.get("chats/\(chatID.uuidString)/messages")
+        let data = try await apiClient.get("chats/\(chatID.lowercaseUUIDString)/messages")
         return try JSONDecoder.evenAI.decode(MessagesResponseDTO.self, from: data).messages.map { $0.toDomain() }
     }
 
@@ -88,7 +88,7 @@ actor NetworkChatService: ChatServicing {
         content: String,
         continuation: AsyncThrowingStream<ChatStreamEvent, Error>.Continuation
     ) async throws {
-        let body = try JSONEncoder.evenAI.encode(["chatId": chatID.uuidString, "content": content])
+        let body = try JSONEncoder.evenAI.encode(["chatId": chatID.lowercaseUUIDString, "content": content])
         let (bytes, _) = try await apiClient.streamBytes(path: "chat/stream", body: body)
 
         var eventName: String?
@@ -173,4 +173,15 @@ enum NetworkChatServiceError: Error, Sendable, LocalizedError {
         case .server(let message): message
         }
     }
+}
+
+private extension UUID {
+    /// `UUID.uuidString` always renders uppercase, but the backend stores
+    /// and compares chat/message ids as lowercase (confirmed live: the
+    /// exact same id, same account, same token 404s as `CHAT_NOT_FOUND`
+    /// when sent uppercase and succeeds when sent lowercase) — a
+    /// case-sensitive string match server-side, not a canonicalized UUID
+    /// comparison. Every outgoing id in this file must go through this,
+    /// not `.uuidString`, whether it lands in a URL path or a JSON body.
+    var lowercaseUUIDString: String { uuidString.lowercased() }
 }

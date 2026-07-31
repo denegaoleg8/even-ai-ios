@@ -77,7 +77,15 @@ struct ChatView: View {
         // same reasoning applies here: the signed-in identity changing
         // (login/logout/restore, including a silent fallback) or a merge
         // completing must both re-fetch this chat too, not just the list.
+        //
+        // Gated on `!authState.isRestoringSession` for the same reason as
+        // ChatListView's identical guard: opening a chat immediately after
+        // launch races `RootView`'s `restoreSession()` resolving
+        // `currentUser` from nil to a real id, which would otherwise
+        // change `refreshTrigger` mid-fetch and have `.task(id:)` cancel
+        // this chat's `load()` call before it ever gets a response.
         .task(id: refreshTrigger) {
+            guard !authState.isRestoringSession else { return }
             await viewModel.load()
         }
     }

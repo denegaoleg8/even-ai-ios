@@ -104,7 +104,20 @@ struct ChatListView: View {
         // 3.7's silent-fallback sync), or a merge completing (same
         // identity, different chats underneath — see
         // AppState.chatListRefreshToken).
+        //
+        // Gated on `!authState.isRestoringSession`: `currentUser` starts
+        // `nil` and resolves to a real id the moment `RootView`'s launch-
+        // time `restoreSession()` finishes — often within milliseconds of
+        // this view's first appearance. Without this guard, that nil→
+        // resolved transition changes `refreshTrigger` and `.task(id:)`
+        // cancels whatever `loadChats()` call was already in flight from
+        // the initial (pre-restore) firing, surfacing as a spurious
+        // `URLError.cancelled` with no cached chats yet to fall back to.
+        // Skipping the call entirely while restoration is still in
+        // progress means the *next* firing (once the identity is settled)
+        // is the only one that ever calls `loadChats()`.
         .task(id: refreshTrigger) {
+            guard !authState.isRestoringSession else { return }
             await viewModel.loadChats()
         }
     }
