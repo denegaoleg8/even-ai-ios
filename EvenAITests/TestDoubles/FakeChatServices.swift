@@ -78,6 +78,60 @@ actor CountingCreateChatService: ChatServicing {
     }
 }
 
+/// Returns a fixed, caller-supplied list of chats/messages — used by
+/// `CachingChatServiceTests` to populate a cache with known content
+/// before exercising fallback/write-through behavior.
+actor StubChatService: ChatServicing {
+    private let chats: [Chat]
+    private let messages: [Message]
+
+    init(chats: [Chat] = [], messages: [Message] = []) {
+        self.chats = chats
+        self.messages = messages
+    }
+
+    func fetchChats() async throws -> [Chat] { chats }
+
+    func fetchChat(id: Chat.ID) async throws -> Chat {
+        guard let chat = chats.first(where: { $0.id == id }) else { throw FailingChatService.Failure() }
+        return chat
+    }
+
+    func createChat(title: String) async throws -> Chat { Chat(title: title) }
+    func renameChat(id: Chat.ID, title: String) async throws -> Chat { Chat(id: id, title: title) }
+    func deleteChat(id: Chat.ID) async throws {}
+    func fetchMessages(chatID: Chat.ID) async throws -> [Message] { messages.filter { $0.chatID == chatID } }
+
+    nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
+}
+
+/// Streams a caller-scripted sequence of events — lets a test control
+/// exactly which `ChatStreamEvent`s `streamReply` produces, e.g. to
+/// verify a decorator caches the "saved" events but not deltas.
+actor ScriptedStreamChatService: ChatServicing {
+    private let events: [ChatStreamEvent]
+
+    init(events: [ChatStreamEvent]) {
+        self.events = events
+    }
+
+    func fetchChats() async throws -> [Chat] { [] }
+    func fetchChat(id: Chat.ID) async throws -> Chat { Chat(id: id) }
+    func createChat(title: String) async throws -> Chat { Chat(title: title) }
+    func renameChat(id: Chat.ID, title: String) async throws -> Chat { Chat(id: id, title: title) }
+    func deleteChat(id: Chat.ID) async throws {}
+    func fetchMessages(chatID: Chat.ID) async throws -> [Message] { [] }
+
+    nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            for event in events { continuation.yield(event) }
+            continuation.finish()
+        }
+    }
+}
+
 /// Streams a user message and one delta, then the connection drops before
 /// the reply finishes — simulates a mid-stream network failure.
 actor PartialStreamThenFailChatService: ChatServicing {

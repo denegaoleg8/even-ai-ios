@@ -31,9 +31,22 @@ final class AuthState {
 
     private let authService: AuthServicing
     private var sessionChangeTask: Task<Void, Never>?
+    /// Phase 3.9: called at every point a signed-in identity's chats may
+    /// no longer match what `CachingChatService` has cached — logout,
+    /// switching to a different account, a merge changing which chats
+    /// this account owns, or a silent session-recovery fallback. Kept as
+    /// an injected closure, not a direct `CachingChatService` reference,
+    /// so `AuthState` stays exactly as decoupled from chat concerns as it
+    /// was before this cache existed — it knows "something needs
+    /// invalidating," never what that something is or how.
+    private let invalidateChatCache: @Sendable () async -> Void
 
-    init(authService: AuthServicing = AppContainer.live.authService) {
+    init(
+        authService: AuthServicing = AppContainer.live.authService,
+        invalidateChatCache: @escaping @Sendable () async -> Void = { AppContainer.live.chatCache.invalidate() }
+    ) {
         self.authService = authService
+        self.invalidateChatCache = invalidateChatCache
         observeSessionChanges()
     }
 
@@ -56,9 +69,18 @@ final class AuthState {
     @discardableResult
     func signIn(email: String, password: String) async throws -> AuthResult {
         let result = try await authService.signIn(email: email, password: password)
+        let isAccountSwitch = currentUser?.id != result.user.id
         currentUser = result.user
         mergeAvailableFrom = result.mergeAvailableFrom
         mergeToken = result.mergeToken
+        // Signing into the *same* account this device already had
+        // (claiming it via signup counts as "same," not a switch) leaves
+        // its cached chats still correct — nothing to invalidate. A
+        // genuine switch to a different account means the cache is now
+        // showing the wrong account's data entirely.
+        if isAccountSwitch {
+            await invalidateChatCache()
+        }
         return result
     }
 
@@ -71,6 +93,7 @@ final class AuthState {
         // this device's old chats into a completely different account.
         mergeAvailableFrom = nil
         mergeToken = nil
+        await invalidateChatCache()
     }
 
     func signOutEverywhere() async {
@@ -78,12 +101,16 @@ final class AuthState {
         currentUser = nil
         mergeAvailableFrom = nil
         mergeToken = nil
+        await invalidateChatCache()
     }
 
     func mergeAccount(fromAccountID: User.ID) async throws -> Int {
         let mergedCount = try await authService.mergeAccount(fromAccountID: fromAccountID, mergeToken: mergeToken)
         mergeAvailableFrom = nil
         mergeToken = nil
+        // The merge just changed which chats this account owns — cached
+        // data reflects a snapshot from before that happened.
+        await invalidateChatCache()
         return mergedCount
     }
 
@@ -94,11 +121,22 @@ final class AuthState {
     /// `AuthServicing.sessionChanges()` for why this exists.
     private func observeSessionChanges() {
         let authService = self.authService
+        let invalidateChatCache = self.invalidateChatCache
         sessionChangeTask = Task { [weak self] in
             let stream = await authService.sessionChanges()
             for await user in stream {
                 guard !Task.isCancelled, let self else { return }
+                // A routine token refresh re-resolves the *same*
+                // identity and fires this stream too — invalidating the
+                // cache every time that happens would defeat the point
+                // of having one. Only a genuinely different identity
+                // (the silent anonymous-fallback case this stream exists
+                // for) means the cache no longer matches who's signed in.
+                let identityChanged = self.currentUser?.id != user.id
                 self.currentUser = user
+                if identityChanged {
+                    await invalidateChatCache()
+                }
             }
         }
     }
