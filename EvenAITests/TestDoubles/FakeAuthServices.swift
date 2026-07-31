@@ -15,7 +15,8 @@ actor FailingAuthService: AuthServicing {
     func signIn(email: String, password: String) async throws -> AuthResult { throw errorToThrow }
     func signOut() async throws { throw errorToThrow }
     func signOutEverywhere() async throws { throw errorToThrow }
-    func mergeAccount(fromAccountID: User.ID) async throws -> Int { throw errorToThrow }
+    func mergeAccount(fromAccountID: User.ID, mergeToken: String?) async throws -> Int { throw errorToThrow }
+    func sessionChanges() async -> AsyncStream<User> { AsyncStream { _ in } }
 }
 
 /// In-memory `AuthTokenStoring` double — isolates tests from the real

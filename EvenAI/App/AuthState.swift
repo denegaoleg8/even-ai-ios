@@ -18,11 +18,23 @@ import Observation
 final class AuthState {
     private(set) var currentUser: User?
     private(set) var isRestoringSession = true
+    /// Set by `signIn` when the device already had its own local
+    /// (anonymous) account with chats — see `AuthResult.mergeAvailableFrom`.
+    /// Deliberately *not* cleared just because the merge screen was
+    /// skipped: "Skip for now" (Phase 3.7) means exactly that, so Settings
+    /// can still offer it later. It's cleared when a merge actually
+    /// succeeds, or when signing out makes it stale (see `signOut`).
+    private(set) var mergeAvailableFrom: User.ID?
+    /// Paired with `mergeAvailableFrom`, same lifecycle — see
+    /// `AuthResult.mergeToken`.
+    private(set) var mergeToken: String?
 
     private let authService: AuthServicing
+    private var sessionChangeTask: Task<Void, Never>?
 
     init(authService: AuthServicing = AppContainer.live.authService) {
         self.authService = authService
+        observeSessionChanges()
     }
 
     /// Called once, at launch. Never throws to its caller: a failure
@@ -45,20 +57,49 @@ final class AuthState {
     func signIn(email: String, password: String) async throws -> AuthResult {
         let result = try await authService.signIn(email: email, password: password)
         currentUser = result.user
+        mergeAvailableFrom = result.mergeAvailableFrom
+        mergeToken = result.mergeToken
         return result
     }
 
     func signOut() async {
         try? await authService.signOut()
         currentUser = nil
+        // A pending merge offer belonged to whatever account was just
+        // signed out of — carrying it forward would let a later merge
+        // call (scoped server-side to "whoever is signed in *now*") move
+        // this device's old chats into a completely different account.
+        mergeAvailableFrom = nil
+        mergeToken = nil
     }
 
     func signOutEverywhere() async {
         try? await authService.signOutEverywhere()
         currentUser = nil
+        mergeAvailableFrom = nil
+        mergeToken = nil
     }
 
     func mergeAccount(fromAccountID: User.ID) async throws -> Int {
-        try await authService.mergeAccount(fromAccountID: fromAccountID)
+        let mergedCount = try await authService.mergeAccount(fromAccountID: fromAccountID, mergeToken: mergeToken)
+        mergeAvailableFrom = nil
+        mergeToken = nil
+        return mergedCount
+    }
+
+    /// Subscribes for the lifetime of this instance (the whole app, in
+    /// practice — `AuthState` is constructed once in `EvenAIApp`) to
+    /// identity changes the underlying client resolves on its own, not
+    /// just the ones this object's own methods triggered. See
+    /// `AuthServicing.sessionChanges()` for why this exists.
+    private func observeSessionChanges() {
+        let authService = self.authService
+        sessionChangeTask = Task { [weak self] in
+            let stream = await authService.sessionChanges()
+            for await user in stream {
+                guard !Task.isCancelled, let self else { return }
+                self.currentUser = user
+            }
+        }
     }
 }

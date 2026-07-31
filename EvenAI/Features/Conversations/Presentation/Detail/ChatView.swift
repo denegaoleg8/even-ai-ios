@@ -2,6 +2,8 @@ import SwiftUI
 
 struct ChatView: View {
     let chatID: Chat.ID
+    @Environment(AuthState.self) private var authState
+    @Environment(AppState.self) private var appState
     @State private var viewModel: ChatViewModel
 
     init(chatID: Chat.ID) {
@@ -70,9 +72,18 @@ struct ChatView: View {
         }
         .navigationTitle(viewModel.chatTitle)
         .navigationBarTitleDisplayMode(.inline)
-        .task(id: chatID) {
+        // See ChatListView.refreshTrigger for why this is one combined
+        // key rather than separate `.task(id:)` modifiers per input —
+        // same reasoning applies here: the signed-in identity changing
+        // (login/logout/restore, including a silent fallback) or a merge
+        // completing must both re-fetch this chat too, not just the list.
+        .task(id: refreshTrigger) {
             await viewModel.load()
         }
+    }
+
+    private var refreshTrigger: String {
+        "\(chatID.uuidString)|\(authState.currentUser?.id.uuidString ?? "none")|\(appState.chatListRefreshToken)"
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
@@ -85,5 +96,7 @@ struct ChatView: View {
 #Preview {
     NavigationStack {
         ChatView(chatID: UUID())
+            .environment(AuthState())
+            .environment(AppState())
     }
 }

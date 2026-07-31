@@ -39,6 +39,19 @@ protocol AuthServicing: Sendable {
     /// Reassigns `fromAccountID`'s chats to the currently signed-in
     /// account (see `AuthResult.mergeAvailableFrom`). Returns the number
     /// of conversations moved. Safe to call more than once — the backend
-    /// endpoint is idempotent by construction.
-    func mergeAccount(fromAccountID: User.ID) async throws -> Int
+    /// endpoint is idempotent by construction. `mergeToken` should be
+    /// `AuthResult.mergeToken` from the sign-in that offered this merge,
+    /// when available (see that property) — `nil` is valid too (merging
+    /// later, past the token's window) and falls back to the backend's
+    /// original ownership check.
+    func mergeAccount(fromAccountID: User.ID, mergeToken: String?) async throws -> Int
+
+    /// Broadcasts the resolved identity every time the underlying session
+    /// is (re-)established, including *without* the caller asking for it
+    /// — e.g. a chat request silently recovering after its refresh token
+    /// was revoked. `AuthState` is the one subscriber, and this is what
+    /// lets it stay accurate without the caller ever polling or the app
+    /// needing a restart (see `AuthenticatedAPIClient.sessionChanges()`,
+    /// which `NetworkAuthService` delegates straight to).
+    func sessionChanges() async -> AsyncStream<User>
 }

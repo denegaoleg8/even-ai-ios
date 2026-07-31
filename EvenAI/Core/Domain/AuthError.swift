@@ -11,6 +11,14 @@ enum AuthError: Error, Sendable, LocalizedError, Equatable {
     case accountAlreadyClaimed
     case accountNotFound
     case cannotMergeClaimedAccount
+    /// The backend's optional proof-of-eligibility for a merge (see
+    /// `AuthResult.mergeToken`) was present but didn't check out — wrong,
+    /// tampered, or past its short window. Distinct from
+    /// `cannotMergeClaimedAccount`: this doesn't mean the merge itself is
+    /// invalid, just that this specific attempt needs a fresh sign-in to
+    /// retry (a new `mergeToken`), or can omit it and rely on the
+    /// backend's other check instead.
+    case invalidMergeToken
     case sessionExpired
     case sessionRevoked
     case offline
@@ -24,6 +32,7 @@ enum AuthError: Error, Sendable, LocalizedError, Equatable {
         case .accountAlreadyClaimed: "This account already has credentials."
         case .accountNotFound: "That account couldn't be found."
         case .cannotMergeClaimedAccount: "That account already belongs to someone else."
+        case .invalidMergeToken: "This merge request has expired. Please try merging again."
         case .sessionExpired: "Your session has expired. Please sign in again."
         case .sessionRevoked: "You've been signed out."
         case .offline: "No internet connection."

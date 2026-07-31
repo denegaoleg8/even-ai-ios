@@ -13,10 +13,13 @@ import Foundation
 /// transition to the signed-out state" and "continue chatting" true at
 /// the same time — a chat request that outlives its session doesn't
 /// throw a raw auth error at the caller, it transparently continues
-/// against a usable (now-anonymous) session. `AuthState` still learns
-/// about an explicit sign-out or sign-in the normal way, by awaiting the
-/// call it made; this fallback only matters for the *reactive*,
-/// mid-session case a caller never asked about.
+/// against a usable (now-anonymous) session. `AuthState` learns about an
+/// explicit sign-out or sign-in the normal way, by awaiting the call it
+/// made — and, as of Phase 3.7, also learns about *this* reactive,
+/// mid-session fallback the moment it happens, by subscribing to
+/// `sessionChanges()` below, rather than continuing to report a
+/// signed-in identity that's no longer real until something else
+/// happened to call `recoverSession()` again.
 ///
 /// Every future authenticated service (Chat as of this phase; Voice,
 /// Vision, Glasses, cloud sync later) is expected to be constructed with
@@ -41,6 +44,7 @@ actor AuthenticatedAPIClient {
 
     private var accessToken: String?
     private var recoveryTask: Task<User, Error>?
+    private var sessionChangeContinuation: AsyncStream<User>.Continuation?
 
     init(
         baseURL: URL = BackendConfiguration.baseURL,
@@ -81,6 +85,27 @@ actor AuthenticatedAPIClient {
     /// rather than rely on the Authorization header.
     func currentRefreshToken() -> String? {
         tokenStore.currentRefreshToken()
+    }
+
+    /// Broadcasts the resolved identity every time `recoverSession()`
+    /// resolves — whether that recovery was requested explicitly (launch-
+    /// time restore) or triggered silently, mid-request, by a 401 inside
+    /// `performOnce`/`streamBytes` that the caller never asked about.
+    /// That second case is this stream's entire reason to exist (Phase
+    /// 3.7): without it, a refresh token being revoked server-side while
+    /// the app sits in the foreground would fall back to an anonymous
+    /// session down here with nothing above ever finding out — `AuthState`
+    /// would keep reporting the old, no-longer-real signed-in user until
+    /// something else happened to call `restoreSession()` again (i.e.
+    /// never, short of relaunching the app). One subscriber in practice
+    /// (`AuthState`, for the app's lifetime) — a later subscription
+    /// simply replaces the previous continuation, which is correct for
+    /// that single-long-lived-listener shape and avoids bookkeeping this
+    /// app has no actual use for.
+    func sessionChanges() -> AsyncStream<User> {
+        AsyncStream { continuation in
+            sessionChangeContinuation = continuation
+        }
     }
 
     /// Resolves to a valid, usable session on every call — the stored
@@ -248,10 +273,14 @@ actor AuthenticatedAPIClient {
     // MARK: - Recovery (single-flight, two-tiered)
 
     private func performRecovery() async throws -> User {
-        if tokenStore.currentRefreshToken() != nil, let user = try? await performRefresh() {
-            return user
+        let user: User
+        if tokenStore.currentRefreshToken() != nil, let refreshed = try? await performRefresh() {
+            user = refreshed
+        } else {
+            user = try await performDeviceAuth()
         }
-        return try await performDeviceAuth()
+        sessionChangeContinuation?.yield(user)
+        return user
     }
 
     private func performRefresh() async throws -> User {

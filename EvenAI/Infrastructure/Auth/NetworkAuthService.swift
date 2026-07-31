@@ -59,7 +59,11 @@ struct NetworkAuthService: AuthServicing {
             let data = try await apiClient.post("auth/login", body: body, recoverOn401: false)
             let decoded = try JSONDecoder.evenAI.decode(LoginResponseDTO.self, from: data)
             await apiClient.installSession(accessToken: decoded.accessToken, refreshToken: decoded.refreshToken)
-            return AuthResult(user: decoded.account.toDomain(), mergeAvailableFrom: decoded.mergeAvailableFrom)
+            return AuthResult(
+                user: decoded.account.toDomain(),
+                mergeAvailableFrom: decoded.mergeAvailableFrom,
+                mergeToken: decoded.mergeToken
+            )
         } catch {
             throw Self.mapError(error)
         }
@@ -83,9 +87,15 @@ struct NetworkAuthService: AuthServicing {
         await apiClient.clearSession()
     }
 
-    func mergeAccount(fromAccountID: User.ID) async throws -> Int {
+    func sessionChanges() async -> AsyncStream<User> {
+        await apiClient.sessionChanges()
+    }
+
+    func mergeAccount(fromAccountID: User.ID, mergeToken: String?) async throws -> Int {
         do {
-            let body = try JSONEncoder.evenAI.encode(["fromAccountId": fromAccountID.uuidString])
+            var payload: [String: String] = ["fromAccountId": fromAccountID.uuidString]
+            if let mergeToken { payload["mergeToken"] = mergeToken }
+            let body = try JSONEncoder.evenAI.encode(payload)
             let data = try await apiClient.post("auth/merge", body: body)
             return try JSONDecoder.evenAI.decode(MergeResponseDTO.self, from: data).mergedChatCount
         } catch {
@@ -115,6 +125,7 @@ struct NetworkAuthService: AuthServicing {
             case "ACCOUNT_ALREADY_CLAIMED": return .accountAlreadyClaimed
             case "ACCOUNT_NOT_FOUND": return .accountNotFound
             case "CANNOT_MERGE_CLAIMED_ACCOUNT": return .cannotMergeClaimedAccount
+            case "INVALID_MERGE_TOKEN": return .invalidMergeToken
             case "UNAUTHORIZED": return .sessionExpired
             default: return status >= 500 ? .serverUnavailable : .unknown
             }

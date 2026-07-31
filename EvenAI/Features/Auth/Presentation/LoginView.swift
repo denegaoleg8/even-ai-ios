@@ -12,9 +12,14 @@ struct LoginView: View {
     @Environment(AuthState.self) private var authState
     @State private var viewModel = LoginViewModel()
     @State private var isForgotPasswordPresented = false
+    @State private var mergeTarget: MergeTarget?
 
     private enum Field: Hashable { case email, password }
     @FocusState private var focusedField: Field?
+
+    private struct MergeTarget: Identifiable {
+        let id: User.ID
+    }
 
     var body: some View {
         ScrollView {
@@ -102,13 +107,26 @@ struct LoginView: View {
         .sheet(isPresented: $isForgotPasswordPresented) {
             ForgotPasswordView()
         }
+        .sheet(item: $mergeTarget) { target in
+            MergeAccountView(fromAccountID: target.id, onFinished: onAuthenticated)
+        }
         .animation(.easeOut(duration: 0.2), value: viewModel.errorMessage)
     }
 
     private func submit() async {
         focusedField = nil
         guard await viewModel.submit(using: authState) else { return }
-        onAuthenticated()
+
+        // A successful sign-in that surfaced a merge offer hands off to
+        // MergeAccountView instead of closing immediately — that screen
+        // calls `onAuthenticated` itself once the user actually resolves
+        // it (merge or skip), so this flow only ever closes once, not
+        // once here and again from there.
+        if let mergeAvailableFrom = authState.mergeAvailableFrom {
+            mergeTarget = MergeTarget(id: mergeAvailableFrom)
+        } else {
+            onAuthenticated()
+        }
     }
 }
 

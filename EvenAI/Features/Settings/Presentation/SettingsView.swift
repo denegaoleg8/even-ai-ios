@@ -6,6 +6,8 @@ struct SettingsView: View {
     @State private var viewModel = SettingsViewModel()
     @State private var isAuthSheetPresented = false
     @State private var isSignOutConfirmationPresented = false
+    @State private var isMergeSheetPresented = false
+    @State private var isDeleteAccountPresented = false
 
     var body: some View {
         @Bindable var viewModel = viewModel
@@ -60,6 +62,14 @@ struct SettingsView: View {
             .sheet(isPresented: $isAuthSheetPresented) {
                 AuthWelcomeView(onAuthenticated: { isAuthSheetPresented = false })
             }
+            .sheet(isPresented: $isMergeSheetPresented) {
+                if let mergeAvailableFrom = authState.mergeAvailableFrom {
+                    MergeAccountView(fromAccountID: mergeAvailableFrom, onFinished: { isMergeSheetPresented = false })
+                }
+            }
+            .sheet(isPresented: $isDeleteAccountPresented) {
+                DeleteAccountView()
+            }
             .confirmationDialog(
                 "Sign Out",
                 isPresented: $isSignOutConfirmationPresented,
@@ -90,22 +100,42 @@ struct SettingsView: View {
                 .accessibilityElement(children: .combine)
                 .accessibilityIdentifier("settings.accountLoading")
             } else if let user = authState.currentUser, user.email != nil {
-                VStack(alignment: .leading, spacing: AppMetrics.Spacing.xs) {
-                    if let displayName = user.displayName, !displayName.isEmpty {
-                        Text(displayName)
-                            .font(AppTypography.chatTitle)
+                HStack(spacing: AppMetrics.Spacing.md) {
+                    AccountAvatarView(user: user)
+                    VStack(alignment: .leading, spacing: AppMetrics.Spacing.xs) {
+                        if let displayName = user.displayName, !displayName.isEmpty {
+                            Text(displayName)
+                                .font(AppTypography.chatTitle)
+                        }
+                        Text(user.email ?? "")
+                            .font(AppTypography.chatPreview)
+                            .foregroundStyle(AppColor.textSecondary)
                     }
-                    Text(user.email ?? "")
-                        .font(AppTypography.chatPreview)
-                        .foregroundStyle(AppColor.textSecondary)
                 }
                 .accessibilityElement(children: .combine)
                 .accessibilityIdentifier("settings.accountSignedIn")
+
+                LabeledContent("Subscription", value: viewModel.subscriptionTier)
+                deviceIDRow
+
+                if authState.mergeAvailableFrom != nil {
+                    Button {
+                        isMergeSheetPresented = true
+                    } label: {
+                        Label("Merge Conversations from This Device", systemImage: "arrow.triangle.merge")
+                    }
+                    .accessibilityIdentifier("settings.mergeButton")
+                }
 
                 Button("Sign Out", role: .destructive) {
                     isSignOutConfirmationPresented = true
                 }
                 .accessibilityIdentifier("settings.signOutButton")
+
+                Button("Delete Account", role: .destructive) {
+                    isDeleteAccountPresented = true
+                }
+                .accessibilityIdentifier("settings.deleteAccountButton")
             } else {
                 Button {
                     isAuthSheetPresented = true
@@ -113,14 +143,56 @@ struct SettingsView: View {
                     Label("Sign In or Create Account", systemImage: "person.crop.circle.badge.plus")
                 }
                 .accessibilityIdentifier("settings.signInButton")
+
+                deviceIDRow
             }
         } header: {
             SectionHeader(title: "Account")
         }
+    }
+
+    private var deviceIDRow: some View {
+        LabeledContent("Device ID") {
+            Text(viewModel.deviceID)
+                .font(.system(.footnote, design: .monospaced))
+                .foregroundStyle(AppColor.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .textSelection(.enabled)
+        .accessibilityIdentifier("settings.deviceID")
+    }
+}
+
+/// Initials-on-a-circle placeholder — there's no profile photo system in
+/// this app, so this is what "avatar placeholder" (Phase 3.7) means:
+/// real derived data (the account's own name/email), not a static
+/// silhouette icon standing in for nothing.
+private struct AccountAvatarView: View {
+    let user: User
+
+    private var initial: String {
+        let source = user.displayName?.trimmingCharacters(in: .whitespaces).first
+            ?? user.email?.first
+        guard let source else { return "?" }
+        return String(source).uppercased()
+    }
+
+    var body: some View {
+        Circle()
+            .fill(AppColor.accent.opacity(0.2))
+            .overlay(
+                Text(initial)
+                    .font(AppTypography.chatTitle)
+                    .foregroundStyle(AppColor.accent)
+            )
+            .frame(width: 44, height: 44)
+            .accessibilityHidden(true)
     }
 }
 
 #Preview {
     SettingsView()
         .environment(AuthState())
+        .environment(AppState())
 }

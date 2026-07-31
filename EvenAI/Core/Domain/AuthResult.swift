@@ -8,4 +8,7 @@ import Foundation
 struct AuthResult: Sendable {
     let user: User
     let mergeAvailableFrom: User.ID?
+    /// Paired with `mergeAvailableFrom` — see `AuthServicing.mergeAccount`
+    /// and `LoginResponseDTO.mergeToken`.
+    let mergeToken: String?
 }

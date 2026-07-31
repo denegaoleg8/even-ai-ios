@@ -8,4 +8,10 @@ import Observation
 final class AppState {
     var selectedChatID: Chat.ID?
     var isSettingsPresented: Bool = false
+    /// Bumped whenever something changed conversation data out from under
+    /// the currently-displayed list/chat without changing `selectedChatID`
+    /// or the signed-in identity — today, that's exactly one thing: a
+    /// successful account merge. `ChatListView`/`ChatView` key a `.task`
+    /// to this so they re-fetch instead of showing stale data.
+    var chatListRefreshToken: Int = 0
 }

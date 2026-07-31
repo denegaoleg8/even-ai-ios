@@ -28,6 +28,12 @@ struct LoginResponseDTO: Decodable {
     let refreshToken: String
     let account: AccountDTO
     let mergeAvailableFrom: UUID?
+    /// Short-lived proof, minted by this exact login call, that the
+    /// caller is who `mergeAvailableFrom` was actually offered to — see
+    /// the backend's `signMergeToken`. `nil` whenever `mergeAvailableFrom`
+    /// is, and safe to omit later (merging past its ~5 minute window
+    /// falls back to the backend's original ownership check).
+    let mergeToken: String?
 }
 
 struct SignupResponseDTO: Decodable {

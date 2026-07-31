@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ChatListView: View {
     @Environment(AppState.self) private var appState
+    @Environment(AuthState.self) private var authState
     @State private var viewModel = ChatListViewModel()
     @State private var chatPendingRename: Chat?
     @State private var renameText: String = ""
@@ -90,9 +91,22 @@ struct ChatListView: View {
             }
             Button("Cancel", role: .cancel) {}
         }
-        .task(id: appState.selectedChatID) {
+        // One combined key, not three separate `.task(id:)` modifiers —
+        // `.task(id:)` fires once immediately on top of firing on every
+        // id change, so three independent ones would fire three
+        // concurrent loadChats() calls on first appearance alone. This
+        // fires once per *meaningful* change: the selected chat, the
+        // signed-in identity (login/logout/restore, including Phase
+        // 3.7's silent-fallback sync), or a merge completing (same
+        // identity, different chats underneath — see
+        // AppState.chatListRefreshToken).
+        .task(id: refreshTrigger) {
             await viewModel.loadChats()
         }
+    }
+
+    private var refreshTrigger: String {
+        "\(appState.selectedChatID?.uuidString ?? "none")|\(authState.currentUser?.id.uuidString ?? "none")|\(appState.chatListRefreshToken)"
     }
 
     private var renameAlertBinding: Binding<Bool> {
@@ -120,6 +134,7 @@ struct ChatListView: View {
     NavigationSplitView {
         ChatListView()
             .environment(AppState())
+            .environment(AuthState())
     } detail: {
         Text("Detail")
     }

@@ -6,6 +6,7 @@ import Foundation
 actor MockAuthService: AuthServicing {
     private var currentUser: User
     private var registeredAccounts: [String: (user: User, password: String)] = [:] // keyed by lowercased email
+    private var sessionChangeContinuation: AsyncStream<User>.Continuation?
 
     init(currentUser: User = User(id: UUID(), email: nil, displayName: nil)) {
         self.currentUser = currentUser
@@ -35,7 +36,11 @@ actor MockAuthService: AuthServicing {
         let previousUserID = currentUser.id
         let mergeAvailableFrom = (previousUserID != entry.user.id && currentUser.email == nil) ? previousUserID : nil
         currentUser = entry.user
-        return AuthResult(user: entry.user, mergeAvailableFrom: mergeAvailableFrom)
+        return AuthResult(
+            user: entry.user,
+            mergeAvailableFrom: mergeAvailableFrom,
+            mergeToken: mergeAvailableFrom != nil ? "mock-merge-token" : nil
+        )
     }
 
     func signOut() async throws {
@@ -46,9 +51,27 @@ actor MockAuthService: AuthServicing {
         try await signOut()
     }
 
-    func mergeAccount(fromAccountID: User.ID) async throws -> Int {
+    func mergeAccount(fromAccountID: User.ID, mergeToken: String?) async throws -> Int {
         // No chat data exists in this mock to move — chat wiring isn't
-        // part of this phase (see Phase 3.5/3.7).
+        // part of this phase (see Phase 3.5/3.7). `mergeToken` isn't
+        // validated here; this mock isn't meant to reproduce the
+        // backend's security logic, only its shape.
         0
+    }
+
+    func sessionChanges() async -> AsyncStream<User> {
+        AsyncStream { continuation in
+            sessionChangeContinuation = continuation
+        }
+    }
+
+    /// Test-only: simulates `AuthenticatedAPIClient`'s silent anonymous
+    /// fallback (Phase 3.7) — production code never calls this; it's how
+    /// `AuthStateTests` verifies `AuthState` reacts to a session change it
+    /// never explicitly asked for, without needing a real `URLSession`
+    /// stub for something this mock can represent directly.
+    func simulateSilentFallback(to user: User) {
+        currentUser = user
+        sessionChangeContinuation?.yield(user)
     }
 }
