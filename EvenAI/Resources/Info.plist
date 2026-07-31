@@ -20,6 +20,8 @@
 	<string>1</string>
 	<key>EVEN_AI_API_BASE_URL</key>
 	<string>$(EVEN_AI_API_BASE_URL)</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
