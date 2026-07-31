@@ -11,6 +11,7 @@ struct EvenAIApp: App {
             RootView()
                 .environment(appState)
                 .environment(authState)
+                .environment(\.chatService, AppContainer.live.chatService)
         }
         .modelContainer(PersistenceController.shared)
     }

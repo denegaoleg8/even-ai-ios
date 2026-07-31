@@ -215,6 +215,7 @@ actor AuthenticatedAPIClient {
                 // answered, and retrying it would just get the same
                 // answer again.
                 guard Self.isRetryable(error), attempt < retryAttempts - 1 else { throw error }
+                AppLogger.networking.notice("Retrying \(method, privacy: .public) \(path, privacy: .public) after a transient failure (attempt \(attempt + 1, privacy: .public)/\(retryAttempts, privacy: .public))")
                 try? await Task.sleep(for: .milliseconds(300 * (attempt + 1)))
             }
         }
@@ -277,6 +278,13 @@ actor AuthenticatedAPIClient {
         if tokenStore.currentRefreshToken() != nil, let refreshed = try? await performRefresh() {
             user = refreshed
         } else {
+            // The one previously-silent transition this whole mechanism
+            // exists to catch (see the class doc comment and
+            // `sessionChanges()`): a signed-in session just became an
+            // anonymous one, possibly mid-request, with no explicit
+            // sign-out ever called. Never log the account id or any
+            // token — just that it happened.
+            AppLogger.auth.notice("Session recovery fell back to an anonymous device session (missing, expired, or revoked refresh token)")
             user = try await performDeviceAuth()
         }
         sessionChangeContinuation?.yield(user)

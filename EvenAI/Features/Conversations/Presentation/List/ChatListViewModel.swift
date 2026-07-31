@@ -17,7 +17,13 @@ final class ChatListViewModel {
 
     private let chatService: ChatServicing
 
-    init(chatService: ChatServicing = AppContainer.live.chatService) {
+    /// No default — `chatService` always comes from whoever constructs
+    /// this (`ChatListView`, itself given it via `RootView`'s
+    /// `@Environment(\.chatService)`, or a test's own fake directly).
+    /// Never resolved from `AppContainer.live` here: `Features` may only
+    /// reach `Infrastructure` through injection, never a concrete type in
+    /// `App/DI` (see `ARCHITECTURE.md`'s Dependency Rule).
+    init(chatService: ChatServicing) {
         self.chatService = chatService
     }
 

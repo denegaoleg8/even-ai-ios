@@ -52,7 +52,15 @@ struct KeychainAuthTokenStore: AuthTokenStoring {
         // silently propagate to a user's other devices through Keychain
         // sync, only through an explicit sign-in.
         attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        SecItemAdd(attributes as CFDictionary, nil)
+        let status = SecItemAdd(attributes as CFDictionary, nil)
+        if status != errSecSuccess {
+            // A failed write here means the *next* launch finds no
+            // refresh token and silently falls back to an anonymous
+            // session (see AuthenticatedAPIClient.performRecovery) —
+            // an unexplained sign-out with no trace anywhere unless this
+            // is logged. Never log the token itself, only the OSStatus.
+            AppLogger.auth.error("Failed to save refresh token to Keychain (OSStatus \(status, privacy: .public))")
+        }
     }
 
     func clear() {
@@ -61,6 +69,9 @@ struct KeychainAuthTokenStore: AuthTokenStoring {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
-        SecItemDelete(query as CFDictionary)
+        let status = SecItemDelete(query as CFDictionary)
+        if status != errSecSuccess && status != errSecItemNotFound {
+            AppLogger.auth.error("Failed to clear refresh token from Keychain (OSStatus \(status, privacy: .public))")
+        }
     }
 }

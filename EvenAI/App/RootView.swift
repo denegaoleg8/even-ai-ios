@@ -3,13 +3,14 @@ import SwiftUI
 struct RootView: View {
     @Environment(AppState.self) private var appState
     @Environment(AuthState.self) private var authState
+    @Environment(\.chatService) private var chatService
 
     var body: some View {
         NavigationSplitView {
-            ChatListView()
+            ChatListView(chatService: chatService)
         } detail: {
             if let chatID = appState.selectedChatID {
-                ChatView(chatID: chatID)
+                ChatView(chatID: chatID, chatService: chatService)
                     .id(chatID)
             } else {
                 EmptyStateView(

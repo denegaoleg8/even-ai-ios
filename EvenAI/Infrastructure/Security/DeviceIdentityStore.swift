@@ -52,6 +52,16 @@ struct KeychainDeviceIdentityStore: DeviceIdentityStoring {
         var attributes = query
         attributes[kSecValueData as String] = data
         attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        SecItemAdd(attributes as CFDictionary, nil)
+        let status = SecItemAdd(attributes as CFDictionary, nil)
+        if status != errSecSuccess {
+            // Worse than a failed token write: currentDeviceID() still
+            // hands back `id` even though it never persisted, so if this
+            // keeps failing, every call in this process generates and
+            // returns a *different* UUID (readUUID() never finds what
+            // was never saved) — a device that looks like a different
+            // one to the backend on every launch. The UUID itself isn't
+            // sensitive; logging it is what makes this diagnosable.
+            AppLogger.auth.error("Failed to save device identity \(id.uuidString, privacy: .public) to Keychain (OSStatus \(status, privacy: .public))")
+        }
     }
 }

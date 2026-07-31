@@ -3,9 +3,13 @@ import SwiftUI
 struct ChatListView: View {
     @Environment(AppState.self) private var appState
     @Environment(AuthState.self) private var authState
-    @State private var viewModel = ChatListViewModel()
+    @State private var viewModel: ChatListViewModel
     @State private var chatPendingRename: Chat?
     @State private var renameText: String = ""
+
+    init(chatService: ChatServicing) {
+        _viewModel = State(initialValue: ChatListViewModel(chatService: chatService))
+    }
 
     var body: some View {
         @Bindable var appState = appState
@@ -132,7 +136,7 @@ struct ChatListView: View {
 
 #Preview {
     NavigationSplitView {
-        ChatListView()
+        ChatListView(chatService: MockChatService())
             .environment(AppState())
             .environment(AuthState())
     } detail: {

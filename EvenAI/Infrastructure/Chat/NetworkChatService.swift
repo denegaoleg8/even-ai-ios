@@ -69,11 +69,20 @@ actor NetworkChatService: ChatServicing {
 
     // MARK: - Streaming
 
-    // Unchanged from Milestone 2 except for how the byte stream itself is
-    // obtained (apiClient.streamBytes instead of session.bytes directly)
-    // — the SSE line-parsing (event:/data: framing, heartbeat comments)
-    // is a chat-specific concern that stays here, not something the
-    // generic transport client should know about.
+    // Deliberately NOT `bytes.lines` (Foundation's `AsyncLineSequence`,
+    // built on top of the same raw `AsyncBytes` iterated manually below).
+    // Empirically confirmed — via a real `URLSession`/`AsyncBytes` round
+    // trip, not just code inspection — that `.lines` unconditionally
+    // drops every blank line, regardless of \n vs \r\n, single- or
+    // multi-chunk delivery, or where the blank line sits in the stream.
+    // SSE's entire event-framing model depends on a blank line marking
+    // "this event is complete, the next one starts here": `flush()`
+    // below only ever fired via the one unconditional call after the
+    // loop, meaning every event in any multi-event stream silently
+    // merged into one and was decoded — or failed to decode — as
+    // whichever `event:` name happened to arrive last. Splitting lines
+    // by hand over the raw byte sequence is what makes blank lines
+    // observable at all.
     private func performStream(
         chatID: Chat.ID,
         content: String,
@@ -91,17 +100,35 @@ actor NetworkChatService: ChatServicing {
             dataLines.removeAll()
         }
 
-        for try await line in bytes.lines {
+        func process(_ line: String) throws {
             if line.isEmpty {
                 try flush()
                 eventName = nil
             } else if line.hasPrefix(":") {
-                continue // comment / heartbeat
+                return // comment / heartbeat
             } else if line.hasPrefix("event:") {
                 eventName = String(line.dropFirst("event:".count)).trimmingCharacters(in: .whitespaces)
             } else if line.hasPrefix("data:") {
                 dataLines.append(String(line.dropFirst("data:".count)).trimmingCharacters(in: .whitespaces))
             }
+        }
+
+        var lineBuffer: [UInt8] = []
+        for try await byte in bytes {
+            if byte == UInt8(ascii: "\n") {
+                // A lone \r right before \n (CRLF line endings) would
+                // otherwise become part of the line's content.
+                if lineBuffer.last == UInt8(ascii: "\r") {
+                    lineBuffer.removeLast()
+                }
+                try process(String(decoding: lineBuffer, as: UTF8.self))
+                lineBuffer.removeAll(keepingCapacity: true)
+            } else {
+                lineBuffer.append(byte)
+            }
+        }
+        if !lineBuffer.isEmpty {
+            try process(String(decoding: lineBuffer, as: UTF8.self))
         }
         try flush()
     }
@@ -124,7 +151,9 @@ actor NetworkChatService: ChatServicing {
             continuation.yield(.assistantMessageSaved(decoded.message.toDomain()))
         case "error":
             let decoded = try? JSONDecoder.evenAI.decode(StreamErrorPayloadDTO.self, from: payloadData)
-            throw NetworkChatServiceError.server(decoded?.error.message ?? "Unknown streaming error.")
+            let message = decoded?.error.message ?? "Unknown streaming error."
+            AppLogger.chat.error("Streaming reply failed: \(message, privacy: .public)")
+            throw NetworkChatServiceError.server(message)
         default:
             break
         }

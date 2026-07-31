@@ -20,7 +20,8 @@ final class ChatViewModel {
     private let chatService: ChatServicing
     private var streamingMessageID: Message.ID?
 
-    init(chatID: Chat.ID, chatService: ChatServicing = AppContainer.live.chatService) {
+    /// No default — see `ChatListViewModel.init`'s note; same reasoning.
+    init(chatID: Chat.ID, chatService: ChatServicing) {
         self.chatID = chatID
         self.chatService = chatService
     }
