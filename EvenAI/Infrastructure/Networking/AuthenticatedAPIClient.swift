@@ -168,6 +168,13 @@ actor AuthenticatedAPIClient {
     /// retried on transient failure at all — a partially-consumed stream,
     /// or one that failed to open due to a flaky connection, is never
     /// safe to silently retry from here.
+    ///
+    /// The retry's response is validated just like `send`/`performOnce`
+    /// does — previously it wasn't, so a retry that *also* came back 401
+    /// (recovery resolving to a session the backend still rejects) was
+    /// never detected as an error at all: the 401's JSON error body has no
+    /// `event:`/`data:` framing, so the SSE parser silently read it as an
+    /// empty stream instead of surfacing the failure.
     func streamBytes(path: String, body: Data) async throws -> (URLSession.AsyncBytes, URLResponse) {
         let request = try await makeRequest(path: path, method: "POST", body: body, accept: "text/event-stream")
         do {
@@ -175,7 +182,9 @@ actor AuthenticatedAPIClient {
             if let http = response as? HTTPURLResponse, http.statusCode == 401 {
                 _ = try await recoverSession()
                 let retryRequest = try await makeRequest(path: path, method: "POST", body: body, accept: "text/event-stream")
-                return try await session.bytes(for: retryRequest)
+                let (retryBytes, retryResponse) = try await session.bytes(for: retryRequest)
+                try Self.validateStatus(retryResponse)
+                return (retryBytes, retryResponse)
             }
             try Self.validateStatus(response)
             return (bytes, response)
