@@ -27,5 +27,7 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Even AI uses Bluetooth to connect to your Even G2 glasses.</string>
 </dict>
 </plist>

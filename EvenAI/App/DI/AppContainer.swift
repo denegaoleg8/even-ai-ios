@@ -19,11 +19,18 @@ import Foundation
 /// purely so `AuthState` can call `invalidate()` on it — `ChatServicing`
 /// itself deliberately has no such method, since invalidation isn't a
 /// concept the network-only or mock implementations have any use for.
+///
+/// `glassesTransport` is `MentraGlassesTransport` as of Milestone 4 phase 1
+/// (transport abstraction only — see `GlassesTransport`). Constructing it
+/// here is inert: the underlying SDK object inside it is lazy, so nothing
+/// Bluetooth-related happens until something actually calls `connect()`,
+/// which no code does yet (no Glasses UI, no Chat wiring).
 struct AppContainer: Sendable {
     let apiClient: AuthenticatedAPIClient
     let authService: AuthServicing
     let chatService: ChatServicing
     let chatCache: CachingChatService
+    let glassesTransport: GlassesTransport
 
     static let live: AppContainer = {
         let apiClient = AuthenticatedAPIClient()
@@ -32,7 +39,8 @@ struct AppContainer: Sendable {
             apiClient: apiClient,
             authService: NetworkAuthService(apiClient: apiClient),
             chatService: cachingChatService,
-            chatCache: cachingChatService
+            chatCache: cachingChatService,
+            glassesTransport: MentraGlassesTransport()
         )
     }()
 }
