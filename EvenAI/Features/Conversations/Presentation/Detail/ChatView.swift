@@ -6,9 +6,11 @@ struct ChatView: View {
     @Environment(AppState.self) private var appState
     @State private var viewModel: ChatViewModel
 
-    init(chatID: Chat.ID, chatService: ChatServicing) {
+    init(chatID: Chat.ID, chatService: ChatServicing, glassesTransport: GlassesTransport) {
         self.chatID = chatID
-        _viewModel = State(initialValue: ChatViewModel(chatID: chatID, chatService: chatService))
+        _viewModel = State(
+            initialValue: ChatViewModel(chatID: chatID, chatService: chatService, glassesTransport: glassesTransport)
+        )
     }
 
     var body: some View {
@@ -103,7 +105,7 @@ struct ChatView: View {
 
 #Preview {
     NavigationStack {
-        ChatView(chatID: UUID(), chatService: MockChatService())
+        ChatView(chatID: UUID(), chatService: MockChatService(), glassesTransport: MockGlassesTransport())
             .environment(AuthState())
             .environment(AppState())
     }

@@ -4,13 +4,14 @@ struct RootView: View {
     @Environment(AppState.self) private var appState
     @Environment(AuthState.self) private var authState
     @Environment(\.chatService) private var chatService
+    @Environment(\.glassesTransport) private var glassesTransport
 
     var body: some View {
         NavigationSplitView {
             ChatListView(chatService: chatService)
         } detail: {
             if let chatID = appState.selectedChatID {
-                ChatView(chatID: chatID, chatService: chatService)
+                ChatView(chatID: chatID, chatService: chatService, glassesTransport: glassesTransport)
                     .id(chatID)
             } else {
                 EmptyStateView(
