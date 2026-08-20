@@ -63,6 +63,15 @@ targets:
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
         NSBluetoothAlwaysUsageDescription: "Even AI uses Bluetooth to connect to your Even G2 glasses."
+        # Keeps the G2 BLE connection alive through screen-lock/backgrounding
+        # (matches CoreBluetooth's own rules — MentraBluetoothSDK's README
+        # documents this as required for background BLE continuity). Does
+        # not, by itself, enable any reconnect-after-termination behavior —
+        # the SDK has no state-restoration support (no
+        # CBCentralManagerOptionRestoreIdentifierKey/willRestoreState
+        # anywhere in it), so that remains explicitly out of scope.
+        UIBackgroundModes:
+          - bluetooth-central
         EVEN_AI_API_BASE_URL: "$(EVEN_AI_API_BASE_URL)"
         ITSAppUsesNonExemptEncryption: false
   EvenAITests:

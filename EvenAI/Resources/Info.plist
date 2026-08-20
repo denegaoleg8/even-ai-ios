@@ -29,5 +29,9 @@
 	</dict>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Even AI uses Bluetooth to connect to your Even G2 glasses.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+	</array>
 </dict>
 </plist>
