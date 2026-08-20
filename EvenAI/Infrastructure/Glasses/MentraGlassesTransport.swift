@@ -50,6 +50,11 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
 
     private var stateContinuations: [UUID: AsyncStream<GlassesTransportState>.Continuation] = [:]
 
+    /// Pagination for whatever text is currently on G2's display — pure
+    /// state, no SDK dependency (see its own doc comment). One instance
+    /// per transport, replaced wholesale on every `sendText(_:)` call.
+    private var pagination = GlassesPaginationState()
+
     /// Upper bound on how long `connect()` will wait for CoreBluetooth's
     /// central-manager state to settle before giving up — see
     /// `BluetoothReadinessWatcher`. This is a safety net for a wait that is
@@ -110,14 +115,26 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
     /// that's a harmless, idempotent re-broadcast of the same value.
     func disconnect() async {
         sdk.disconnect()
+        pagination.clear()
         broadcast(.disconnected)
     }
 
+    /// Splits `text` into pages (see `GlassesTextPaginator`) and displays
+    /// only the first — identical to the pre-pagination behavior for any
+    /// text short enough to be a single page (`GlassesTextPaginator.pages`
+    /// returns the original string verbatim in that case, so this is the
+    /// exact same `sdk.displayText(text)` call as before). A new call here
+    /// always replaces whatever pagination state existed, starting fresh
+    /// at page 1 — there is no "append to the previous message" case.
+    /// Subsequent pages are shown only in response to a swipe, via
+    /// `didReceive(event:)` below.
     func sendText(_ text: String) async throws {
         guard sdk.glasses.connected else {
             throw GlassesTransportError.notConnected
         }
-        try await sdk.displayText(text)
+        pagination.start(withPages: GlassesTextPaginator.pages(for: text))
+        guard let firstPage = pagination.currentPage else { return }
+        try await sdk.displayText(firstPage)
     }
 
     /// Maps a raw `BluetoothSdkError` code to a clean, actionable message.
@@ -154,7 +171,42 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
 
 extension MentraGlassesTransport: MentraBluetoothSDKDelegate {
     func mentraBluetoothSDK(_ sdk: MentraBluetoothSDK, didUpdateGlasses glasses: GlassesRuntimeState) {
-        broadcast(Self.mapConnectionState(glasses.connection))
+        let state = Self.mapConnectionState(glasses.connection)
+        // Covers every disconnect path, not just our own `disconnect()` —
+        // an unexpected drop (out of range, battery, etc.) reports
+        // `.disconnected` here too, and pagination must not survive it.
+        if state == .disconnected {
+            pagination.clear()
+        }
+        broadcast(state)
+    }
+
+    /// G2's touchpad reports swipes as `.touch(TouchEvent)` — confirmed via
+    /// source: `OsEventType.scrollTop`/`.scrollBottom` map to
+    /// `"swipe_up"`/`"swipe_down"` gesture names in `G2.swift`, forwarded
+    /// through `Bridge.sendTouchEvent` to this exact delegate method. This
+    /// is the SDK's only navigation-relevant event — there is no separate
+    /// "next page" API (see the pagination audit); we drive our own page
+    /// state machine from it. Not `async` (protocol requirement), so a
+    /// resulting page change is sent via a detached `Task`, matching this
+    /// file's existing pattern for delegate-triggered SDK calls (e.g.
+    /// `BluetoothReadinessWatcher`'s state-update handling). Swallows a
+    /// failed re-display rather than affecting connection state — a screen
+    /// update failing is not a connection failure.
+    func mentraBluetoothSDK(_ sdk: MentraBluetoothSDK, didReceive event: BluetoothEvent) {
+        guard case .touch(let touch) = event, touch.isSwipe else { return }
+
+        let nextPage: String?
+        switch touch.gestureName {
+        case "swipe_down": nextPage = pagination.advance()
+        case "swipe_up": nextPage = pagination.retreat()
+        default: nextPage = nil
+        }
+
+        guard let nextPage else { return }
+        Task { @MainActor [weak self] in
+            try? await self?.sdk.displayText(nextPage)
+        }
     }
 
     func mentraBluetoothSDK(_ sdk: MentraBluetoothSDK, didDiscover device: Device) {
@@ -249,5 +301,162 @@ private enum BluetoothReadinessError: Error, LocalizedError {
         case .timedOut:
             "Couldn't reach Bluetooth. Try again."
         }
+    }
+}
+
+/// Splits long text into pages sized for G2's fixed-size display. Pure —
+/// no SDK/CoreBluetooth dependency — so it's directly unit-testable.
+///
+/// G2's default text container is the full 576×288px canvas
+/// (`G2.defaultTextContainer` in the vendored SDK source) with no
+/// documented character limit — rendering is pixel-based, and neither the
+/// SDK nor the firmware exposes any pagination/scrolling API (verified:
+/// `sendTextAt` just overwrites or adds a fixed-rect container; splitting
+/// text across multiple `displayText` calls does not, by itself, create
+/// navigable pages). `defaultMaxCharactersPerPage` is therefore a
+/// deliberately isolated, conservative estimate — not a documented
+/// hardware constant — meant to be tuned after physical-device testing.
+enum GlassesTextPaginator {
+    /// Deliberately isolated, conservative estimate — not a documented
+    /// hardware constant — meant to be tuned after physical-device
+    /// testing. Lowered from an earlier, larger value once physical
+    /// testing showed page-to-page swipes feeling abrupt: G2 has no true
+    /// scroll or transition capability (confirmed against the vendored
+    /// SDK — `updateTextMessage`'s `contentOffset`/`contentLength` fields
+    /// exist in the wire protocol, but the SDK itself always sends them
+    /// as `0`/full-length together, never partially, so there's no
+    /// verified scroll semantics to build on), so smaller, more frequent
+    /// page changes are the only lever available to make it read as more
+    /// incremental than a few large jumps.
+    static let defaultMaxCharactersPerPage = 140
+
+    /// How many trailing words of the previous page are repeated at the
+    /// start of the next one — a software approximation of continuity in
+    /// place of real scrolling: re-showing a little of what was just read
+    /// softens the instant cut between pages.
+    static let defaultOverlapWordCount = 3
+
+    /// Splits `text` into ordered pages of at most `maxCharactersPerPage`
+    /// `Character`s (grapheme clusters, never raw UTF-8 bytes or Unicode
+    /// scalars — a multi-byte/multi-scalar character is never split).
+    /// Prefers breaking on whitespace so words aren't cut mid-word; only
+    /// hard-breaks inside a single "word" when that word alone exceeds the
+    /// page budget (e.g. a long URL), so no character is ever dropped.
+    /// Text that already fits in one page is returned completely
+    /// unchanged — this keeps `sendText`'s behavior for short messages
+    /// byte-for-byte identical to before pagination existed.
+    ///
+    /// Each page after the first is prefixed with the last
+    /// `overlapWordCount` words of the page before it (see
+    /// `defaultOverlapWordCount`). This only repeats content for
+    /// readability — it never changes which page any given character
+    /// canonically belongs to; `coreSplit(text:maxCharactersPerPage:)`
+    /// (below) is the underlying non-overlapping partition, kept separate
+    /// so "no character is ever lost" stays verifiable independently of
+    /// the overlap feature.
+    static func pages(
+        for text: String,
+        maxCharactersPerPage: Int = GlassesTextPaginator.defaultMaxCharactersPerPage,
+        overlapWordCount: Int = GlassesTextPaginator.defaultOverlapWordCount
+    ) -> [String] {
+        let corePages = coreSplit(text: text, maxCharactersPerPage: maxCharactersPerPage)
+        guard corePages.count > 1, overlapWordCount > 0 else { return corePages }
+
+        var pages: [String] = [corePages[0]]
+        for index in 1 ..< corePages.count {
+            let previousWords = corePages[index - 1].split(whereSeparator: { $0.isWhitespace })
+            let overlapWords = previousWords.suffix(overlapWordCount)
+            if overlapWords.isEmpty {
+                pages.append(corePages[index])
+            } else {
+                pages.append(overlapWords.joined(separator: " ") + " " + corePages[index])
+            }
+        }
+        return pages
+    }
+
+    private static func coreSplit(text: String, maxCharactersPerPage: Int) -> [String] {
+        guard !text.isEmpty else { return [] }
+        let characters = Array(text)
+        guard characters.count > maxCharactersPerPage, maxCharactersPerPage > 0 else { return [text] }
+
+        var pages: [String] = []
+        var pageStart = 0
+
+        while pageStart < characters.count {
+            let remaining = characters.count - pageStart
+            if remaining <= maxCharactersPerPage {
+                pages.append(String(characters[pageStart...]))
+                break
+            }
+
+            let budgetEnd = pageStart + maxCharactersPerPage
+            var breakIndex = budgetEnd
+            var lastWhitespace: Int?
+            var i = pageStart
+            while i < budgetEnd {
+                if characters[i].isWhitespace { lastWhitespace = i }
+                i += 1
+            }
+            if let lastWhitespace, lastWhitespace > pageStart {
+                breakIndex = lastWhitespace
+            }
+            // else: no whitespace anywhere in this page's budget (one very
+            // long unbroken run of characters) — hard-break exactly at the
+            // budget so every character still lands on some page.
+
+            let pageText = String(characters[pageStart..<breakIndex])
+            if !pageText.isEmpty {
+                pages.append(pageText)
+            }
+            pageStart = breakIndex
+            while pageStart < characters.count, characters[pageStart].isWhitespace {
+                pageStart += 1
+            }
+        }
+
+        return pages
+    }
+}
+
+/// Pure pagination state machine: which page of the current message is
+/// showing, and how `advance()`/`retreat()` move through them. No
+/// SDK/CoreBluetooth dependency, so it's directly unit-testable —
+/// `MentraGlassesTransport` owns one instance and translates its output
+/// into `sdk.displayText(...)` calls; this type only tracks state.
+struct GlassesPaginationState {
+    private(set) var pages: [String] = []
+    private(set) var currentIndex = 0
+
+    var currentPage: String? {
+        pages.indices.contains(currentIndex) ? pages[currentIndex] : nil
+    }
+
+    /// A new message always replaces whatever was showing and starts at
+    /// page 1 — never appends to or merges with a previous message.
+    mutating func start(withPages newPages: [String]) {
+        pages = newPages
+        currentIndex = 0
+    }
+
+    /// Moves to the next page and returns its text, or `nil` if already on
+    /// the last page (nothing changed, nothing to (re-)send).
+    mutating func advance() -> String? {
+        guard currentIndex + 1 < pages.count else { return nil }
+        currentIndex += 1
+        return currentPage
+    }
+
+    /// Moves to the previous page and returns its text, or `nil` if
+    /// already on the first page.
+    mutating func retreat() -> String? {
+        guard currentIndex > 0 else { return nil }
+        currentIndex -= 1
+        return currentPage
+    }
+
+    mutating func clear() {
+        pages = []
+        currentIndex = 0
     }
 }
