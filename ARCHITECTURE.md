@@ -28,7 +28,8 @@ EvenAI/
 │   ├── AppState.swift           selectedChatID, isSettingsPresented
 │   └── DI/AppContainer.swift    static .live — the one place that picks the concrete ChatServicing
 ├── Core/
-│   ├── Domain/               Chat, Message, MessageRole, MessageStatus, ChatStreamEvent, ChatServicing (protocol)
+│   ├── Domain/               Chat, Message, MessageRole, MessageStatus, ChatStreamEvent, ChatServicing (protocol);
+│   │                          GlassesTransport, GlassesTransportState, GlassesTransportError (protocol) — see "Glasses transport" below
 │   ├── DesignSystem/         PrimaryButton, EmptyStateView, LoadingView, SectionHeader, TypingIndicatorView
 │   └── Theme/                 AppColor, AppTypography, AppMetrics
 ├── Infrastructure/
@@ -38,13 +39,18 @@ EvenAI/
 │   │   ├── ChatAPIDTOs.swift           Wire-format DTOs + ISO8601 date coding, separate from domain structs
 │   │   └── BackendConfiguration.swift  Base URL (Info.plist override → localhost fallback)
 │   ├── Persistence/           PersistenceController, ChatEntity, MessageEntity (SwiftData)
-│   └── Security/              DeviceIdentityStore (Keychain-backed UUID; not yet wired to auth — see Roadmap)
+│   ├── Security/               DeviceIdentityStore (Keychain-backed UUID; not yet wired to auth — see Roadmap)
+│   └── Glasses/
+│       ├── MentraGlassesTransport.swift   GlassesTransport implementation — the only file that imports MentraBluetoothSDK
+│       └── MockGlassesTransport.swift     In-memory stand-in for tests/previews, mirrors MockChatService/MockAuthService
 └── Features/
     ├── Conversations/Presentation/{List,Detail,Components}    Chat list + chat screen + their view-specific components
     ├── Settings/Presentation/
     ├── Voice/Presentation/         Placeholder only
     ├── Vision/Presentation/        Placeholder only
-    └── Glasses/Presentation/       Placeholder only
+    └── Glasses/Presentation/       GlassesView + GlassesViewModel — Connect/Disconnect + Send Test Text,
+                                     verified end-to-end against physical Even G2 hardware (Milestone 4, phase 1);
+                                     no Chat integration yet
 ```
 
 Project is generated via **XcodeGen** (`project.yml` is the source of truth; `xcodegen generate` produces `EvenAI.xcodeproj`, which is not checked in).
@@ -78,6 +84,18 @@ src/
 4. `NetworkChatService` decodes each SSE payload into a `ChatStreamEvent` (`.userMessageSaved` / `.assistantDelta` / `.assistantMessageSaved`) and yields it through an `AsyncThrowingStream`.
 5. `ChatViewModel` consumes the stream, appending/growing a `.streaming`-status placeholder message as deltas arrive, replacing it with the final message on completion — or marking it `.failed` (see below) if the stream breaks.
 
+## Glasses transport (Milestone 4, phase 1)
+
+`GlassesTransport` (`Core/Domain/GlassesTransport.swift`) is the vendor-neutral abstraction over the glasses BLE link — `connectionStateUpdates()`, `connect()`, `disconnect()`, `sendText(_:)` — mirroring `ChatServicing`'s role for chat. Same Dependency Rule as everywhere else: `Core/Domain/{GlassesTransport,GlassesTransportState,GlassesTransportError}.swift` have zero knowledge of any vendor SDK.
+
+`MentraGlassesTransport` (`Infrastructure/Glasses/`) is the concrete implementation, talking to Even Realities G2 glasses via the third-party `MentraBluetoothSDK` (Mentra-Community, pinned to `0.1.21-beta.5` in `project.yml`'s `packages:`). **`MentraBluetoothSDK` is imported by exactly one file in this codebase** — `MentraGlassesTransport.swift` — the same isolation principle already applied to `ChatAPIDTOs`/wire formats: nothing above this file, including `GlassesTransport` itself, ever sees a MentraBluetoothSDK type. This is what keeps the transport swappable later (a different SDK, a future Even Hub bridge, direct CoreBluetooth) without touching `Features/Glasses`, Chat, or the backend — the explicit requirement behind choosing this SDK in the first place (see `ROADMAP.md` Milestone 4).
+
+`MockGlassesTransport` (`Infrastructure/Glasses/`) is the in-memory stand-in for tests/previews, mirroring `MockChatService`/`MockAuthService`'s role. DI follows the pattern already established for `chatService`: `AppContainer.live.glassesTransport`, threaded through `EnvironmentValues.glassesTransport` (default `MockGlassesTransport()`), overridden with the real instance in `EvenAIApp`.
+
+**Glasses currently operates entirely independently of Chat, Voice, and Vision.** `GlassesView`/`GlassesViewModel` (`Features/Glasses/Presentation/`) depend only on `GlassesTransport`; nothing in `Features/Conversations`, `Infrastructure/Chat`, or `Infrastructure/Networking` references `GlassesTransport`, and nothing in `Features/Glasses` references `ChatServicing`. Chat messages are not sent to the glasses — that integration is deliberately not yet built (see `ROADMAP.md`).
+
+**Bluetooth permission and connection behavior.** `MentraBluetoothSDK` is constructed lazily inside `MentraGlassesTransport` — merely opening the Glasses screen does not construct it and does not trigger iOS's Bluetooth permission prompt; only pressing Connect does, since `MentraBluetoothSDK.init()` is what first touches `CBCentralManager`. `NSBluetoothAlwaysUsageDescription` is declared via `project.yml`'s Info.plist properties. Once Connect is pressed, `connect()` waits for CoreBluetooth's central-manager state to genuinely settle (`.poweredOn`) before calling `startScan` — via `BluetoothReadinessWatcher`, a small helper using Apple's own `CoreBluetooth` API directly (a second, independent `CBCentralManager`, since MentraBluetoothSDK exposes no public way to observe this internally) that waits for the real `centralManagerDidUpdateState` event rather than guessing an interval, bounded by a 10-second timeout as a safety net. A real `.unauthorized`/`.poweredOff`/`.unsupported` condition surfaces immediately instead of being retried. No background Bluetooth mode is declared — the app does not maintain a glasses connection while backgrounded.
+
 ## Key engineering decisions
 
 - **DTOs are separate from domain structs.** `ChatDTO`/`MessageDTO` (Infrastructure) map to/from `Chat`/`Message` (Core.Domain) rather than making the domain structs `Codable` against the wire format directly — the backend's `chatId` JSON key doesn't match the domain's `chatID` property, and this keeps JSON-key concerns out of Core entirely. The same separation exists for SwiftData (`ChatEntity`/`MessageEntity` → `.toDomain()`).
@@ -101,7 +119,7 @@ Two things were found, considered, and deliberately **not** changed:
 ## What is *not* yet implemented
 
 - Authentication (device identity exists in `Infrastructure/Security/DeviceIdentityStore` but isn't wired to any backend auth flow yet).
-- Any glasses/BLE transport (`Features/Glasses` is a placeholder screen only).
+- Chat → Glasses mirroring: chat messages are not sent to the glasses. The transport (`GlassesTransport`/`MentraGlassesTransport`) and a working Connect/Disconnect + "Send Test Text" screen exist and are verified against physical Even G2 hardware — see "Glasses transport" above and `ROADMAP.md` Milestone 4.
 - Voice and Vision modules (placeholder screens only).
 - An offline/local cache for the production (network) chat path.
 
