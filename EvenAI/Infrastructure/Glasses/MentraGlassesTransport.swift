@@ -49,6 +49,12 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
 
     private var stateContinuations: [UUID: AsyncStream<GlassesTransportState>.Continuation] = [:]
 
+    /// `startScan` fails with this exact code when `CBCentralManager`'s
+    /// state hasn't synced with the Bluetooth daemon yet — see `connect()`.
+    private static let bluetoothNotReadyErrorCode = "bluetooth_not_ready"
+    private static let startScanMaxAttempts = 4
+    private static let startScanRetryDelay: Duration = .milliseconds(350)
+
     nonisolated init() {}
 
     func connectionStateUpdates() async -> AsyncStream<GlassesTransportState> {
@@ -67,8 +73,33 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
         }
     }
 
+    /// `sdk` (and the `CBCentralManager` it owns, via MentraBluetoothSDK's
+    /// internal `BluetoothAvailability` singleton) is constructed lazily on
+    /// this exact call — see `sdk`'s doc comment — with no run-loop turn
+    /// between that construction and `startScan`'s internal readiness check.
+    /// `CBCentralManager.state` doesn't reflect the real (already-granted,
+    /// already-on) hardware state until CoreBluetooth's async
+    /// `centralManagerDidUpdateState` callback lands, so the very first
+    /// scan attempt per process launch deterministically sees `.unknown`
+    /// and throws `BluetoothSdkError(code: "bluetooth_not_ready", ...)` —
+    /// confirmed against MentraBluetoothSDK's own source
+    /// (`BluetoothAvailability.requirePoweredOn`). `BluetoothAvailability`
+    /// is internal to that module, so there's no public hook to await
+    /// readiness directly; a short bounded retry is the only fix available
+    /// from here. Only this specific, transient code is retried — a real
+    /// `.unauthorized`/`.poweredOff`/`.unsupported` failure (or any other
+    /// error) surfaces immediately, since retrying those would just waste
+    /// time on a state that isn't going to change on its own.
     func connect() async throws {
-        try sdk.startScan(model: .g2)
+        for attempt in 1...Self.startScanMaxAttempts {
+            do {
+                try sdk.startScan(model: .g2)
+                return
+            } catch let error as BluetoothSdkError where error.code == Self.bluetoothNotReadyErrorCode {
+                guard attempt < Self.startScanMaxAttempts else { throw error }
+                try? await Task.sleep(for: Self.startScanRetryDelay)
+            }
+        }
     }
 
     func disconnect() async {
