@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(AuthState.self) private var authState
+    @Environment(\.glassesTransport) private var glassesTransport
     @State private var viewModel = SettingsViewModel()
     @State private var isAuthSheetPresented = false
     @State private var isSignOutConfirmationPresented = false
@@ -38,7 +39,7 @@ struct SettingsView: View {
                         Label("Vision", systemImage: "eye")
                     }
                     NavigationLink {
-                        GlassesPlaceholderView()
+                        GlassesView(transport: glassesTransport)
                     } label: {
                         Label("Glasses", systemImage: "eyeglasses")
                     }

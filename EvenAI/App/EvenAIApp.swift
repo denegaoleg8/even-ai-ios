@@ -12,6 +12,7 @@ struct EvenAIApp: App {
                 .environment(appState)
                 .environment(authState)
                 .environment(\.chatService, AppContainer.live.chatService)
+                .environment(\.glassesTransport, AppContainer.live.glassesTransport)
         }
         .modelContainer(PersistenceController.shared)
     }

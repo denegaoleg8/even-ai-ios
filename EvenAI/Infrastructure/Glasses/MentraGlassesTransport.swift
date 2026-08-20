@@ -32,7 +32,16 @@ import MentraBluetoothSDK
 /// class-wide isolation, never accessed concurrently.
 @MainActor
 final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
+    /// Tracks whether `sdk` has been touched yet, so `connectionStateUpdates()`
+    /// can report the (trivially correct) `.disconnected` state without
+    /// forcing lazy SDK construction — see `sdk`'s own doc comment. Without
+    /// this, a Glasses screen that merely subscribes to state on appear
+    /// (before the user ever presses Connect) would silently trigger the
+    /// Bluetooth permission prompt.
+    private var isSDKStarted = false
+
     private lazy var sdk: MentraBluetoothSDK = {
+        isSDKStarted = true
         let sdk = MentraBluetoothSDK()
         sdk.delegate = self
         return sdk
@@ -43,7 +52,9 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
     nonisolated init() {}
 
     func connectionStateUpdates() async -> AsyncStream<GlassesTransportState> {
-        let currentState = Self.mapConnectionState(sdk.glasses.connection)
+        let currentState: GlassesTransportState = isSDKStarted
+            ? Self.mapConnectionState(sdk.glasses.connection)
+            : .disconnected
         return AsyncStream { continuation in
             let id = UUID()
             stateContinuations[id] = continuation
