@@ -102,8 +102,15 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
         try sdk.startScan(model: .g2)
     }
 
+    /// Broadcasts `.disconnected` immediately rather than waiting on the
+    /// SDK's own async `DeviceStore` → `didUpdateGlasses` propagation —
+    /// makes the reset deterministic (Phase 2 hardening) instead of
+    /// depending on the timing of an internal chain we don't control. If
+    /// the SDK's own `didUpdateGlasses` later reports `.disconnected` too,
+    /// that's a harmless, idempotent re-broadcast of the same value.
     func disconnect() async {
         sdk.disconnect()
+        broadcast(.disconnected)
     }
 
     func sendText(_ text: String) async throws {
@@ -111,6 +118,22 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
             throw GlassesTransportError.notConnected
         }
         try await sdk.displayText(text)
+    }
+
+    /// Maps a raw `BluetoothSdkError` code to a clean, actionable message.
+    /// `"pair_failure"` is what `MentraBluetoothSDK` reports when G2's
+    /// internal 10-second dual-peripheral pairing timeout fires having
+    /// found only one arm (left or right) — traced to `Bridge.
+    /// sendPairFailureEvent("errors:pairNeedDisconnect")` → `dispatchBridgeEvent`'s
+    /// `case "pair_failure"` → `BluetoothSdkError(code: "pair_failure",
+    /// message: "errors:pairNeedDisconnect")`. Left as-is, that raw slug
+    /// reaches the UI verbatim via `.failed(_:)` — not stuck, but not
+    /// explicit either. Every other code passes through unchanged.
+    /// Internal (not `private`) so it's directly unit-testable without
+    /// constructing a real `MentraBluetoothSDK`/`CBCentralManager`.
+    nonisolated static func failureMessage(forCode code: String, rawMessage: String) -> String {
+        guard code == "pair_failure" else { return rawMessage }
+        return "Couldn't pair with both sides of your G2. Unpair the glasses in iPhone Settings → Bluetooth, then try again."
     }
 
     private static func mapConnectionState(_ state: GlassesConnectionState) -> GlassesTransportState {
@@ -145,7 +168,7 @@ extension MentraGlassesTransport: MentraBluetoothSDKDelegate {
     }
 
     func mentraBluetoothSDK(_ sdk: MentraBluetoothSDK, didFail error: BluetoothSdkError) {
-        broadcast(.failed(error.message))
+        broadcast(.failed(Self.failureMessage(forCode: error.code, rawMessage: error.message)))
     }
 }
 

@@ -29,6 +29,9 @@ final class GlassesViewModel {
     }
 
     func connect() async {
+        // Clear any stale error from a previous session — a fresh connect
+        // attempt shouldn't leave an old "Send Test Text" failure visible.
+        sendError = nil
         do {
             try await transport.connect()
         } catch {
@@ -42,6 +45,12 @@ final class GlassesViewModel {
 
     func disconnect() async {
         await transport.disconnect()
+        // Set directly rather than only waiting on the transport's own
+        // broadcast — guarantees a manual disconnect always leaves this
+        // view model in `.disconnected`, deterministically, regardless of
+        // how quickly (or whether) the transport's own state stream catches
+        // up (see `MentraGlassesTransport.disconnect()`).
+        connectionState = .disconnected
     }
 
     func sendTestText() async {
