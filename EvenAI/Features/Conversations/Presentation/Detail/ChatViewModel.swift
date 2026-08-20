@@ -18,14 +18,19 @@ final class ChatViewModel {
     private(set) var loadFailed = false
 
     private let chatService: ChatServicing
-    private let glassesTransport: GlassesTransport
+    private let messageSender: ChatMessageSending
     private var streamingMessageID: Message.ID?
 
     /// No default — see `ChatListViewModel.init`'s note; same reasoning.
+    /// Constructor signature deliberately unchanged even though sending no
+    /// longer goes straight through `chatService` — `messageSender` (built
+    /// here, not injected) wraps the same `chatService`/`glassesTransport`
+    /// pair this type always took, so `ChatView`/`RootView`/existing tests
+    /// need no changes — see `ChatMessageSending`'s doc comment.
     init(chatID: Chat.ID, chatService: ChatServicing, glassesTransport: GlassesTransport) {
         self.chatID = chatID
         self.chatService = chatService
-        self.glassesTransport = glassesTransport
+        self.messageSender = ChatMessageSender(chatService: chatService, glassesTransport: glassesTransport)
     }
 
     func load() async {
@@ -56,7 +61,7 @@ final class ChatViewModel {
         }
 
         do {
-            let stream = chatService.streamReply(chatID: chatID, content: text)
+            let stream = messageSender.send(chatID: chatID, content: text)
             for try await event in stream {
                 if case .userMessageSaved = event { didReceiveUserMessage = true }
                 handle(event)
@@ -92,25 +97,9 @@ final class ChatViewModel {
                 messages.append(message)
             }
             streamingMessageID = nil
-            mirrorToGlasses(message)
-        }
-    }
-
-    /// Best-effort, one-way mirror of a just-completed reply — fired exactly
-    /// once per `sendDraft()` call, only from this `.assistantMessageSaved`
-    /// branch of the event this send's own stream produced (never from
-    /// `load()`, which assigns `messages` directly from history and never
-    /// touches `handle(_:)` — so switching to or reloading an existing chat
-    /// never re-mirrors old replies). Never awaited by `sendDraft()`'s own
-    /// loop, so a slow or hung BLE write can never delay clearing
-    /// `isSending`/unlocking the input bar, and never affects Chat's own
-    /// success/failure state. Silently no-ops if glasses aren't connected
-    /// (`GlassesTransportError.notConnected`) — Chat has no dependency on,
-    /// and never observes, glasses connection state.
-    private func mirrorToGlasses(_ message: Message) {
-        guard !message.content.isEmpty else { return }
-        Task { [glassesTransport] in
-            try? await glassesTransport.sendText(message.content)
+            // Mirroring to the glasses now happens inside `messageSender`
+            // itself (see `ChatMessageSender`) — this branch only updates
+            // this view model's own `messages`, same as every other event.
         }
     }
 

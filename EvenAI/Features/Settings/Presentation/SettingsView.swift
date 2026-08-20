@@ -29,7 +29,7 @@ struct SettingsView: View {
 
                 Section {
                     NavigationLink {
-                        VoicePlaceholderView()
+                        LiveTranslationView()
                     } label: {
                         Label("Voice", systemImage: "waveform")
                     }

@@ -4,6 +4,7 @@ struct ChatView: View {
     let chatID: Chat.ID
     @Environment(AuthState.self) private var authState
     @Environment(AppState.self) private var appState
+    @Environment(LiveTranslationService.self) private var liveTranslation
     @State private var viewModel: ChatViewModel
 
     init(chatID: Chat.ID, chatService: ChatServicing, glassesTransport: GlassesTransport) {
@@ -17,6 +18,10 @@ struct ChatView: View {
         @Bindable var viewModel = viewModel
 
         VStack(spacing: 0) {
+            if liveTranslation.state == .listening, let phrase = liveTranslation.lastRecognizedPhrase {
+                liveTranslationBanner(phrase: phrase)
+            }
+
             if viewModel.isLoading && viewModel.messages.isEmpty {
                 LoadingView(label: "Loading messages...")
             } else if viewModel.messages.isEmpty && viewModel.loadFailed {
@@ -92,6 +97,31 @@ struct ChatView: View {
         }
     }
 
+    /// Read-only: shows the most recent live-recognized phrase (and its
+    /// Ukrainian translation, if one was produced) while `LiveTranslationService`
+    /// is listening. This is purely informational — it never becomes a
+    /// `Message`, is never persisted, and is not part of `viewModel`'s
+    /// state, so it can't interfere with `ChatMessageSender`/normal Chat.
+    private func liveTranslationBanner(phrase: String) -> some View {
+        HStack(alignment: .top, spacing: AppMetrics.Spacing.sm) {
+            Image(systemName: "globe")
+                .foregroundStyle(AppColor.accent)
+            VStack(alignment: .leading, spacing: AppMetrics.Spacing.xs) {
+                Text(phrase)
+                    .font(AppTypography.chatPreview)
+                if let translation = liveTranslation.lastTranslation {
+                    Text(translation)
+                        .font(AppTypography.chatPreview)
+                        .foregroundStyle(AppColor.textSecondary)
+                }
+            }
+            Spacer()
+        }
+        .padding(AppMetrics.Spacing.sm)
+        .background(AppColor.secondaryBackground)
+        .accessibilityIdentifier("chat.liveTranslationBanner")
+    }
+
     private var refreshTrigger: String {
         "\(chatID.uuidString)|\(authState.currentUser?.id.uuidString ?? "none")|\(appState.chatListRefreshToken)"
     }
@@ -108,5 +138,12 @@ struct ChatView: View {
         ChatView(chatID: UUID(), chatService: MockChatService(), glassesTransport: MockGlassesTransport())
             .environment(AuthState())
             .environment(AppState())
+            .environment(
+                LiveTranslationService(
+                    glassesTransport: MockGlassesTransport(),
+                    transcriber: GlassesSpeechTranscriber(),
+                    translator: AppleLanguageTranslator()
+                )
+            )
     }
 }

@@ -1,10 +1,15 @@
 import SwiftUI
+// `TranslationSession` predates Swift 6 strict-concurrency annotations —
+// see `AppleLanguageTranslator.swift`'s import comment.
+@preconcurrency import Translation
 
 struct RootView: View {
     @Environment(AppState.self) private var appState
     @Environment(AuthState.self) private var authState
+    @Environment(\.languageTranslator) private var languageTranslator
     @Environment(\.chatService) private var chatService
     @Environment(\.glassesTransport) private var glassesTransport
+    @State private var translationConfiguration: TranslationSession.Configuration?
 
     var body: some View {
         NavigationSplitView {
@@ -30,6 +35,20 @@ struct RootView: View {
         .task {
             await authState.restoreSession()
         }
+        // `LiveTranslationService` is app-level and must outlive any one
+        // screen, but the `Translation` framework only vends a usable
+        // `TranslationSession` through this exact SwiftUI modifier — this
+        // is the highest, always-present place in the hierarchy to host
+        // it. `languageTranslator.runSession(_:)` just drains translation
+        // requests as they arrive; it doesn't care which view attached it.
+        .translationTask(translationConfiguration) { session in
+            await languageTranslator.runSession(session)
+        }
+        .onAppear {
+            if translationConfiguration == nil {
+                translationConfiguration = TranslationSession.Configuration(target: Locale.Language(identifier: "uk"))
+            }
+        }
     }
 }
 
@@ -37,4 +56,11 @@ struct RootView: View {
     RootView()
         .environment(AppState())
         .environment(AuthState())
+        .environment(
+            LiveTranslationService(
+                glassesTransport: MockGlassesTransport(),
+                transcriber: GlassesSpeechTranscriber(),
+                translator: AppleLanguageTranslator()
+            )
+        )
 }

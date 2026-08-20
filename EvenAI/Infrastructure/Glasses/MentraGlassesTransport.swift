@@ -50,6 +50,15 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
 
     private var stateContinuations: [UUID: AsyncStream<GlassesTransportState>.Continuation] = [:]
 
+    /// Subscribers to raw G2 microphone PCM — see `microphonePCMUpdates()`.
+    private var pcmContinuations: [UUID: AsyncStream<Data>.Continuation] = [:]
+
+    /// Mirrors `GlassesSpeechTranscriber`'s hardcoded format assumption —
+    /// see `micPcmSampleRate` and its `AVAudioFormat(commonFormat: .pcmFormatInt16, channels: 1, ...)`.
+    private static let assumedSampleRate = 16000
+    private static let assumedBitsPerSample = 16
+    private static let assumedChannels = 1
+
     /// Pagination for whatever text is currently on G2's display — pure
     /// state, no SDK dependency (see its own doc comment). One instance
     /// per transport, replaced wholesale on every `sendText(_:)` call.
@@ -61,6 +70,10 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
     /// otherwise driven entirely by the real `centralManagerDidUpdateState`
     /// event, not the primary mechanism itself.
     private static let bluetoothReadyTimeout: Duration = .seconds(10)
+
+    /// See `setMicrophoneEnabled(_:)`'s doc comment — covers the vendored
+    /// SDK's traced ~1.6s worst-case internal mic-arm sequence with margin.
+    private static let micArmSettleDelay: Duration = .seconds(2)
 
     nonisolated init() {}
 
@@ -137,6 +150,68 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
         try await sdk.displayText(firstPage)
     }
 
+    /// See `pcmContinuations`. No seeding of a "current" value — unlike
+    /// `connectionStateUpdates()`, there is no meaningful "current" PCM
+    /// frame, only a live feed while the mic is enabled.
+    func microphonePCMUpdates() async -> AsyncStream<Data> {
+        AsyncStream { continuation in
+            let id = UUID()
+            pcmContinuations[id] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.pcmContinuations.removeValue(forKey: id)
+                }
+            }
+        }
+    }
+
+    /// `sendTranscript`/`sendLc3Data` are always `false`: the SDK's local-
+    /// transcription pipeline (`SherpaOnnxTranscriber`) is compiled out of
+    /// this SwiftPM distribution (`#if !SWIFT_PACKAGE || MENTRA_FEATURE_LOCAL_STT`
+    /// in the vendored source), so `.localTranscription` events never fire
+    /// in this build — confirmed by tracing every call site of
+    /// `Bridge.sendLocalTranscription`. Raw PCM (`didReceiveMicPcm`,
+    /// forwarded via `microphonePCMUpdates()`) is transcribed ourselves
+    /// instead (see `GlassesSpeechTranscriber`). LC3 is skipped too: it's
+    /// a bandwidth optimization with no on-device decoder available here,
+    /// and PCM already works.
+    ///
+    /// Enabling when not yet connected doesn't force lazy `sdk` construction
+    /// on its own — `sdk.glasses.connected` is checked first, which is only
+    /// ever true after `sdk` already exists. Disabling is guarded on
+    /// `isSDKStarted` for the same reason `connectionStateUpdates()` avoids
+    /// touching `sdk` before it's needed: constructing it would trigger the
+    /// Bluetooth permission prompt as a side effect of merely leaving Live
+    /// Translation.
+    ///
+    /// `micArmSettleDelay` after enabling: confirmed against the vendored
+    /// SDK's `G2.swift` that `setMicEnabled(true)` is NOT a simple one-shot
+    /// command — G2's mic only exists inside a live "EvenHub page"
+    /// (`pageCreated`). If none exists yet (e.g. Live Translation is
+    /// started before anything has ever been displayed on G2 this
+    /// session), `setMicEnabled` routes through `restartMic()` →
+    /// (0.5s settle) → `rebuildState()` (0.3s + 0.3s settle) →
+    /// `restartMicIfAlreadyEnabled()` → `restartMic()` again (another 0.5s
+    /// settle) before the actual `audioControlMessage(enable: true)` is
+    /// sent — roughly 1.6s worst-case, entirely internal to the SDK, with
+    /// no completion event or error exposed through the public API. Without
+    /// this delay, a caller that starts feeding PCM immediately after
+    /// `setMicrophoneEnabled(true)` returns may see no audio at all for
+    /// that entire window. Sized with margin above the traced worst case.
+    func setMicrophoneEnabled(_ enabled: Bool) async throws {
+        guard enabled else {
+            if isSDKStarted {
+                sdk.setMicState(enabled: false, useGlassesMic: true)
+            }
+            return
+        }
+        guard isSDKStarted, sdk.glasses.connected else {
+            throw GlassesTransportError.notConnected
+        }
+        sdk.setMicState(enabled: true, useGlassesMic: true, sendTranscript: false, sendLc3Data: false)
+        try? await Task.sleep(for: Self.micArmSettleDelay)
+    }
+
     /// Maps a raw `BluetoothSdkError` code to a clean, actionable message.
     /// `"pair_failure"` is what `MentraBluetoothSDK` reports when G2's
     /// internal 10-second dual-peripheral pairing timeout fires having
@@ -206,6 +281,31 @@ extension MentraGlassesTransport: MentraBluetoothSDKDelegate {
         guard let nextPage else { return }
         Task { @MainActor [weak self] in
             try? await self?.sdk.displayText(nextPage)
+        }
+    }
+
+    /// Forwards raw mic PCM to every `microphonePCMUpdates()` subscriber —
+    /// no filtering/buffering here, that's `GlassesSpeechTranscriber`'s job.
+    func mentraBluetoothSDK(_ sdk: MentraBluetoothSDK, didReceiveMicPcm event: MicPcmEvent) {
+        // `GlassesSpeechTranscriber` hardcodes its assumed format (16000 Hz,
+        // 16-bit, mono) independently of whatever the SDK actually reports
+        // here; this is the one place that sees the SDK's real, per-event
+        // metadata, so this ongoing safety check lives here rather than
+        // requiring a `GlassesTransport` protocol change to thread the
+        // metadata through. Not a leftover diagnostic — a real format
+        // drift would otherwise silently corrupt every buffer fed to
+        // `SFSpeechRecognizer`, with nothing else to catch it.
+        if event.sampleRate != Self.assumedSampleRate
+            || event.bitsPerSample != Self.assumedBitsPerSample
+            || event.channels != Self.assumedChannels {
+            DiagnosticTrace.log(
+                "LIVE_TRACE",
+                "FORMAT_MISMATCH — SDK reports sampleRate=\(event.sampleRate), bitsPerSample=\(event.bitsPerSample), channels=\(event.channels) but GlassesSpeechTranscriber assumes sampleRate=\(Self.assumedSampleRate), bitsPerSample=\(Self.assumedBitsPerSample), channels=\(Self.assumedChannels)"
+            )
+        }
+
+        for continuation in pcmContinuations.values {
+            continuation.yield(event.pcm)
         }
     }
 

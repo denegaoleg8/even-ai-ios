@@ -29,4 +29,18 @@ protocol GlassesTransport: Sendable {
     /// Sends text content to be displayed on the glasses.
     /// Throws `GlassesTransportError.notConnected` if not currently connected.
     func sendText(_ text: String) async throws
+
+    /// Raw PCM audio frames captured from G2's own microphone (16kHz,
+    /// 16-bit, mono, signed little-endian). No elements are delivered
+    /// unless `setMicrophoneEnabled(true)` has been called and glasses are
+    /// connected. Foreground-only — this does not imply any background
+    /// audio capability.
+    func microphonePCMUpdates() async -> AsyncStream<Data>
+
+    /// Enables or disables G2's own microphone, routing raw PCM to
+    /// `microphonePCMUpdates()`. Independent of `connect()`/`disconnect()`
+    /// — does not affect connection lifecycle. Throws
+    /// `GlassesTransportError.notConnected` if enabling while not
+    /// connected; disabling is always safe to call.
+    func setMicrophoneEnabled(_ enabled: Bool) async throws
 }

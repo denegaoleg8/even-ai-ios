@@ -29,9 +29,14 @@
 	</dict>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Even AI uses Bluetooth to connect to your Even G2 glasses.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Even AI may use audio session access to power Live Translation with your Even G2 glasses.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Even AI uses on-device speech recognition to detect foreign-language phrases spoken near your Even G2 glasses and translate them to Ukrainian.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>bluetooth-central</string>
+		<string>audio</string>
 	</array>
 </dict>
 </plist>
