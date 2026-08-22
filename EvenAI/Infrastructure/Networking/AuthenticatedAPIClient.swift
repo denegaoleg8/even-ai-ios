@@ -193,6 +193,26 @@ actor AuthenticatedAPIClient {
         }
     }
 
+    /// Builds an authenticated WebSocket upgrade request for `path` — the
+    /// same Bearer-token attachment `get`/`post`/etc. use (see
+    /// `makeRequest`), returned as a plain `URLRequest` rather than sent,
+    /// since constructing a `URLSessionWebSocketTask` from it (not
+    /// `URLSession.data(for:)`) is the caller's own job — see
+    /// `URLSessionRealtimeTranscriptionSocket`. Deliberately no 401/retry
+    /// handling here: a WS upgrade failure just surfaces as a closed/
+    /// errored socket to the caller, whose own reconnect logic is what
+    /// calls `recoverSession()` before rebuilding this request with a
+    /// fresh token — the same division of responsibility `streamBytes`
+    /// has for SSE, just one level further out since a dropped WS
+    /// reconnects as a whole new connection, not a retried request.
+    func makeWebSocketRequest(path: String) -> URLRequest {
+        var request = URLRequest(url: baseURL.appending(path: path))
+        if let accessToken {
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        }
+        return request
+    }
+
     // MARK: - Request construction
 
     private func makeRequest(path: String, method: String, body: Data?, accept: String? = nil) async throws -> URLRequest {

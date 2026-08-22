@@ -1,0 +1,179 @@
+import Foundation
+
+/// Milestone 8a: `ContinuousTranscribing` implementation backed by this
+/// app's own backend (`src/realtimeTranscription/`), which in turn talks
+/// to OpenAI's `gpt-live-transcribe` realtime model — see the Milestone 8
+/// architecture audit. **Not wired into `EvenAIApp`/production
+/// `LiveTranslationService` yet** — `GlassesSpeechTranscriber` remains the
+/// live implementation until Milestone 8b makes the one-line switch (see
+/// that milestone's own scope). Nothing about `LiveTranslationService`'s
+/// integration needs to change to do that: this type conforms to the
+/// exact same `ContinuousTranscribing` protocol, unchanged.
+///
+/// Multilingual scope (English/German/Polish/Ukrainian) is configured
+/// entirely on the backend (`src/realtimeTranscription/openaiClient.js`'s
+/// `SUPPORTED_LANGUAGES`) — this class has no locale/language
+/// configuration of its own at all, unlike `GlassesSpeechTranscriber`'s
+/// hardcoded `en-US`, and never runs more than one recognizer/session
+/// concurrently (there is exactly one `RealtimeTranscriptionSocket` open
+/// at a time — `handleUnexpectedClose(...)` replaces it, never adds a
+/// second one alongside it).
+///
+/// Ukrainian-vs-foreign filtering is deliberately NOT here: this class
+/// only reports whatever text the backend finalizes, exactly like
+/// `GlassesSpeechTranscriber` does today. `LiveTranslationService` (via
+/// the existing, unchanged `LanguageTranslating.detectedLanguageCode(for:)`)
+/// remains the one place that decides whether a given final becomes a
+/// live-conversation `ConversationTurn`.
+///
+/// `@MainActor` + `@unchecked Sendable`: mirrors `GlassesSpeechTranscriber`'s
+/// own isolation pattern.
+@MainActor
+final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendable {
+    private let makeSocket: () async -> RealtimeTranscriptionSocket
+
+    private var isActive = false
+    private var socket: RealtimeTranscriptionSocket?
+    private var pcmConsumerTask: Task<Void, Never>?
+    private var eventConsumerTask: Task<Void, Never>?
+    private var continuation: AsyncThrowingStream<String, Error>.Continuation?
+
+    /// The most recent `language_info` the backend reported, if any —
+    /// captured for future use/observability only. `ContinuousTranscribing`'s
+    /// contract is unchanged (finals only), so this is deliberately never
+    /// surfaced through `startTranscribing`'s own output stream — see
+    /// this type's doc comment on why Ukrainian filtering stays out of
+    /// this layer regardless of what's available here.
+    private(set) var lastKnownLanguages: [String]?
+
+    /// One reconnect attempt per dropped connection — mirrors the
+    /// backend's own single-retry policy in `session.js` exactly (see
+    /// that file's `handlers.onClose`), so a transient blip on either hop
+    /// (iOS<->backend here, backend<->OpenAI there) is absorbed the same
+    /// way without either side needing to know about the other's policy.
+    /// Reset back to `false` the moment a connection actually starts
+    /// working again (`.sessionStarted`/`.finalTranscript`), so a later,
+    /// independent drop still gets its own single retry.
+    private var hasReconnectedSinceLastSuccess = false
+
+    init(makeSocket: @escaping () async -> RealtimeTranscriptionSocket) {
+        self.makeSocket = makeSocket
+    }
+
+    convenience init(apiClient: AuthenticatedAPIClient) {
+        self.init(makeSocket: { URLSessionRealtimeTranscriptionSocket(apiClient: apiClient) })
+    }
+
+    func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<String, Error> {
+        stopInternal()
+        isActive = true
+        hasReconnectedSinceLastSuccess = false
+
+        let newSocket = await makeSocket()
+        socket = newSocket
+        let eventStream = try await newSocket.connect()
+
+        return AsyncThrowingStream { continuation in
+            self.continuation = continuation
+
+            pcmConsumerTask = Task { [weak self] in
+                for await data in pcmUpdates {
+                    guard let self, self.isActive else { break }
+                    try? await newSocket.sendPCM(data)
+                }
+            }
+
+            eventConsumerTask = Task { [weak self] in
+                await self?.consume(eventStream, from: newSocket)
+            }
+
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor in self?.stopInternal() }
+            }
+        }
+    }
+
+    func stopTranscribing() async {
+        stopInternal()
+    }
+
+    /// Runs for the lifetime of one `RealtimeTranscriptionSocket`
+    /// connection. Returning from this method always means either the
+    /// session ended intentionally (`isActive` already false) or a
+    /// reconnect was already handed off to a new `eventConsumerTask` —
+    /// never a silently-abandoned connection.
+    private func consume(_ events: AsyncThrowingStream<RealtimeTranscriptionEvent, Error>, from currentSocket: RealtimeTranscriptionSocket) async {
+        do {
+            for try await event in events {
+                guard isActive else { return }
+                switch event {
+                case .sessionStarted:
+                    hasReconnectedSinceLastSuccess = false
+                case .partialTranscript:
+                    continue // ContinuousTranscribing yields finalized utterances only
+                case .finalTranscript(let text):
+                    hasReconnectedSinceLastSuccess = false
+                    continuation?.yield(text)
+                case .languageInfo(let languages):
+                    lastKnownLanguages = languages
+                case .providerError:
+                    // Non-fatal — same "log and keep going" policy
+                    // GlassesSpeechTranscriber already applies to a
+                    // recognition-session-boundary error: one failure
+                    // doesn't end an otherwise-healthy stream.
+                    continue
+                case .closed:
+                    await handleUnexpectedClose(previousSocket: currentSocket, error: nil)
+                    return
+                }
+            }
+            guard isActive else { return }
+            await handleUnexpectedClose(previousSocket: currentSocket, error: nil)
+        } catch {
+            guard isActive else { return }
+            await handleUnexpectedClose(previousSocket: currentSocket, error: error)
+        }
+    }
+
+    /// The connection ended without `stopTranscribing()` having been
+    /// called — reconnect once; give up (and surface the failure to
+    /// `startTranscribing`'s caller) if a reconnect was already attempted
+    /// since the last successful event.
+    private func handleUnexpectedClose(previousSocket: RealtimeTranscriptionSocket, error: Error?) async {
+        guard isActive else { return }
+        await previousSocket.close()
+
+        guard !hasReconnectedSinceLastSuccess else {
+            continuation?.finish(throwing: error ?? RealtimeTranscriptionSocketError.notConnected)
+            stopInternal()
+            return
+        }
+        hasReconnectedSinceLastSuccess = true
+
+        let newSocket = await makeSocket()
+        socket = newSocket
+        do {
+            let eventStream = try await newSocket.connect()
+            eventConsumerTask = Task { [weak self] in
+                await self?.consume(eventStream, from: newSocket)
+            }
+        } catch {
+            continuation?.finish(throwing: error)
+            stopInternal()
+        }
+    }
+
+    private func stopInternal() {
+        isActive = false
+        pcmConsumerTask?.cancel()
+        pcmConsumerTask = nil
+        eventConsumerTask?.cancel()
+        eventConsumerTask = nil
+        continuation?.finish()
+        continuation = nil
+
+        guard let socketToClose = socket else { return }
+        socket = nil
+        Task { await socketToClose.close() }
+    }
+}
