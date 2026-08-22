@@ -36,10 +36,10 @@ struct EvenAIApp: App {
                 transcriber: GlassesSpeechTranscriber(),
                 translator: translator,
                 agentContextStore: agentContextStore,
-                // No real AI provider chosen yet — replacing this is the
-                // entire scope of that future milestone; nothing else
-                // here needs to change to do it.
-                replyGenerator: NoOpSuggestedReplyGenerator()
+                // Milestone 7: real, backend-calling generator — shares
+                // `AppContainer.live.apiClient` with Chat/Auth, same
+                // "one client, one session" rule those already follow.
+                replyGenerator: NetworkSuggestedReplyGenerator(apiClient: AppContainer.live.apiClient)
             )
         )
     }
