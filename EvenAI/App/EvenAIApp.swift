@@ -16,15 +16,30 @@ struct EvenAIApp: App {
     /// — because it's stateful, observable, app-lifetime state, not a
     /// swappable dependency. See `LiveTranslationService`'s doc comment.
     @State private var liveTranslation: LiveTranslationService
+    /// Milestone 2: the ONE shared conversation/session record — see
+    /// `AgentContextStore`'s doc comment. Constructed here (same
+    /// app-level pattern as `appState`/`authState`/`liveTranslation`) and
+    /// handed to `liveTranslation` below *and* injected into the
+    /// environment, so every future consumer (Chat, etc.) shares the
+    /// exact same instance `LiveTranslationService` is already writing
+    /// into — never a second, independent session.
+    @State private var agentContextStore = AgentContextStore()
 
     init() {
         let translator = AppleLanguageTranslator()
+        let agentContextStore = AgentContextStore()
         _languageTranslator = State(initialValue: translator)
+        _agentContextStore = State(initialValue: agentContextStore)
         _liveTranslation = State(
             initialValue: LiveTranslationService(
                 glassesTransport: AppContainer.live.glassesTransport,
                 transcriber: GlassesSpeechTranscriber(),
-                translator: translator
+                translator: translator,
+                agentContextStore: agentContextStore,
+                // No real AI provider chosen yet — replacing this is the
+                // entire scope of that future milestone; nothing else
+                // here needs to change to do it.
+                replyGenerator: NoOpSuggestedReplyGenerator()
             )
         )
     }
@@ -35,6 +50,7 @@ struct EvenAIApp: App {
                 .environment(appState)
                 .environment(authState)
                 .environment(liveTranslation)
+                .environment(agentContextStore)
                 .environment(\.languageTranslator, languageTranslator)
                 .environment(\.chatService, AppContainer.live.chatService)
                 .environment(\.glassesTransport, AppContainer.live.glassesTransport)

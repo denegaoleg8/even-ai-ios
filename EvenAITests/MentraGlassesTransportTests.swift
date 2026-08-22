@@ -236,4 +236,31 @@ struct GlassesPaginationStateTests {
         #expect(state.advance() == nil)
         #expect(state.retreat() == nil)
     }
+
+    /// Milestone 6: `GlassesPresentationLayer.pages(for:)` output is just
+    /// another `[String]` fed to `start(withPages:)` — proves swipe
+    /// navigation (advance/retreat) works identically for a
+    /// translation-plus-replies page set as it already does for a plain
+    /// `GlassesTextPaginator`-produced one, with no new pagination
+    /// concept or duplicate state needed.
+    @Test("swipe navigation works over GlassesPresentationLayer's page output exactly as it does for any other page set")
+    func navigationWorksOverPresentationLayerPages() {
+        let turn = ConversationTurn.liveConversationTurn(
+            originalText: "Guten Tag",
+            detectedLanguage: "de-DE",
+            ukrainianTranslation: "Добрий день",
+            suggestedReplies: [SuggestedReply(originalLanguageText: "Hi", ukrainianText: "Привіт", ordering: 0)]
+        )
+        let pages = GlassesPresentationLayer.pages(for: turn)
+        #expect(pages.count == 2) // translation page + one reply page
+
+        var state = GlassesPaginationState()
+        state.start(withPages: pages)
+
+        #expect(state.currentPage == pages[0])
+        #expect(state.advance() == pages[1])
+        #expect(state.currentPage == pages[1])
+        #expect(state.advance() == nil) // clamped at the last page
+        #expect(state.retreat() == pages[0])
+    }
 }

@@ -35,6 +35,10 @@ actor PairFailureGlassesTransport: GlassesTransport {
         throw GlassesTransportError.notConnected
     }
 
+    func displayPages(_ pages: [String]) async throws {
+        throw GlassesTransportError.notConnected
+    }
+
     func microphonePCMUpdates() async -> AsyncStream<Data> {
         AsyncStream { _ in }
     }
@@ -52,6 +56,12 @@ actor PairFailureGlassesTransport: GlassesTransport {
 /// `sendText` never short-circuits on `GlassesTransportError.notConnected`.
 actor SpyGlassesTransport: GlassesTransport {
     private(set) var sentTexts: [String] = []
+    /// Every `displayPages(_:)` call, in order — kept entirely separate
+    /// from `sentTexts` (not derived from it, and `sendText(_:)` below is
+    /// deliberately left untouched) so a test can assert on the new
+    /// Milestone 6 page-set API without any risk of changing what
+    /// `sentTexts`-based assertions already see.
+    private(set) var displayedPageSets: [[String]] = []
     /// Every `setMicrophoneEnabled(_:)` call, in order — used by
     /// `LiveTranslationServiceTests` to verify the mic is enabled on
     /// start and disabled on stop.
@@ -66,6 +76,10 @@ actor SpyGlassesTransport: GlassesTransport {
 
     func sendText(_ text: String) async throws {
         sentTexts.append(text)
+    }
+
+    func displayPages(_ pages: [String]) async throws {
+        displayedPageSets.append(pages)
     }
 
     func microphonePCMUpdates() async -> AsyncStream<Data> {
@@ -84,6 +98,7 @@ actor SpyGlassesTransport: GlassesTransport {
 /// single-value-forever stream can't simulate.
 actor ControllableGlassesTransport: GlassesTransport {
     private(set) var sentTexts: [String] = []
+    private(set) var displayedPageSets: [[String]] = []
     private(set) var microphoneEnabledCalls: [Bool] = []
     private var currentState: GlassesTransportState
     private var stateContinuation: AsyncStream<GlassesTransportState>.Continuation?
@@ -102,8 +117,18 @@ actor ControllableGlassesTransport: GlassesTransport {
     func connect() async throws {}
     func disconnect() async {}
 
+    // Deliberately no connected-state guard here — unchanged from before
+    // this milestone, since "existing plain sendText behavior remains
+    // unchanged" is an explicit requirement.
     func sendText(_ text: String) async throws {
         sentTexts.append(text)
+    }
+
+    func displayPages(_ pages: [String]) async throws {
+        guard currentState == .connected else {
+            throw GlassesTransportError.notConnected
+        }
+        displayedPageSets.append(pages)
     }
 
     func microphonePCMUpdates() async -> AsyncStream<Data> {

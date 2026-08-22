@@ -142,10 +142,20 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
     /// Subsequent pages are shown only in response to a swipe, via
     /// `didReceive(event:)` below.
     func sendText(_ text: String) async throws {
+        try await displayPages(GlassesTextPaginator.pages(for: text))
+    }
+
+    /// Displays an already-paginated sequence of pages — `sendText(_:)`
+    /// above is now just this, fed `GlassesTextPaginator`'s own output,
+    /// so there is exactly one place pagination is actually started/sent
+    /// from, not two. Milestone 6: `LiveTranslationService` calls this
+    /// directly with `GlassesPresentationLayer.pages(for:)`'s output,
+    /// which is already page-shaped and needs no further splitting.
+    func displayPages(_ pages: [String]) async throws {
         guard sdk.glasses.connected else {
             throw GlassesTransportError.notConnected
         }
-        pagination.start(withPages: GlassesTextPaginator.pages(for: text))
+        pagination.start(withPages: pages)
         guard let firstPage = pagination.currentPage else { return }
         try await sdk.displayText(firstPage)
     }
@@ -300,7 +310,7 @@ extension MentraGlassesTransport: MentraBluetoothSDKDelegate {
             || event.channels != Self.assumedChannels {
             DiagnosticTrace.log(
                 "LIVE_TRACE",
-                "FORMAT_MISMATCH — SDK reports sampleRate=\(event.sampleRate), bitsPerSample=\(event.bitsPerSample), channels=\(event.channels) but GlassesSpeechTranscriber assumes sampleRate=\(Self.assumedSampleRate), bitsPerSample=\(Self.assumedBitsPerSample), channels=\(Self.assumedChannels)"
+                "FORMAT_MISMATCH sdkSampleRate=\(event.sampleRate) sdkBitsPerSample=\(event.bitsPerSample) sdkChannels=\(event.channels) assumedSampleRate=\(Self.assumedSampleRate) assumedBitsPerSample=\(Self.assumedBitsPerSample) assumedChannels=\(Self.assumedChannels)"
             )
         }
 

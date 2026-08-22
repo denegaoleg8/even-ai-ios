@@ -31,6 +31,12 @@ actor MockGlassesTransport: GlassesTransport {
         }
     }
 
+    func displayPages(_ pages: [String]) async throws {
+        guard state == .connected else {
+            throw GlassesTransportError.notConnected
+        }
+    }
+
     func microphonePCMUpdates() async -> AsyncStream<Data> {
         AsyncStream { _ in }
     }

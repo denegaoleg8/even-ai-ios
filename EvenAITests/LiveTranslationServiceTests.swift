@@ -27,7 +27,11 @@ struct LiveTranslationServiceTests {
         await service.start()
         try? await Task.sleep(for: Self.propagationDelay)
 
-        #expect(await spy.sentTexts == ["привіт"])
+        // Milestone 6: the translation now reaches G2 via
+        // `displayPages(_:)` (through `GlassesPresentationLayer`), not a
+        // direct `sendText(_:)` call — `sentTexts` legitimately stays
+        // empty; this is what actually carries the translation now.
+        #expect(await spy.displayedPageSets == [["привіт"]])
     }
 
     @Test("Ukrainian speech is never translated or displayed")
@@ -72,7 +76,9 @@ struct LiveTranslationServiceTests {
         await service.start()
         try? await Task.sleep(for: Self.propagationDelay)
 
-        #expect(await spy.sentTexts == ["привіт"])
+        // Milestone 6: see `foreignPhraseIsTranslatedAndSent`'s comment —
+        // `displayPages(_:)` is what actually carries this now.
+        #expect(await spy.displayedPageSets == [["привіт"]])
     }
 
     @Test("an empty (or whitespace-only) final transcript is ignored")

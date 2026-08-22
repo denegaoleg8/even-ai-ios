@@ -4,7 +4,11 @@ import Observation
 /// Ambient G2-microphone translation — app-level, not owned by any screen.
 /// G2's own mic stays enabled continuously once started; finalized foreign-
 /// language phrases are translated to Ukrainian and shown directly on G2
-/// via `GlassesTransport.sendText(_:)`. Nothing here ever touches
+/// via `GlassesTransport.displayPages(_:)` (Milestone 6) — the translation
+/// alone at first, then updated with `GlassesPresentationLayer`-formatted
+/// suggested replies once generation completes, guarded so a slower,
+/// now-superseded turn's replies can never overwrite a newer turn's
+/// display (see `generateSuggestedReplies(for:)`). Nothing here ever touches
 /// `ChatMessageSending`/`ChatServicing` — recognized/translated phrases are
 /// only ever exposed as read-only observable state (`lastRecognizedPhrase`/
 /// `lastTranslation`) for `ChatView` to display, never submitted as chat
@@ -57,9 +61,30 @@ final class LiveTranslationService {
     private let glassesTransport: GlassesTransport
     private let transcriber: ContinuousTranscribing
     private let translator: LanguageTranslating
+    /// Milestone 2: the app-level shared conversation/session record —
+    /// see `AgentContextStore`'s doc comment. Defaulted to a fresh,
+    /// private instance rather than a required parameter so every
+    /// existing construction call site (tests included) keeps compiling
+    /// unchanged; `EvenAIApp` passes the one real, shared instance
+    /// explicitly.
+    private let agentContextStore: AgentContextStore
+    /// Milestone 4: generates suggested replies for a finalized foreign-
+    /// language turn — provider-agnostic (see `SuggestedReplyGenerating`'s
+    /// doc comment). Defaulted to `NoOpSuggestedReplyGenerator()` (no
+    /// real provider chosen yet) for the same reason `agentContextStore`
+    /// is defaulted — every existing construction call site keeps
+    /// compiling unchanged.
+    private let replyGenerator: SuggestedReplyGenerating
 
     private var consumeTask: Task<Void, Never>?
     private var connectionObserverTask: Task<Void, Never>?
+    /// Milestone 6: one entry per in-flight `generateSuggestedReplies(for:)`
+    /// call — tracked (not fire-and-forget-and-forget) purely so `stop()`
+    /// can cancel them, satisfying "disconnect/stop does not leave stale
+    /// display state." Cleared wholesale on `stop()`; not individually
+    /// removed on completion, since a Live Translation session realistically
+    /// never accumulates more than a handful of these before it ends.
+    private var replyGenerationTasks: [Task<Void, Never>] = []
     /// The user's explicit on/off intent, distinct from `state` — guards
     /// `observeConnection()` so a disconnect/reconnect cycle before the
     /// user has ever started Live Translation doesn't do anything.
@@ -70,11 +95,15 @@ final class LiveTranslationService {
     init(
         glassesTransport: GlassesTransport,
         transcriber: ContinuousTranscribing,
-        translator: LanguageTranslating
+        translator: LanguageTranslating,
+        agentContextStore: AgentContextStore = AgentContextStore(),
+        replyGenerator: SuggestedReplyGenerating = NoOpSuggestedReplyGenerator()
     ) {
         self.glassesTransport = glassesTransport
         self.transcriber = transcriber
         self.translator = translator
+        self.agentContextStore = agentContextStore
+        self.replyGenerator = replyGenerator
         observeConnection()
     }
 
@@ -108,6 +137,13 @@ final class LiveTranslationService {
         isEnabledIntent = false
         consumeTask?.cancel()
         consumeTask = nil
+        // Milestone 6: cancel any suggested-reply generation still in
+        // flight — a completion after this point must never call
+        // `displayPages` again (the transport itself would likely reject
+        // it once disconnected/mic-disabled anyway, but this avoids ever
+        // attempting it, and avoids leaving an orphaned Task running).
+        replyGenerationTasks.forEach { $0.cancel() }
+        replyGenerationTasks.removeAll()
         await transcriber.stopTranscribing()
         try? await glassesTransport.setMicrophoneEnabled(false)
         // Only clears a `.listening` state — an `.error` set immediately
@@ -180,12 +216,92 @@ final class LiveTranslationService {
         guard !displayText.isEmpty else { return }
 
         lastTranslation = displayText
+
+        // Milestone 2: record this turn in the shared session — additive
+        // only, never affects what reaches G2 below. Uses
+        // `liveConversationTurn(...)` (not the plain initializer) for its
+        // own belt-and-suspenders Ukrainian-nulling, even though the
+        // `languageCode != Self.ukrainianLanguageCode` guard above already
+        // means this line is never reached for Ukrainian speech.
+        let turn = ConversationTurn.liveConversationTurn(
+            originalText: text,
+            detectedLanguage: languageCode,
+            ukrainianTranslation: displayText
+        )
+        agentContextStore.appendTurn(turn)
+
+        // Milestone 6: translation must not wait for reply generation —
+        // displayed immediately, via `GlassesPresentationLayer` (empty
+        // `suggestedReplies` at this point, so this is exactly the
+        // translation page(s) alone, byte-for-byte what plain
+        // `sendText(displayText)` would have produced).
         do {
-            try await glassesTransport.sendText(displayText)
+            try await glassesTransport.displayPages(GlassesPresentationLayer.pages(for: turn))
         } catch {
-            // Same reasoning as the translation catch above — `sendText`
-            // failing here has no other visibility.
-            DiagnosticTrace.log("LIVE_TRACE", "sendText failed for \"\(displayText.prefix(60))\": \(error)")
+            // Same reasoning as the translation catch above — displaying
+            // this has no other visibility.
+            DiagnosticTrace.log("LIVE_TRACE", "displayPages failed for \"\(displayText.prefix(60))\": \(error)")
+        }
+
+        // Runs independently of this method's caller (the consume loop)
+        // — a slow/real generator must never delay processing the next
+        // finalized phrase. Tracked in `replyGenerationTasks` only so
+        // `stop()` can cancel it; nothing here is awaited by `handle`.
+        let replyTask = Task { [weak self] in
+            guard let self else { return }
+            await self.generateSuggestedReplies(for: turn)
+        }
+        replyGenerationTasks.append(replyTask)
+    }
+
+    /// Milestone 4/6: best-effort — runs independently of `handle(final:)`
+    /// and never affects the translation already displayed there either
+    /// way. `turn` was already appended to `agentContextStore` with empty
+    /// `suggestedReplies`; a thrown error, or cancellation, here just
+    /// leaves it that way, per the product requirement that a reply-
+    /// generation failure must never hide the turn's own translation.
+    /// `recentTurns` excludes `turn` by id (not by array position — this
+    /// runs concurrently with the next phrase's own processing, so a
+    /// later turn may already have been appended by the time this reads
+    /// `agentContextStore.session.turns`) and is oldest-first, matching
+    /// `SuggestedReplyContext`'s documented convention.
+    ///
+    /// Guards, right before updating G2's display, that `turn` is still
+    /// the session's latest turn — "newest finalized turn always becomes
+    /// the active G2 content," so a slower-to-generate older turn must
+    /// never overwrite what a newer turn has already put on screen. The
+    /// turn's own `suggestedReplies` are still recorded in
+    /// `agentContextStore` either way (visible in Chat/history), only the
+    /// G2 *display* update is skipped when stale.
+    private func generateSuggestedReplies(for turn: ConversationTurn) async {
+        guard !Task.isCancelled else { return }
+
+        let context = SuggestedReplyContext(
+            recentTurns: agentContextStore.session.turns.filter { $0.id != turn.id },
+            contextItems: agentContextStore.session.contextItems
+        )
+        do {
+            let replies = try await replyGenerator.generateReplies(for: turn, context: context)
+            guard !Task.isCancelled else { return }
+
+            var updatedTurn = turn
+            // Capped here regardless of what the generator returned —
+            // G2's display constraint is enforced at this one choke
+            // point, not trusted to every possible generator.
+            updatedTurn.suggestedReplies = Array(replies.prefix(3))
+            agentContextStore.updateTurn(updatedTurn)
+
+            guard agentContextStore.session.latestTurn?.id == updatedTurn.id else { return }
+            // No replies to add — the translation already on screen is
+            // already correct, so there's nothing to redisplay.
+            guard !updatedTurn.suggestedReplies.isEmpty else { return }
+            do {
+                try await glassesTransport.displayPages(GlassesPresentationLayer.pages(for: updatedTurn))
+            } catch {
+                DiagnosticTrace.log("LIVE_TRACE", "displayPages (suggested replies) failed: \(error)")
+            }
+        } catch {
+            DiagnosticTrace.log("LIVE_TRACE", "suggested-reply generation failed: \(error)")
         }
     }
 }

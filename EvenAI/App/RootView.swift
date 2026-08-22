@@ -63,4 +63,5 @@ struct RootView: View {
                 translator: AppleLanguageTranslator()
             )
         )
+        .environment(AgentContextStore())
 }

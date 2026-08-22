@@ -30,6 +30,16 @@ protocol GlassesTransport: Sendable {
     /// Throws `GlassesTransportError.notConnected` if not currently connected.
     func sendText(_ text: String) async throws
 
+    /// Displays an already-paginated sequence of pages — e.g. from
+    /// `GlassesPresentationLayer.pages(for:)` — skipping the "derive
+    /// pages from one string" step `sendText(_:)` itself does via
+    /// `GlassesTextPaginator`. Same semantics as `sendText(_:)`: always
+    /// replaces whatever pagination state existed, starting fresh at
+    /// page 1 — no "append to the previous message" case, and no second/
+    /// duplicate pagination state anywhere. Throws
+    /// `GlassesTransportError.notConnected` if not currently connected.
+    func displayPages(_ pages: [String]) async throws
+
     /// Raw PCM audio frames captured from G2's own microphone (16kHz,
     /// 16-bit, mono, signed little-endian). No elements are delivered
     /// unless `setMicrophoneEnabled(true)` has been called and glasses are

@@ -4,7 +4,12 @@ struct ChatView: View {
     let chatID: Chat.ID
     @Environment(AuthState.self) private var authState
     @Environment(AppState.self) private var appState
-    @Environment(LiveTranslationService.self) private var liveTranslation
+    /// The ONE shared conversation/session record `LiveTranslationService`
+    /// appends live-conversation turns into (see `AgentContextStore`'s
+    /// doc comment) — `ChatView` reads it directly rather than reaching
+    /// through `LiveTranslationService` for this, so there is exactly one
+    /// source of truth for "what was the last live turn," not two.
+    @Environment(AgentContextStore.self) private var agentContextStore
     @State private var viewModel: ChatViewModel
 
     init(chatID: Chat.ID, chatService: ChatServicing, glassesTransport: GlassesTransport) {
@@ -17,9 +22,11 @@ struct ChatView: View {
     var body: some View {
         @Bindable var viewModel = viewModel
 
+        let liveConversation = ChatLiveConversationPresenter.present(agentContextStore.session)
+
         VStack(spacing: 0) {
-            if liveTranslation.state == .listening, let phrase = liveTranslation.lastRecognizedPhrase {
-                liveTranslationBanner(phrase: phrase)
+            if let latestTurn = liveConversation.latest {
+                liveConversationSection(latestTurn: latestTurn, olderTurns: liveConversation.older)
             }
 
             if viewModel.isLoading && viewModel.messages.isEmpty {
@@ -97,29 +104,78 @@ struct ChatView: View {
         }
     }
 
-    /// Read-only: shows the most recent live-recognized phrase (and its
-    /// Ukrainian translation, if one was produced) while `LiveTranslationService`
-    /// is listening. This is purely informational — it never becomes a
-    /// `Message`, is never persisted, and is not part of `viewModel`'s
-    /// state, so it can't interfere with `ChatMessageSender`/normal Chat.
-    private func liveTranslationBanner(phrase: String) -> some View {
+    /// Read-only: shows the shared session's live-conversation turns —
+    /// see `AgentContextStore`/`ChatLiveConversationPresenter`. Never
+    /// becomes a `Message`, is never sent through `ChatMessageSender`/the
+    /// normal Chat backend pipeline, and is not part of `viewModel`'s own
+    /// state, so it can't interfere with normal Chat. The newest turn is
+    /// shown prominently; any earlier turns from this session stay
+    /// visible below it, dimmed, newest-first — "remain available in the
+    /// conversation context" without competing with the current one.
+    private func liveConversationSection(latestTurn: ConversationTurn, olderTurns: [ConversationTurn]) -> some View {
+        VStack(alignment: .leading, spacing: AppMetrics.Spacing.xs) {
+            liveConversationTurnRow(latestTurn, isProminent: true)
+                .accessibilityIdentifier("chat.liveTranslationBanner")
+
+            if !olderTurns.isEmpty {
+                VStack(alignment: .leading, spacing: AppMetrics.Spacing.xs) {
+                    ForEach(olderTurns) { turn in
+                        liveConversationTurnRow(turn, isProminent: false)
+                    }
+                }
+                .accessibilityIdentifier("chat.liveConversation.olderTurns")
+            }
+        }
+        .padding(AppMetrics.Spacing.sm)
+        .background(AppColor.secondaryBackground)
+        .accessibilityIdentifier("chat.liveConversationSection")
+    }
+
+    private func liveConversationTurnRow(_ turn: ConversationTurn, isProminent: Bool) -> some View {
         HStack(alignment: .top, spacing: AppMetrics.Spacing.sm) {
             Image(systemName: "globe")
-                .foregroundStyle(AppColor.accent)
+                .foregroundStyle(isProminent ? AppColor.accent : AppColor.textSecondary)
             VStack(alignment: .leading, spacing: AppMetrics.Spacing.xs) {
-                Text(phrase)
+                Text(turn.originalText)
                     .font(AppTypography.chatPreview)
-                if let translation = liveTranslation.lastTranslation {
+                if let translation = turn.ukrainianTranslation {
+                    Text("Translation:")
+                        .font(.caption2)
+                        .foregroundStyle(AppColor.textSecondary)
                     Text(translation)
                         .font(AppTypography.chatPreview)
                         .foregroundStyle(AppColor.textSecondary)
                 }
+                if let detectedLanguage = turn.detectedLanguage {
+                    Text(detectedLanguage)
+                        .font(.caption2)
+                        .foregroundStyle(AppColor.textSecondary)
+                }
+                if !turn.suggestedReplies.isEmpty {
+                    VStack(alignment: .leading, spacing: AppMetrics.Spacing.xs) {
+                        Text("Suggested replies:")
+                            .font(.caption2)
+                            .foregroundStyle(AppColor.textSecondary)
+                        ForEach(
+                            Array(turn.suggestedReplies.sorted { $0.ordering < $1.ordering }.enumerated()),
+                            id: \.element.id
+                        ) { index, reply in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(index + 1). \(reply.originalLanguageText)")
+                                    .font(AppTypography.chatPreview)
+                                Text(reply.ukrainianText)
+                                    .font(AppTypography.chatPreview)
+                                    .foregroundStyle(AppColor.textSecondary)
+                            }
+                        }
+                    }
+                    .padding(.top, AppMetrics.Spacing.xs)
+                    .accessibilityIdentifier("chat.liveConversation.suggestedReplies")
+                }
             }
             Spacer()
         }
-        .padding(AppMetrics.Spacing.sm)
-        .background(AppColor.secondaryBackground)
-        .accessibilityIdentifier("chat.liveTranslationBanner")
+        .opacity(isProminent ? 1 : 0.6)
     }
 
     private var refreshTrigger: String {
@@ -138,12 +194,6 @@ struct ChatView: View {
         ChatView(chatID: UUID(), chatService: MockChatService(), glassesTransport: MockGlassesTransport())
             .environment(AuthState())
             .environment(AppState())
-            .environment(
-                LiveTranslationService(
-                    glassesTransport: MockGlassesTransport(),
-                    transcriber: GlassesSpeechTranscriber(),
-                    translator: AppleLanguageTranslator()
-                )
-            )
+            .environment(AgentContextStore())
     }
 }

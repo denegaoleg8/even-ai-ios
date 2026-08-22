@@ -10,17 +10,17 @@ import Speech
 /// phone microphone involved anywhere in this feature; G2's own
 /// microphone, relayed over BLE, is the only audio source.
 ///
-/// First-milestone limitation, deliberate: a single `en-US` recognizer is
-/// used regardless of what's actually being spoken — "support at minimum
-/// English → Ukrainian" per the product spec for this milestone. Genuine
-/// Ukrainian speech fed through an English-locale recognizer will not
-/// transcribe cleanly (there is no Cyrillic in its language model), so it
-/// will tend to produce garbled or low-quality English-ish text rather
-/// than clean Ukrainian — `LiveTranslationViewModel`'s language-detection
-/// step operates on whatever this recognizer outputs, so its accuracy is
-/// bounded by this single-locale choice. Recognizing additional source
-/// languages (e.g. running a second recognizer, or switching locale) is
-/// the natural extension point for a later milestone.
+/// Single `en-US` recognizer, deliberately — a parallel dual-recognizer
+/// (`en-US` + `uk-UA`) experiment was tried and reverted: physical-device
+/// tracing showed both `recognitionTask`s immediately erroring with
+/// `kAFAssistantErrorDomain Code=1110 "No speech detected"` before either
+/// ever received a first PCM append, then repeatedly recreating in an
+/// uncontrolled restart loop — i.e. running two concurrent `SFSpeechRecognizer`
+/// sessions against the same buffer feed did not work on the tested device,
+/// for reasons not yet root-caused (see the reverted commit's diagnostic
+/// history, not this file, for the `ML_TRACE` evidence). Multilingual
+/// support is a known gap for a future milestone, not solved here — see
+/// `LiveTranslationService`'s doc comment for the current scope.
 ///
 /// `@MainActor` + `@unchecked Sendable`: all mutable state is confined to
 /// the main actor by this class-wide isolation, never accessed
@@ -61,7 +61,46 @@ final class GlassesSpeechTranscriber: ContinuousTranscribing, @unchecked Sendabl
     private var isActive = false
     private var continuation: AsyncThrowingStream<String, Error>.Continuation?
 
+    /// Debounce-timer task for silence-based utterance finalization — see
+    /// `scheduleFinalization(sessionID:)`. `SFSpeechAudioBufferRecognitionRequest`
+    /// is fed G2's PCM continuously with no natural end; nothing else ever
+    /// signals "this utterance is over" to the recognizer, so without this,
+    /// `isFinal` never becomes true (confirmed via physical-device tracing:
+    /// interim results kept arriving indefinitely, no final ever landed).
+    private var finalizationTask: Task<Void, Never>?
+    /// How long to wait after the most recent partial result before treating
+    /// the utterance as over and calling `request.endAudio()`. Isolated as
+    /// its own tunable constant per the smallest-fix requirement.
+    private static let silenceDebounceInterval: Duration = .milliseconds(1300)
+    /// Identifies the current recognition session so a callback from an
+    /// already-replaced `task` (e.g. a final result or error arriving after
+    /// `beginNewSession()` has already run again) is recognized as stale
+    /// and dropped — this is what actually prevents overlapping sessions or
+    /// double-processing a final phrase, since `SFSpeechRecognitionTask`
+    /// gives no synchronous guarantee its old callback won't still fire
+    /// once after being superseded.
+    private var currentSessionID = UUID()
+    /// True from the moment `endAudio()` is called on the current `request`
+    /// until `beginNewSession()` replaces it — `append(_:format:)` must not
+    /// feed a request that has already been told no more audio is coming
+    /// (invalid per `SFSpeechAudioBufferRecognitionRequest`). G2's mic keeps
+    /// streaming through this gap (never stopped for rollover), so those
+    /// few buffers are simply dropped.
+    private var isFinalizingUtterance = false
+
     nonisolated init() {}
+
+    // `task: SFSpeechRecognitionTask?` isn't `Sendable`, so it can't be
+    // touched from `deinit` (nonisolated even on a `@MainActor` class) —
+    // only the `Task<Void, Never>` handles, which are `Sendable`, are
+    // cancelled here. In practice this type is owned for the app's
+    // lifetime (see `LiveTranslationService`), so `deinit` is a belt-and-
+    // suspenders safeguard, not a path any real session relies on;
+    // `stopInternal()` is what actually cancels `task` during normal use.
+    deinit {
+        finalizationTask?.cancel()
+        pcmConsumerTask?.cancel()
+    }
 
     func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<String, Error> {
         stopInternal()
@@ -109,25 +148,48 @@ final class GlassesSpeechTranscriber: ContinuousTranscribing, @unchecked Sendabl
     /// itself is never toggled by this — `append(_:format:)` keeps feeding
     /// whichever request is current.
     private func beginNewSession(recognizer: SFSpeechRecognizer) {
+        finalizationTask?.cancel()
+        finalizationTask = nil
+        isFinalizingUtterance = false
+
         let newRequest = SFSpeechAudioBufferRecognitionRequest()
         newRequest.shouldReportPartialResults = true
         if recognizer.supportsOnDeviceRecognition {
             newRequest.requiresOnDeviceRecognition = true
         }
         request = newRequest
+
+        let sessionID = UUID()
+        currentSessionID = sessionID
         task = recognizer.recognitionTask(with: newRequest) { [weak self] result, error in
             Task { @MainActor [weak self] in
-                self?.handle(result: result, error: error, recognizer: recognizer)
+                self?.handle(result: result, error: error, recognizer: recognizer, sessionID: sessionID)
             }
         }
     }
 
-    private func handle(result: SFSpeechRecognitionResult?, error: Error?, recognizer: SFSpeechRecognizer) {
-        guard isActive else { return }
+    /// `sessionID` must match `currentSessionID` — a callback from a `task`
+    /// that `beginNewSession(recognizer:)` has already superseded is stale
+    /// and ignored, which is what prevents overlapping sessions and
+    /// duplicate final-phrase processing.
+    private func handle(
+        result: SFSpeechRecognitionResult?,
+        error: Error?,
+        recognizer: SFSpeechRecognizer,
+        sessionID: UUID
+    ) {
+        guard isActive, sessionID == currentSessionID else { return }
 
         if let result, result.isFinal {
+            finalizationTask?.cancel()
+            finalizationTask = nil
             continuation?.yield(result.bestTranscription.formattedString)
             beginNewSession(recognizer: recognizer)
+            return
+        }
+
+        if let result, !result.isFinal {
+            scheduleFinalization(sessionID: sessionID)
             return
         }
 
@@ -139,11 +201,46 @@ final class GlassesSpeechTranscriber: ContinuousTranscribing, @unchecked Sendabl
         // every session-duration-limit restart), not a failure worth
         // logging on its own.
         if error != nil {
+            finalizationTask?.cancel()
+            finalizationTask = nil
             beginNewSession(recognizer: recognizer)
         }
     }
 
+    /// Resets the silence-debounce timer — called on every non-final
+    /// partial result. If no new partial arrives within
+    /// `silenceDebounceInterval`, `finalizeCurrentUtterance(sessionID:)`
+    /// forces the current request to end, since nothing else ever will
+    /// (see `finalizationTask`'s doc comment).
+    private func scheduleFinalization(sessionID: UUID) {
+        finalizationTask?.cancel()
+        finalizationTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.silenceDebounceInterval)
+            guard !Task.isCancelled else { return }
+            self?.finalizeCurrentUtterance(sessionID: sessionID)
+        }
+    }
+
+    /// Fires after `silenceDebounceInterval` of no new partial results —
+    /// calls `endAudio()` so the recognizer can no longer stay open
+    /// indefinitely. `beginNewSession(recognizer:)` (in `handle`'s
+    /// `isFinal` branch, above) is what actually starts capturing the next
+    /// utterance, once the forced final lands.
+    private func finalizeCurrentUtterance(sessionID: UUID) {
+        guard isActive, sessionID == currentSessionID, !isFinalizingUtterance else { return }
+        finalizationTask = nil
+        isFinalizingUtterance = true
+        request?.endAudio()
+    }
+
     private func append(_ pcm: Data, format: AVAudioFormat) {
+        // Dropped while the current request is winding down after
+        // `endAudio()` — appending after that point is invalid, and a
+        // fresh request (from `beginNewSession(recognizer:)`) takes over
+        // moments later once the forced final lands. G2's mic is never
+        // stopped for this, so it's a few buffers lost, not a gap in
+        // capture readiness.
+        guard !isFinalizingUtterance else { return }
         // A `nil` here means a malformed/empty PCM chunk was silently
         // dropped — kept visible rather than swallowed entirely, since
         // there's no other signal anywhere that this happened.
@@ -157,6 +254,9 @@ final class GlassesSpeechTranscriber: ContinuousTranscribing, @unchecked Sendabl
     private func stopInternal() {
         let wasActive = isActive
         isActive = false
+        finalizationTask?.cancel()
+        finalizationTask = nil
+        isFinalizingUtterance = false
         pcmConsumerTask?.cancel()
         pcmConsumerTask = nil
         request?.endAudio()
