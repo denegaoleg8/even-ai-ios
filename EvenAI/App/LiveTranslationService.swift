@@ -283,30 +283,44 @@ final class LiveTranslationService {
     /// source text only, no translation, until the final runs full
     /// detection).
     private var utteranceLanguageCode: String?
-    /// Cancelled and replaced on every `.partial(_:)` update — only the
-    /// most recent partial's debounced translate-and-display ever runs;
-    /// see `handlePartial(_:)`.
-    private var partialDebounceTask: Task<Void, Never>?
-    /// Monotonically increasing per-partial generation, reset implicitly
-    /// by `utteranceID` changing (a new utterance always means a
-    /// completely fresh comparison). Captured at dispatch time in
-    /// `settlePartial(...)` so a stale response — one superseded by
-    /// either a newer partial of the SAME utterance or that utterance's
-    /// own final — can detect it and discard itself, both before AND
-    /// after the network round trip.
-    private var partialGenerationCounter = 0
-    /// How long to wait after a partial stops changing before actually
-    /// translating/displaying it — deliberately short: this is the whole
-    /// point of the streaming path (translation "as close to real time as
-    /// technically possible"), not a batching optimization. 150ms is
-    /// below normal human perception of a delay, comfortably above the
-    /// rate successive partials for the same word/phrase tend to arrive
-    /// at (avoiding a translate call per single-character growth), and
-    /// matches this repo's own established "short debounce, not a
-    /// multi-second wait" convention (see `GlassesSpeechTranscriber
-    /// .silenceDebounceInterval` for the analogous, much longer,
-    /// deliberately-different-purpose utterance-boundary debounce).
-    private static let partialDebounceInterval: Duration = .milliseconds(150)
+    /// Decides WHEN a growing partial is worth actually translating — see
+    /// `AdaptiveStreamingTranslationBuffer`'s own doc comment for the full
+    /// design (punctuation / pause / max-latency-budget chunk boundaries)
+    /// and the "word-by-word" bug it replaces. Reset (via
+    /// `beginUtterance`/`endUtterance`) in lockstep with `utteranceID`.
+    private var streamingBuffer = AdaptiveStreamingTranslationBuffer()
+    /// Runs for the lifetime of one utterance — periodically calls
+    /// `streamingBuffer.tick(now:)` so a genuine pause or the max-latency
+    /// budget can fire a chunk even when no NEW partial has arrived (see
+    /// `runUtteranceTicker()`). Cancelled the moment the utterance's
+    /// final arrives, or on `stop()`.
+    private var utteranceTickTask: Task<Void, Never>?
+    /// The currently in-flight streaming-chunk translate call, if any —
+    /// cancelled (never left to keep running unobserved) the instant a
+    /// NEWER chunk becomes ready, so at most one streaming translation
+    /// request is ever outstanding per utterance ("backpressure favors
+    /// recency, never queue obsolete requests" — see
+    /// `settleStreamingChunk(...)`'s doc comment).
+    private var streamingTranslateTask: Task<Void, Never>?
+    /// The revision (from `AdaptiveStreamingTranslationBuffer.Decision
+    /// .ready(text:revision:)`) most recently dispatched for translation
+    /// — the authoritative staleness key `settleStreamingChunk(...)`
+    /// checks, both before and after its network round trip. NOT
+    /// redundant with `streamingTranslateTask?.cancel()`: cancelling a
+    /// `Task` only marks it cancelled — it does not retroactively un-
+    /// happen a `Task.sleep`/network call that had already finished
+    /// (e.g. a translator's own artificial delay elapsing) microseconds
+    /// before the cancellation lands. A chunk's result is only ever
+    /// trusted if its own `revision` still equals this value when
+    /// checked, closing that exact race.
+    private var latestDispatchedStreamingRevision = 0
+    /// How often `utteranceTickTask` re-evaluates `streamingBuffer` while
+    /// an utterance is in progress and no new partial has arrived — fine-
+    /// grained enough to catch a stability/max-latency boundary promptly
+    /// (worst case, `tickInterval` of extra latency) without doing
+    /// meaningful work more often than that; each tick that doesn't
+    /// result in `.ready` is a few cheap, in-memory comparisons, no I/O.
+    private static let tickInterval: Duration = .milliseconds(100)
     /// The user's explicit on/off intent, distinct from `state` — guards
     /// `observeConnection()` so a disconnect/reconnect cycle before the
     /// user has ever started Live Translation doesn't do anything.
@@ -544,12 +558,14 @@ final class LiveTranslationService {
                     // TEMPORARY — upstream-path diagnostic. Remove once
                     // root-caused. See DiagnosticTrace.swift.
                     DiagnosticTrace.log("UPSTREAM_TRACE", "TRANSCRIPT_RECEIVED text=\"\(text.prefix(60))\"")
-                    // A final always supersedes any still-pending partial
-                    // for the same utterance — translation has absolute
-                    // priority, and a partial's job is done the moment the
-                    // authoritative text exists.
-                    partialDebounceTask?.cancel()
-                    partialDebounceTask = nil
+                    // A final always supersedes any still-pending
+                    // streaming (partial) work for the same utterance —
+                    // translation has absolute priority, and a partial's
+                    // job is done the moment the authoritative text
+                    // exists. `prepareAndDispatch(final:)` calls
+                    // `resetUtteranceState()` immediately, which cancels
+                    // both the ticker and any in-flight streaming
+                    // translate call.
                     await prepareAndDispatch(final: text)
                 }
             }
@@ -682,8 +698,12 @@ final class LiveTranslationService {
     /// (nothing should survive a stopped session). See `utteranceID`'s and
     /// `partialDebounceTask`'s own doc comments for why each field exists.
     private func resetUtteranceState() {
-        partialDebounceTask?.cancel()
-        partialDebounceTask = nil
+        utteranceTickTask?.cancel()
+        utteranceTickTask = nil
+        streamingTranslateTask?.cancel()
+        streamingTranslateTask = nil
+        latestDispatchedStreamingRevision = 0
+        streamingBuffer.endUtterance()
         utteranceID = nil
         utteranceSequence = nil
         utteranceLanguageCode = nil
@@ -711,16 +731,19 @@ final class LiveTranslationService {
     }
 
     /// Handles one `.partial(_:)` update — see this class's own doc
-    /// comment ("Streaming translation") for the full design. Entirely
-    /// synchronous and cheap: updates `currentPartialTranscript`
-    /// immediately (local state, no I/O), then schedules (replacing any
-    /// previous one) a debounced `Task` that will translate-and-display
-    /// this text if nothing newer supersedes it within
-    /// `partialDebounceInterval`. Never awaited by `consume(_:)`'s loop.
+    /// comment ("Streaming translation") and `AdaptiveStreamingTranslationBuffer`'s
+    /// own doc comment for the full design. Entirely synchronous and
+    /// cheap: updates `currentPartialTranscript` immediately (local
+    /// state, no I/O), feeds the text into `streamingBuffer`, and only if
+    /// THAT decides a chunk is ready right now does any translate/display
+    /// work get dispatched — most partials, especially during fast
+    /// continuous speech, simply update local state and return. Never
+    /// awaited by `consume(_:)`'s loop.
     private func handlePartial(_ rawText: String) {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text != currentPartialTranscript else { return }
 
+        let now = Date()
         if utteranceID == nil {
             let newUtteranceID = UUID()
             utteranceID = newUtteranceID
@@ -728,6 +751,10 @@ final class LiveTranslationService {
             utteranceSequence = turnSequenceCounter
             utteranceLanguageCode = resolveLanguageForNewUtterance()
             currentPartialTranslation = nil
+            streamingBuffer.beginUtterance(id: newUtteranceID, now: now)
+            utteranceTickTask = Task { [weak self] in
+                await self?.runUtteranceTicker(utteranceID: newUtteranceID)
+            }
             DiagnosticTrace.log(
                 "UTTERANCE_STARTED",
                 "id=\(newUtteranceID.uuidString) language=\(utteranceLanguageCode ?? "unresolved")"
@@ -735,78 +762,126 @@ final class LiveTranslationService {
         }
         currentPartialTranscript = text
         DiagnosticTrace.log("PARTIAL_TRANSCRIPT_RECEIVED", "text=\"\(text.prefix(60))\"")
+        DiagnosticTrace.log("STREAM_BUFFER_UPDATE", "text=\"\(text.prefix(60))\" length=\(text.count)")
 
-        guard let utteranceID, let utteranceSequence else { return } // always set just above
+        let decision = streamingBuffer.receivePartial(text, now: now)
+        handleStreamingDecision(decision, arrivedAt: now)
+    }
+
+    /// Runs for the lifetime of one utterance, re-evaluating
+    /// `streamingBuffer` every `tickInterval` — the only way a genuine
+    /// pause or the max-latency budget can fire a chunk when no NEW
+    /// partial has arrived (see `AdaptiveStreamingTranslationBuffer
+    /// .tick(now:)`'s doc comment). Exits the moment `utteranceID`
+    /// no longer matches (the utterance finalized or was superseded) —
+    /// also cancelled directly by `resetUtteranceState()`, this exit
+    /// condition is the belt-and-suspenders backstop.
+    private func runUtteranceTicker(utteranceID: UUID) async {
+        while !Task.isCancelled, self.utteranceID == utteranceID {
+            try? await Task.sleep(for: Self.tickInterval)
+            guard !Task.isCancelled, self.utteranceID == utteranceID else { return }
+            let decision = streamingBuffer.tick(now: Date())
+            handleStreamingDecision(decision, arrivedAt: Date())
+        }
+    }
+
+    /// The one place a `.ready` decision from `streamingBuffer` turns
+    /// into actual work — synchronous itself (dispatches a `Task`, never
+    /// awaits translation here), so it's safe to call from both
+    /// `handlePartial(_:)` (immediate reaction to a new partial) and
+    /// `runUtteranceTicker()` (periodic reaction to elapsed time) without
+    /// either one blocking. `.wait` is a no-op — most calls, especially
+    /// during fast continuous speech, land here.
+    private func handleStreamingDecision(_ decision: AdaptiveStreamingTranslationBuffer.Decision, arrivedAt: Date) {
+        guard case .ready(let text, let revision) = decision else { return }
+        guard let utteranceID, let utteranceSequence else { return }
+        DiagnosticTrace.log("STREAM_CHUNK_READY", "utteranceID=\(utteranceID.uuidString) revision=\(revision) text=\"\(text.prefix(60))\"")
+
+        // Backpressure favors recency: at most one streaming translate
+        // call outstanding per utterance. A newer chunk becoming ready
+        // cancels whatever the previous chunk's call was doing — it is
+        // never left to keep running unobserved, and it is never queued
+        // behind this one either.
+        streamingTranslateTask?.cancel()
+        latestDispatchedStreamingRevision = revision
         let languageCode = utteranceLanguageCode
-        let partialArrivedAt = Date()
-
-        partialGenerationCounter += 1
-        let generation = partialGenerationCounter
-
-        partialDebounceTask?.cancel()
-        partialDebounceTask = Task { [weak self] in
-            try? await Task.sleep(for: Self.partialDebounceInterval)
-            guard !Task.isCancelled else { return }
-            await self?.settlePartial(
+        streamingTranslateTask = Task { [weak self] in
+            await self?.settleStreamingChunk(
                 text: text,
                 languageCode: languageCode,
                 utteranceID: utteranceID,
                 utteranceSequence: utteranceSequence,
-                generation: generation,
-                partialArrivedAt: partialArrivedAt
+                revision: revision,
+                chunkReadyAt: arrivedAt
             )
         }
     }
 
-    /// Runs after `partialDebounceInterval` of no newer partial for the
-    /// same utterance. Translates the now-stable partial (if a language
-    /// is known) and updates G2 in place — but only after confirming,
-    /// BOTH before and after the network round trip, that nothing newer
-    /// (a later partial, or this utterance's own final) has already
-    /// superseded it. This is the literal "stale partial translation
-    /// responses never overwrite newer text" requirement: the check
-    /// before the call is cheap and catches the common case (a burst of
-    /// rapid partials cancelling each other's debounce); the check after
-    /// is the one that actually matters, since the translate call itself
-    /// is the only place real time passes where something newer could
-    /// legitimately arrive.
-    private func settlePartial(
+    /// Translates one ready chunk and updates G2 in place — but only
+    /// after confirming, BOTH before and after the network round trip,
+    /// that nothing newer (a later chunk of the SAME utterance, or that
+    /// utterance's own final) has already superseded it. `revision`
+    /// (from `AdaptiveStreamingTranslationBuffer`) compared against
+    /// `latestDispatchedStreamingRevision` is the authoritative staleness
+    /// key within one utterance; `utteranceID` is the authoritative key
+    /// across utterances — together they're what
+    /// `STREAM_RESULT_DISCARDED_STALE` traces. This is deliberately NOT
+    /// `Task.isCancelled` alone: cancelling `streamingTranslateTask` only
+    /// marks it cancelled going forward — it can't retroactively un-
+    /// happen a translate call whose own delay/network round trip had
+    /// already finished microseconds before the newer chunk's
+    /// cancellation landed (confirmed by a real test failure during
+    /// development: an older, artificially-slow chunk's result still
+    /// arrived and was accepted, because the newer chunk hadn't been
+    /// dispatched — and hadn't cancelled anything — yet). The revision
+    /// comparison has no such timing gap: it's a plain, synchronous
+    /// equality check against whatever the LATEST dispatch actually was,
+    /// at the exact moment each guard runs.
+    private func settleStreamingChunk(
         text: String,
         languageCode: String?,
         utteranceID: UUID,
         utteranceSequence: Int,
-        generation: Int,
-        partialArrivedAt: Date
+        revision: Int,
+        chunkReadyAt: Date
     ) async {
-        guard self.utteranceID == utteranceID, generation == partialGenerationCounter else {
-            DiagnosticTrace.log("PARTIAL_TRANSLATION_STALE", "reason=supersededBeforeStart generation=\(generation)")
+        guard self.utteranceID == utteranceID, revision == latestDispatchedStreamingRevision else {
+            DiagnosticTrace.log("STREAM_RESULT_DISCARDED_STALE", "reason=supersededBeforeStart utteranceID=\(utteranceID.uuidString) revision=\(revision)")
             return
         }
 
         guard let languageCode, languageCode != Self.ukrainianLanguageCode else {
             // No language known yet for this utterance (Auto, unlocked)
-            // or Ukrainian speech — show the source partial alone; there
-            // is nothing to translate.
+            // or Ukrainian speech — show the source chunk alone; there is
+            // nothing to translate.
             await displayPartial(source: text, translation: nil, utteranceID: utteranceID, utteranceSequence: utteranceSequence)
             return
         }
 
         let requestStart = Date()
         DiagnosticTrace.log(
+            "STREAM_TRANSLATION_REQUEST",
+            "utteranceID=\(utteranceID.uuidString) revision=\(revision) language=\(languageCode) text=\"\(text.prefix(60))\""
+        )
+        DiagnosticTrace.log(
             "LATENCY_TRACE",
-            "PARTIAL_TO_TRANSLATION_REQUEST_MS value=\(Int(requestStart.timeIntervalSince(partialArrivedAt) * 1000))"
+            "PARTIAL_TO_TRANSLATION_REQUEST_MS value=\(Int(requestStart.timeIntervalSince(chunkReadyAt) * 1000))"
         )
         var translated: String?
         do {
             translated = try await translateWithTimeout(text, from: languageCode)
+            DiagnosticTrace.log(
+                "STREAM_TRANSLATION_RESULT",
+                "utteranceID=\(utteranceID.uuidString) revision=\(revision) text=\"\(translated?.prefix(60) ?? "nil")\""
+            )
         } catch {
-            // A failed/timed-out partial translation is not worth
-            // surfacing as an error — this debounce tick simply shows
-            // source-only; the next partial (or the eventual, always-
-            // retried final) tries again. A partial never blocks on or
+            // A failed/timed-out chunk translation is not worth
+            // surfacing as an error — this chunk simply shows source-
+            // only; the next chunk (or the eventual, always-retried
+            // final) tries again. A streaming chunk never blocks on or
             // retries its own failure.
             translated = nil
-            DiagnosticTrace.log("LIVE_TRACE", "partial translation failed/timed out for \"\(text.prefix(60))\": \(error)")
+            DiagnosticTrace.log("LIVE_TRACE", "streaming chunk translation failed/timed out for \"\(text.prefix(60))\": \(error)")
         }
         let translationDoneAt = Date()
         DiagnosticTrace.log(
@@ -814,8 +889,8 @@ final class LiveTranslationService {
             "PARTIAL_TRANSLATION_LATENCY_MS value=\(Int(translationDoneAt.timeIntervalSince(requestStart) * 1000))"
         )
 
-        guard self.utteranceID == utteranceID, generation == partialGenerationCounter else {
-            DiagnosticTrace.log("PARTIAL_TRANSLATION_STALE", "reason=supersededDuringTranslation generation=\(generation)")
+        guard self.utteranceID == utteranceID, revision == latestDispatchedStreamingRevision else {
+            DiagnosticTrace.log("STREAM_RESULT_DISCARDED_STALE", "reason=supersededDuringTranslation utteranceID=\(utteranceID.uuidString) revision=\(revision)")
             return
         }
 
@@ -823,7 +898,7 @@ final class LiveTranslationService {
         await displayPartial(source: text, translation: translated, utteranceID: utteranceID, utteranceSequence: utteranceSequence)
         DiagnosticTrace.log(
             "LATENCY_TRACE",
-            "PARTIAL_TO_G2_MS value=\(Int(Date().timeIntervalSince(partialArrivedAt) * 1000))"
+            "PARTIAL_TO_G2_MS value=\(Int(Date().timeIntervalSince(chunkReadyAt) * 1000))"
         )
     }
 
@@ -1025,6 +1100,13 @@ final class LiveTranslationService {
             DiagnosticTrace.log("REAL_TURN_TRACE", "DISPLAY_DONE stage=translationOnly turnID=\(turnID)")
             DiagnosticTrace.log("DISPLAY_END", "id=\(turnID)")
             DiagnosticTrace.log("TURN_TRANSLATION_DISPLAYED", "turnID=\(turnID)")
+            // The final always wins over any provisional streaming chunk
+            // — by this point `resetUtteranceState()` (called at the top
+            // of `prepareAndDispatch(final:)`) has already cancelled any
+            // in-flight streaming translate/ticker work for this
+            // utterance, so this is the authoritative, terminal display
+            // for it.
+            DiagnosticTrace.log("STREAM_FINAL_COMMIT", "turnID=\(turnID) text=\"\(displayText.prefix(60))\"")
             let now = Date()
             DiagnosticTrace.log("LATENCY_TRACE", "DISPLAY_CALL_END id=\(turnID)")
             DiagnosticTrace.log("LATENCY_TRACE", "TRANSLATION_DISPLAY_TS id=\(turnID) value=\(now.timeIntervalSince1970)")

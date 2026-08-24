@@ -11,6 +11,18 @@ struct ChatView: View {
     /// source of truth for "what was the last live turn," not two.
     @Environment(AgentContextStore.self) private var agentContextStore
     @State private var viewModel: ChatViewModel
+    /// The actual auto-scroll RULE lives in `ChatAutoScrollState` (pure,
+    /// unit-tested in isolation) — this is just the one instance driving
+    /// this screen, fed by `.onScrollGeometryChange` (real scroll
+    /// position) and `.onChange(of: viewModel.messages)` (new content).
+    @State private var autoScroll = ChatAutoScrollState()
+    /// How close to the true bottom (in points) still counts as "near
+    /// the bottom" for auto-follow purposes — generous enough that a
+    /// message bubble or two of slop doesn't feel like "I scrolled away"
+    /// (a user reading the very last message, with its bubble partly
+    /// below the fold, should still auto-follow), tight enough that
+    /// genuinely scrolling up to reread history reliably disables it.
+    private static let nearBottomThreshold: CGFloat = 120
 
     init(chatID: Chat.ID, chatService: ChatServicing, glassesTransport: GlassesTransport) {
         self.chatID = chatID
@@ -64,15 +76,38 @@ struct ChatView: View {
                         .padding(AppMetrics.Spacing.md)
                         .animation(.easeOut(duration: 0.2), value: viewModel.messages)
                     }
+                    // The auto-scroll rule: follow new content only while
+                    // already near the bottom; otherwise just flag that
+                    // something new arrived, never yank the view out from
+                    // under someone deliberately reading older turns.
+                    .onScrollGeometryChange(for: Bool.self) { geometry in
+                        let distanceFromBottom = geometry.contentSize.height
+                            - (geometry.contentOffset.y + geometry.containerSize.height)
+                        return distanceFromBottom <= Self.nearBottomThreshold
+                    } action: { _, isNear in
+                        autoScroll.scrollPositionChanged(isNearBottom: isNear)
+                    }
                     .onChange(of: viewModel.messages) {
-                        scrollToBottom(proxy)
+                        if autoScroll.newContentArrived() {
+                            scrollToBottom(proxy)
+                        }
                     }
                     .onChange(of: viewModel.isAwaitingFirstToken) {
-                        scrollToBottom(proxy)
+                        if autoScroll.newContentArrived() {
+                            scrollToBottom(proxy)
+                        }
                     }
                     .onAppear {
                         proxy.scrollTo("bottom", anchor: .bottom)
                     }
+                    .overlay(alignment: .bottom) {
+                        if autoScroll.hasNewMessagesBelow {
+                            newMessagesButton(proxy)
+                                .padding(.bottom, AppMetrics.Spacing.sm)
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
+                    }
+                    .animation(.easeOut(duration: 0.2), value: autoScroll.hasNewMessagesBelow)
                 }
             }
 
@@ -186,6 +221,27 @@ struct ChatView: View {
         withAnimation(.easeOut(duration: 0.2)) {
             proxy.scrollTo("bottom", anchor: .bottom)
         }
+        autoScroll.acknowledgedNewMessages()
+    }
+
+    /// The "↓ New messages" affordance — appears only once the user has
+    /// scrolled away from the bottom AND something new has arrived since.
+    /// Tapping it is the only way this indicator scrolls the view; it
+    /// never scrolls on its own.
+    private func newMessagesButton(_ proxy: ScrollViewProxy) -> some View {
+        Button {
+            scrollToBottom(proxy)
+        } label: {
+            Label("New messages", systemImage: "arrow.down")
+                .font(AppTypography.chatPreview.weight(.semibold))
+                .padding(.horizontal, AppMetrics.Spacing.md)
+                .padding(.vertical, AppMetrics.Spacing.xs)
+                .background(AppColor.accent)
+                .foregroundStyle(Color.white)
+                .clipShape(Capsule())
+                .shadow(radius: 3)
+        }
+        .accessibilityIdentifier("chat.newMessagesIndicator")
     }
 }
 

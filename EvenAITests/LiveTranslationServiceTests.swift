@@ -901,7 +901,10 @@ struct LiveTranslationServiceTests {
 
         await service.start()
         await transcriber.emitPartial("Where are")
-        try? await Task.sleep(for: .milliseconds(250)) // past the 150ms partial debounce
+        // Past AdaptiveStreamingTranslationBuffer's 350ms stability
+        // window (plus tick granularity/translate/display overhead) —
+        // no punctuation here, so stability (a pause) is what fires it.
+        try? await Task.sleep(for: .milliseconds(600))
 
         #expect(service.currentPartialTranscript == "Where are")
         #expect(service.currentPartialTranslation == "Куди ви")
@@ -929,9 +932,9 @@ struct LiveTranslationServiceTests {
 
         await service.start()
         await transcriber.emitPartial("Where")
-        try? await Task.sleep(for: .milliseconds(40)) // well under the 150ms debounce
+        try? await Task.sleep(for: .milliseconds(40)) // well under the 350ms stability window
         await transcriber.emitPartial("Where are you going")
-        try? await Task.sleep(for: .milliseconds(250))
+        try? await Task.sleep(for: .milliseconds(600)) // past the 350ms stability window from here
 
         #expect(service.currentPartialTranscript == "Where are you going")
         let displayed = await spy.displayedPageSets
@@ -941,18 +944,23 @@ struct LiveTranslationServiceTests {
         #expect(displayed == [["Where are you going\n\nUA: Куди ви йдете?"]])
     }
 
-    /// The harder case: "Where"'s debounce DOES fire and its (slow)
+    /// The harder case: "Where"'s chunk becomes ready and its (very slow)
     /// translation call is genuinely in flight when "Where are you going"
-    /// arrives — its own (fast) translation settles first. "Where"'s
-    /// stale response, whenever it eventually resolves, must never
-    /// overwrite what's already on screen.
+    /// arrives — its own (fast, undelayed) translation settles first.
+    /// "Where"'s stale response, whenever it eventually resolves, must
+    /// never overwrite what's already on screen. "Where"'s artificial
+    /// delay (1200ms) is deliberately much longer than the ~450ms it
+    /// takes "Where are you going" to become ready and resolve, so the
+    /// two results are never a close enough race to make this test flaky
+    /// — the point is proving correctness with a comfortable margin, not
+    /// finding the exact timing boundary.
     @Test("a stale, slower partial translation response can never overwrite a newer, faster-settling partial's result")
     func stalePartialTranslationNeverOverwritesNewer() async throws {
         let spy = SpyGlassesTransport()
         let transcriber = ManualContinuousTranscriber()
         let translator = DelayedLanguageTranslator(
             languageCodes: ["Where": "en", "Where are you going": "en"],
-            delays: ["Where": .milliseconds(400)],
+            delays: ["Where": .milliseconds(1200)],
             translations: ["Where": "Де", "Where are you going": "Куди ви йдете?"]
         )
         let service = LiveTranslationService(
@@ -965,12 +973,16 @@ struct LiveTranslationServiceTests {
 
         await service.start()
         await transcriber.emitPartial("Where")
-        // Past the 150ms debounce — "Where"'s slow (400ms) translate call
-        // is now genuinely in flight, not merely scheduled.
-        try? await Task.sleep(for: .milliseconds(220))
+        // Past the 350ms stability window (plus tick granularity) —
+        // "Where"'s slow (1200ms) translate call is now genuinely in
+        // flight, not merely scheduled or still buffered.
+        try? await Task.sleep(for: .milliseconds(500))
         await transcriber.emitPartial("Where are you going")
-        // Past both the new debounce AND "Where"'s full 400ms delay.
-        try? await Task.sleep(for: .milliseconds(600))
+        // Long enough for "Where are you going" to become ready, translate
+        // (instantly — no delay scripted for it) and display, AND for
+        // "Where"'s full 1200ms delay (started around the 500ms mark) to
+        // have elapsed too — proving its stale result never landed.
+        try? await Task.sleep(for: .milliseconds(1400))
 
         #expect(service.currentPartialTranscript == "Where are you going")
         #expect(service.currentPartialTranslation == "Куди ви йдете?")
@@ -1110,11 +1122,119 @@ struct LiveTranslationServiceTests {
 
         // A brand-new utterance's partial must still stream normally.
         await transcriber.emitPartial("Wie geht")
-        try? await Task.sleep(for: .milliseconds(250))
+        try? await Task.sleep(for: .milliseconds(600))
 
         #expect(service.currentPartialTranscript == "Wie geht")
         #expect(service.currentPartialTranslation == "переклад")
         #expect(await spy.displayedPageSets.count == 2)
+    }
+
+    // MARK: - Adaptive phrase streaming (word-by-word regression guards)
+
+    /// End-to-end regression guard for the physically-reported bug: a
+    /// long sentence spoken continuously, word by word, must NOT produce
+    /// one translation request per word — `AdaptiveStreamingTranslationBufferTests`
+    /// covers the pure buffer logic in isolation; this proves the same
+    /// holds once it's wired into the real `LiveTranslationService`
+    /// pipeline (language resolution, translate call dispatch, display).
+    @Test("a long sentence spoken as many rapid partials does not translate every fragment — far fewer, semantically fuller requests")
+    func rapidWordByWordPartialsDoNotEachTranslate() async throws {
+        let recorder = RecordingLanguageTranslator(translation: "переклад")
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: transcriber,
+            translator: recorder,
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.en)
+        await service.start()
+
+        let words = ["How", "are", "you", "going", "to", "get", "there", "tomorrow"]
+        var accumulated = ""
+        for word in words {
+            accumulated += (accumulated.isEmpty ? "" : " ") + word
+            await transcriber.emitPartial(accumulated)
+            try? await Task.sleep(for: .milliseconds(80)) // fast continuous speech — well under the 350ms stability window
+        }
+        // Let the final accumulated (unpunctuated) text settle via the
+        // stability window now that the "speaker" has stopped.
+        try? await Task.sleep(for: .milliseconds(600))
+
+        let translateCalls = await recorder.translateCalls
+        // Nowhere near "one request per word" (8 words) — realistically
+        // just the one final stable chunk once the rapid growth stops.
+        #expect(translateCalls.count <= 2)
+        #expect(translateCalls.last?.text == "How are you going to get there tomorrow")
+    }
+
+    /// A long, continuous, never-pausing run of speech must still update
+    /// periodically (the max-latency budget), never silently falling
+    /// behind and never queuing up translation requests — at most one
+    /// streaming request is ever outstanding at a time.
+    @Test("continuous fast speech with no pauses produces a small, bounded number of chunk translations, not an unbounded queue")
+    func continuousFastSpeechNeverQueuesUnboundedRequests() async throws {
+        let recorder = RecordingLanguageTranslator(translation: "переклад")
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: transcriber,
+            translator: recorder,
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.en)
+        await service.start()
+
+        var accumulated = ""
+        // 30 words, 80ms apart — 2.4 seconds of continuous fast speech,
+        // never pausing long enough to trigger stability on its own.
+        for index in 1...30 {
+            accumulated += (accumulated.isEmpty ? "" : " ") + "word\(index)"
+            await transcriber.emitPartial(accumulated)
+            try? await Task.sleep(for: .milliseconds(80))
+        }
+        try? await Task.sleep(for: .milliseconds(600)) // let the final chunk settle
+
+        let translateCalls = await recorder.translateCalls
+        // ~2.4s of speech / ~0.9s max-latency budget ≈ 3-4 periodic
+        // chunks, plus the final settle — nowhere near 30 (one per word).
+        #expect(translateCalls.count >= 2)
+        #expect(translateCalls.count <= 6)
+    }
+
+    /// Suggested replies must be generated from the FINAL, authoritative
+    /// turn's full semantic content — never from a tiny streaming
+    /// fragment. Proven by checking exactly what text the reply
+    /// generator actually received.
+    @Test("suggested replies are generated from the final semantic turn, never from a partial fragment")
+    func repliesUseFinalSemanticContentNotPartialFragments() async throws {
+        let generator = FakeSuggestedReplyGenerator(defaultReplies: [
+            SuggestedReply(originalLanguageText: "Sure", ukrainianText: "Так", ordering: 0),
+        ])
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(
+                languageCodes: ["How": "en", "How are you going to get there tomorrow": "en"],
+                translation: "переклад"
+            ),
+            replyGenerator: generator,
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.en)
+        await service.start()
+
+        // A partial fragment streams first...
+        await transcriber.emitPartial("How")
+        try? await Task.sleep(for: .milliseconds(500))
+        // ...then the full final arrives.
+        await transcriber.emit("How are you going to get there tomorrow")
+        try? await Task.sleep(for: .milliseconds(100))
+
+        let calls = await generator.calls
+        #expect(calls.count == 1)
+        #expect(calls.first?.turn.originalText == "How are you going to get there tomorrow")
     }
 
     // MARK: - Explicit language-selection state bug ("select a language" repeating loop)
@@ -1184,7 +1304,7 @@ struct LiveTranslationServiceTests {
 
         await service.start()
         await transcriber.emitPartial("some phrase")
-        try? await Task.sleep(for: .milliseconds(250))
+        try? await Task.sleep(for: .milliseconds(600))
 
         #expect(await recorder.detectionCallCount == 0)
         let translateCalls = await recorder.translateCalls
@@ -1261,7 +1381,7 @@ struct LiveTranslationServiceTests {
         await service.start()
         service.setSourceLanguageMode(.en)
         await transcriber.emitPartial("some phrase")
-        try? await Task.sleep(for: .milliseconds(250))
+        try? await Task.sleep(for: .milliseconds(600))
 
         #expect(await recorder.detectionCallCount == 0)
         let translateCalls = await recorder.translateCalls
@@ -1282,7 +1402,7 @@ struct LiveTranslationServiceTests {
         await service.start()
 
         await transcriber.emitPartial("first phrase")
-        try? await Task.sleep(for: .milliseconds(250))
+        try? await Task.sleep(for: .milliseconds(600))
         #expect(await recorder.translateCalls.last?.languageCode == "en")
 
         // Switch mid-session — no stop()/start() anywhere in this test.
@@ -1291,7 +1411,7 @@ struct LiveTranslationServiceTests {
         try? await Task.sleep(for: .milliseconds(60))
 
         await transcriber.emitPartial("second phrase")
-        try? await Task.sleep(for: .milliseconds(250))
+        try? await Task.sleep(for: .milliseconds(600))
 
         #expect(await recorder.translateCalls.last?.languageCode == "de")
         #expect(await recorder.detectionCallCount == 0)
@@ -1354,12 +1474,13 @@ struct LiveTranslationServiceTests {
         await service.start()
 
         await transcriber.emitPartial("Gdzie")
-        try? await Task.sleep(for: .milliseconds(250))
+        try? await Task.sleep(for: .milliseconds(600))
         await transcriber.emit("Gdzie jesteś")
         try? await Task.sleep(for: .milliseconds(100))
 
         #expect(await recorder.detectionCallCount == 0)
         let languages = await recorder.translateCalls.map(\.languageCode)
+        #expect(languages.count == 2) // the partial's chunk, then the final
         #expect(languages.allSatisfy { $0 == "pl" })
         #expect(service.finalTranscript == "Gdzie jesteś")
     }
