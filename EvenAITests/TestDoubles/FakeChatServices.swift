@@ -11,6 +11,7 @@ actor FailingChatService: ChatServicing {
     func renameChat(id: Chat.ID, title: String) async throws -> Chat { throw Failure() }
     func deleteChat(id: Chat.ID) async throws { throw Failure() }
     func fetchMessages(chatID: Chat.ID) async throws -> [Message] { throw Failure() }
+    func appendMessage(chatID: Chat.ID, role: MessageRole, content: String) async throws -> Message { throw Failure() }
 
     nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -29,6 +30,9 @@ actor EmptyChatService: ChatServicing {
     func renameChat(id: Chat.ID, title: String) async throws -> Chat { Chat(id: id, title: title) }
     func deleteChat(id: Chat.ID) async throws {}
     func fetchMessages(chatID: Chat.ID) async throws -> [Message] { [] }
+    func appendMessage(chatID: Chat.ID, role: MessageRole, content: String) async throws -> Message {
+        Message(chatID: chatID, role: role, content: content)
+    }
 
     nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -48,6 +52,9 @@ actor DeleteFailingChatService: ChatServicing {
     func renameChat(id: Chat.ID, title: String) async throws -> Chat { Chat(id: id, title: title) }
     func deleteChat(id: Chat.ID) async throws { throw Failure() }
     func fetchMessages(chatID: Chat.ID) async throws -> [Message] { [] }
+    func appendMessage(chatID: Chat.ID, role: MessageRole, content: String) async throws -> Message {
+        Message(chatID: chatID, role: role, content: content)
+    }
 
     nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
         AsyncThrowingStream { $0.finish() }
@@ -72,6 +79,9 @@ actor CountingCreateChatService: ChatServicing {
     func renameChat(id: Chat.ID, title: String) async throws -> Chat { Chat(id: id, title: title) }
     func deleteChat(id: Chat.ID) async throws {}
     func fetchMessages(chatID: Chat.ID) async throws -> [Message] { [] }
+    func appendMessage(chatID: Chat.ID, role: MessageRole, content: String) async throws -> Message {
+        Message(chatID: chatID, role: role, content: content)
+    }
 
     nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
         AsyncThrowingStream { $0.finish() }
@@ -101,6 +111,9 @@ actor StubChatService: ChatServicing {
     func renameChat(id: Chat.ID, title: String) async throws -> Chat { Chat(id: id, title: title) }
     func deleteChat(id: Chat.ID) async throws {}
     func fetchMessages(chatID: Chat.ID) async throws -> [Message] { messages.filter { $0.chatID == chatID } }
+    func appendMessage(chatID: Chat.ID, role: MessageRole, content: String) async throws -> Message {
+        Message(chatID: chatID, role: role, content: content)
+    }
 
     nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
         AsyncThrowingStream { $0.finish() }
@@ -123,6 +136,9 @@ actor ScriptedStreamChatService: ChatServicing {
     func renameChat(id: Chat.ID, title: String) async throws -> Chat { Chat(id: id, title: title) }
     func deleteChat(id: Chat.ID) async throws {}
     func fetchMessages(chatID: Chat.ID) async throws -> [Message] { [] }
+    func appendMessage(chatID: Chat.ID, role: MessageRole, content: String) async throws -> Message {
+        Message(chatID: chatID, role: role, content: content)
+    }
 
     nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -143,6 +159,9 @@ actor PartialStreamThenFailChatService: ChatServicing {
     func renameChat(id: Chat.ID, title: String) async throws -> Chat { Chat(id: id, title: title) }
     func deleteChat(id: Chat.ID) async throws {}
     func fetchMessages(chatID: Chat.ID) async throws -> [Message] { [] }
+    func appendMessage(chatID: Chat.ID, role: MessageRole, content: String) async throws -> Message {
+        Message(chatID: chatID, role: role, content: content)
+    }
 
     nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
         AsyncThrowingStream { continuation in

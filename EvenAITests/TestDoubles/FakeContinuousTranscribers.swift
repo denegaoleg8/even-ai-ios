@@ -50,3 +50,32 @@ actor ScriptedContinuousTranscriber: ContinuousTranscribing {
         continuation = nil
     }
 }
+
+/// Like `ScriptedContinuousTranscriber`, but finals are emitted on demand
+/// via `emit(_:)` rather than all up front — lets a test control the real
+/// wall-clock gap between two finals (e.g. to test a time-bounded dedupe
+/// window's boundary), which a fixed, synchronously-yielded array can't.
+actor ManualContinuousTranscriber: ContinuousTranscribing {
+    private(set) var stopCallCount = 0
+    private var continuation: AsyncThrowingStream<String, Error>.Continuation?
+
+    func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            Task { await self.retain(continuation) }
+        }
+    }
+
+    private func retain(_ continuation: AsyncThrowingStream<String, Error>.Continuation) {
+        self.continuation = continuation
+    }
+
+    func emit(_ text: String) {
+        continuation?.yield(text)
+    }
+
+    func stopTranscribing() async {
+        stopCallCount += 1
+        continuation?.finish()
+        continuation = nil
+    }
+}

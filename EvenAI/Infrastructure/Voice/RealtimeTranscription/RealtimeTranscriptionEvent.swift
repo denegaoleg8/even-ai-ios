@@ -19,6 +19,21 @@ enum RealtimeTranscriptionEvent: Equatable, Sendable {
     case languageInfo([String])
     case providerError(String)
     case closed(reason: String?)
+
+    /// Case name only — never the associated transcript/error text.
+    /// Diagnostic logging (see `URLSessionRealtimeTranscriptionSocket`)
+    /// uses this instead of string-interpolating the event directly, so a
+    /// trace line can never leak spoken content.
+    var caseName: String {
+        switch self {
+        case .sessionStarted: return "sessionStarted"
+        case .partialTranscript: return "partialTranscript"
+        case .finalTranscript: return "finalTranscript"
+        case .languageInfo: return "languageInfo"
+        case .providerError: return "providerError"
+        case .closed: return "closed"
+        }
+    }
 }
 
 enum RealtimeTranscriptionEventDecodingError: Error, Equatable, Sendable {

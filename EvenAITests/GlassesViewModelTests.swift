@@ -91,4 +91,44 @@ struct GlassesViewModelTests {
         #expect(!viewModel.isSendingTestText)
         #expect(viewModel.connectionState == .disconnected)
     }
+
+    // MARK: - Display-First milestone: temporary hard-coded display test
+
+    @Test("f) the hard-coded display test page list is exactly the required 4 pages, in order")
+    func displayTestPagesAreExact() {
+        #expect(GlassesViewModel.displayTestPages == [
+            "HELLO FROM EVENAI",
+            "Привіт від EvenAI",
+            "Sure, that works.",
+            "Так, це підходить.",
+        ])
+    }
+
+    @Test("g) running the display test while connected sends the exact 4-page set through displayPages(_:)")
+    func displayTestSendsExactPagesWhenConnected() async {
+        let spy = SpyGlassesTransport()
+        let viewModel = GlassesViewModel(transport: spy)
+        let observation = Task { await viewModel.observeConnectionState() }
+        try? await Task.sleep(for: Self.propagationDelay)
+        await viewModel.connect()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        await viewModel.runHardCodedDisplayTest()
+
+        #expect(await spy.displayedPageSets == [GlassesViewModel.displayTestPages])
+        #expect(viewModel.displayTestError == nil)
+        #expect(!viewModel.isRunningDisplayTest)
+        observation.cancel()
+    }
+
+    @Test("h) running the display test while disconnected surfaces a friendly error, no crash")
+    func displayTestWhileDisconnectedIsHarmless() async {
+        let viewModel = GlassesViewModel(transport: MockGlassesTransport())
+        // Never connected.
+        await viewModel.runHardCodedDisplayTest()
+
+        #expect(viewModel.displayTestError != nil)
+        #expect(!viewModel.isRunningDisplayTest)
+        #expect(viewModel.connectionState == .disconnected)
+    }
 }

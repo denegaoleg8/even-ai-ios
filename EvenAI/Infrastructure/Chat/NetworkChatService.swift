@@ -53,6 +53,12 @@ actor NetworkChatService: ChatServicing {
         return try JSONDecoder.evenAI.decode(MessagesResponseDTO.self, from: data).messages.map { $0.toDomain() }
     }
 
+    func appendMessage(chatID: Chat.ID, role: MessageRole, content: String) async throws -> Message {
+        let body = try JSONEncoder.evenAI.encode(["role": role.rawValue, "content": content])
+        let data = try await apiClient.post("chats/\(chatID.lowercaseUUIDString)/messages", body: body)
+        return try JSONDecoder.evenAI.decode(MessageDTO.self, from: data).toDomain()
+    }
+
     nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {

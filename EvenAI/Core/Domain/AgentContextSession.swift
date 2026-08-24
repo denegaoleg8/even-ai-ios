@@ -49,6 +49,18 @@ struct AgentContextSession: Identifiable, Codable, Hashable, Sendable {
         turns[index] = turn
     }
 
+    /// Removes the turn with the given `id`, if one exists — used when a
+    /// turn was appended as a draft (translation still pending) but that
+    /// translation then failed/timed out/came back empty: the product
+    /// requirement is that a failed translation leaves no trace in
+    /// history or on G2, matching what a fully-synchronous "only append
+    /// once translation succeeds" pipeline would have done. A no-op if no
+    /// turn with that id exists any more (e.g. already removed, or the
+    /// session was reset).
+    mutating func removeTurn(id: ConversationTurn.ID) {
+        turns.removeAll { $0.id == id }
+    }
+
     /// Adds a piece of raw context material — never implicitly appended
     /// to `turns`.
     mutating func addContext(_ item: ContextItem) {

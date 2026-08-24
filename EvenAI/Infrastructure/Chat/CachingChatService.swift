@@ -99,6 +99,12 @@ actor CachingChatService: ChatServicing {
         removeCachedChat(id: id)
     }
 
+    func appendMessage(chatID: Chat.ID, role: MessageRole, content: String) async throws -> Message {
+        let message = try await wrapped.appendMessage(chatID: chatID, role: role, content: content)
+        cacheMessageWriteThrough(message)
+        return message
+    }
+
     nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {

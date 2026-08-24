@@ -35,6 +35,25 @@ final class AppleLanguageTranslator: LanguageTranslating, @unchecked Sendable {
     /// nothing rather than produce noisy output" contract.
     private static let confidenceThreshold = 0.6
 
+    /// Bounds each individual `session.translate(_:)` call inside
+    /// `runSession(_:)`'s own loop — NOT the same thing as a caller's own
+    /// timeout on `translateToUkrainian(_:from:)` (see
+    /// `LiveTranslationService.translateWithTimeout(_:from:)`), and not
+    /// redundant with it. `pendingTranslations` is a single-consumer FIFO
+    /// queue: `runSession(_:)` dequeues one item and awaits its
+    /// `session.translate(_:)` call before it ever looks at the next
+    /// queued item. A caller-side timeout only makes THAT CALLER stop
+    /// waiting — it does nothing to un-stick `runSession(_:)`'s own loop,
+    /// which is still sitting on the same stuck `session.translate(_:)`
+    /// call for the abandoned item. Confirmed as the actual root cause of
+    /// "Live Translation hangs on one phrase and never continues" for
+    /// this specific implementation: every later translation request,
+    /// however unrelated, funnels through this one queue and would never
+    /// even be dequeued, let alone attempted, while the loop is wedged.
+    /// Racing a timeout around each dequeued item, right here, is what
+    /// actually frees the loop to move on to the next one.
+    private static let perCallTimeout: Duration = .seconds(8)
+
     private struct PendingTranslation {
         let text: String
         let continuation: CheckedContinuation<String, Error>
@@ -46,6 +65,23 @@ final class AppleLanguageTranslator: LanguageTranslating, @unchecked Sendable {
     nonisolated init() {}
 
     func detectedLanguageCode(for text: String) async -> String? {
+        // Measured directly against the real NLLanguageRecognizer (not
+        // assumed): "hello" scores only ~0.13 confidence for English, its
+        // actual language ("no"/"goodbye" score even lower and get
+        // assigned to entirely wrong languages — Portuguese, Danish —
+        // both still under the 0.6 bar below; "okay" scores ~0.39, also
+        // under it). A single short, common word simply doesn't carry
+        // enough statistical signal for a general-purpose n-gram model —
+        // raising/lowering confidenceThreshold can't fix this without
+        // either still rejecting these exact words or accepting
+        // genuinely ambiguous/noisy input elsewhere. See
+        // `CommonShortUtterances`'s own doc comment for why this table is
+        // shared with `LiveTranslationService`'s Auto-lock hysteresis,
+        // not private to this file.
+        if let knownLanguage = CommonShortUtterances.language(for: text) {
+            return knownLanguage
+        }
+
         let recognizer = NLLanguageRecognizer()
         recognizer.processString(text)
         guard let dominant = recognizer.dominantLanguage else { return nil }
@@ -87,11 +123,31 @@ final class AppleLanguageTranslator: LanguageTranslating, @unchecked Sendable {
         while !Task.isCancelled {
             let pending = await nextPendingTranslation()
             do {
-                let response = try await session.translate(pending.text)
-                pending.continuation.resume(returning: response.targetText)
+                let targetText = try await translate(pending.text, using: session)
+                pending.continuation.resume(returning: targetText)
             } catch {
                 pending.continuation.resume(throwing: error)
             }
         }
+    }
+
+    /// See `perCallTimeout`'s doc comment for why this — not a plain
+    /// `try await session.translate(text).targetText` — is what actually
+    /// keeps `runSession(_:)`'s single-consumer loop from getting
+    /// permanently wedged behind one stuck call.
+    private func translate(_ text: String, using session: TranslationSession) async throws -> String {
+        try await withThrowingTaskGroup(of: String.self) { group in
+            group.addTask { try await session.translate(text).targetText }
+            group.addTask {
+                try await Task.sleep(for: Self.perCallTimeout)
+                throw PerCallTimeoutError()
+            }
+            defer { group.cancelAll() }
+            return try await group.next()!
+        }
+    }
+
+    private struct PerCallTimeoutError: Error, CustomStringConvertible {
+        var description: String { "on-device translation call timed out" }
     }
 }

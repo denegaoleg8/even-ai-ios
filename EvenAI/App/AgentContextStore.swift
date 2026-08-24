@@ -40,6 +40,14 @@ final class AgentContextStore {
         session.updateTurn(turn)
     }
 
+    /// Removes an already-appended turn — used when a turn was appended
+    /// as a draft (translation still pending) but that translation then
+    /// failed/timed out/came back empty. See
+    /// `AgentContextSession.removeTurn(id:)`'s own doc comment.
+    func removeTurn(id: ConversationTurn.ID) {
+        session.removeTurn(id: id)
+    }
+
     /// Adds a note/pasted-text/imported-file reference to the shared
     /// session — background material `SuggestedReplyGenerating`
     /// implementations can read via `SuggestedReplyContext.contextItems`.

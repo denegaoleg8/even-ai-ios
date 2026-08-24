@@ -62,7 +62,13 @@ struct LiveTranslationServiceG2DisplayTests {
             ukrainianTranslation: "Добрий день",
             suggestedReplies: replies
         )
-        #expect(calls[1] == GlassesPresentationLayer.pages(for: expectedTurn))
+        // replyLeadingPages(for:), not pages(for:) — the automatic reply
+        // update must show the first reply page immediately, not re-show
+        // the translation the user already saw with the reply content
+        // sitting unreachable without a swipe. See
+        // LiveTranslationService.generateSuggestedReplies(for:)'s doc
+        // comment for the physical bug this fixes.
+        #expect(calls[1] == GlassesPresentationLayer.replyLeadingPages(for: expectedTurn))
     }
 
     @Test("the reply update replaces G2's page set — it never duplicates or appends a redundant third call")
@@ -82,12 +88,14 @@ struct LiveTranslationServiceG2DisplayTests {
         try? await Task.sleep(for: Self.propagationDelay)
 
         let calls = await spy.displayedPageSets
-        // Exactly two calls total: translation-only, then translation+replies —
+        // Exactly two calls total: translation-only, then reply-leading —
         // never a third call, and the second call is one coherent page
-        // set, not the reply pages appended as a separate display.
+        // set (the first reply page immediately visible, translation
+        // reachable afterward by swipe — see replyLeadingPages(for:)),
+        // not the reply pages appended as a separate display.
         #expect(calls.count == 2)
-        #expect(calls[1].first == "Добрий день")
-        #expect(calls[1].dropFirst().contains { $0.contains("Sure") })
+        #expect(calls[1].first?.contains("Sure") == true)
+        #expect(calls[1].contains("Добрий день"))
     }
 
     @Test("newest finalized turn always becomes the active G2 content — a stale, late-arriving reply never overwrites it")

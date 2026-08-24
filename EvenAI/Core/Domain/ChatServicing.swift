@@ -13,4 +13,10 @@ protocol ChatServicing: Sendable {
     func deleteChat(id: Chat.ID) async throws
     func fetchMessages(chatID: Chat.ID) async throws -> [Message]
     func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error>
+    /// Persists one message directly, with no AI reply triggered — unlike
+    /// `streamReply(chatID:content:)`, which always provokes a completion.
+    /// Added for "Glasses Chat" (Live Translation turns are real,
+    /// persisted conversation entries, but a translated phrase must never
+    /// itself cost a chat-completion call).
+    func appendMessage(chatID: Chat.ID, role: MessageRole, content: String) async throws -> Message
 }

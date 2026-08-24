@@ -50,6 +50,22 @@ struct GlassesView: View {
                     if let sendError = viewModel.sendError {
                         InlineErrorText(message: sendError)
                     }
+
+                    // TEMPORARY — Display-First milestone physical-device
+                    // primitive test (4 hard-coded pages, no STT/AI in
+                    // the loop). Remove once the production G2 display
+                    // path is physically confirmed.
+                    PrimaryButton(
+                        "Run Display Test (4 pages)",
+                        systemImage: "rectangle.stack",
+                        isLoading: viewModel.isRunningDisplayTest
+                    ) {
+                        Task { await viewModel.runHardCodedDisplayTest() }
+                    }
+
+                    if let displayTestError = viewModel.displayTestError {
+                        InlineErrorText(message: displayTestError)
+                    }
                 }
             }
             .frame(maxWidth: 260)

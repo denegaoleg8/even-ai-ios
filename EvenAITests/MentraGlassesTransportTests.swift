@@ -28,6 +28,47 @@ struct MentraGlassesTransportTests {
     }
 }
 
+/// SDK-audit fix: G2.swift (the vendored SDK's private glasses
+/// implementation) confirms a systemExit/abnormalExit touch event means
+/// "the firmware killed our page" — its own `pageCreated` flag goes false,
+/// and recovery is left to either a paired dashboard-close event or new
+/// display content reaching the SDK's reconcile loop. Without a reaction
+/// here, an exit between two translated phrases (or after the last one in
+/// a session) had nothing to prompt a rebuild. `exitRecoveryRedisplayText`
+/// is the pure decision extracted from `didReceive(event:)` so it's
+/// testable without a real `MentraBluetoothSDK`/`CBCentralManager` — the
+/// actual `sdk.displayText(_:)` redisplay call remains untested at that
+/// boundary, matching this file's existing scope (the pre-existing swipe-
+/// redisplay path was never exercised against a real `sdk` either).
+@Suite("MentraGlassesTransport exit-recovery redisplay")
+struct MentraGlassesTransportExitRecoveryTests {
+    @Test("a system_exit gesture with an active page returns that page's text to redisplay")
+    func systemExitWithActivePageRedisplays() {
+        let text = MentraGlassesTransport.exitRecoveryRedisplayText(
+            gestureName: "system_exit", currentPage: "Hello from EvenAI"
+        )
+        #expect(text == "Hello from EvenAI")
+    }
+
+    @Test("gesture-name matching is case-insensitive and matches any exit-class name, not just the exact literal")
+    func exitClassGestureNamesAllMatch() {
+        #expect(MentraGlassesTransport.exitRecoveryRedisplayText(gestureName: "SYSTEM_EXIT", currentPage: "x") == "x")
+        #expect(MentraGlassesTransport.exitRecoveryRedisplayText(gestureName: "abnormal_exit", currentPage: "x") == "x")
+    }
+
+    @Test("a system_exit gesture with no active page triggers no redisplay")
+    func systemExitWithNoActivePageDoesNothing() {
+        let text = MentraGlassesTransport.exitRecoveryRedisplayText(gestureName: "system_exit", currentPage: nil)
+        #expect(text == nil)
+    }
+
+    @Test("a non-exit gesture never triggers a redisplay, even with an active page")
+    func nonExitGestureDoesNothing() {
+        #expect(MentraGlassesTransport.exitRecoveryRedisplayText(gestureName: "double_click", currentPage: "x") == nil)
+        #expect(MentraGlassesTransport.exitRecoveryRedisplayText(gestureName: nil, currentPage: "x") == nil)
+    }
+}
+
 /// `GlassesTextPaginator` splits long chat replies into pages sized for
 /// G2's fixed-size display — the fix for "long responses can't be
 /// scrolled/read in full." Pure text logic, no SDK dependency.
@@ -262,5 +303,87 @@ struct GlassesPaginationStateTests {
         #expect(state.currentPage == pages[1])
         #expect(state.advance() == nil) // clamped at the last page
         #expect(state.retreat() == pages[0])
+    }
+}
+
+/// Root-cause fix (Display-First milestone): `connected == true` no
+/// longer means "safe to display" — the vendored SDK's own display-
+/// reconcile loop only starts once `ready` (fullyBooted) is also true.
+/// These tests cover `GlassesReadinessGate` in complete isolation from
+/// `MentraGlassesTransport`/the real SDK, exactly as `GlassesPaginationStateTests`
+/// does for pagination.
+@Suite("GlassesReadinessGate")
+struct GlassesReadinessGateTests {
+    @Test("connected but not ready: requestDisplay returns nil and records the pages as pending")
+    func notReadyQueuesRequest() {
+        var gate = GlassesReadinessGate()
+        let result = gate.requestDisplay(["HELLO FROM EVENAI"], ready: false)
+
+        #expect(result == nil)
+        #expect(gate.pendingPages == ["HELLO FROM EVENAI"])
+    }
+
+    @Test("ready: requestDisplay returns the pages immediately, with nothing left pending")
+    func readySendsImmediately() {
+        var gate = GlassesReadinessGate()
+        let result = gate.requestDisplay(["HELLO FROM EVENAI"], ready: true)
+
+        #expect(result == ["HELLO FROM EVENAI"])
+        #expect(gate.pendingPages == nil)
+    }
+
+    @Test("a ready transition flushes the pending pages exactly once")
+    func readyTransitionFlushesPendingPages() {
+        var gate = GlassesReadinessGate()
+        _ = gate.requestDisplay(["HELLO FROM EVENAI"], ready: false)
+
+        // Not ready yet — nothing to flush.
+        #expect(gate.flushIfReady(ready: false) == nil)
+        #expect(gate.pendingPages == ["HELLO FROM EVENAI"])
+
+        // Ready now — the queued pages are returned exactly once.
+        #expect(gate.flushIfReady(ready: true) == ["HELLO FROM EVENAI"])
+        #expect(gate.pendingPages == nil)
+    }
+
+    @Test("no duplicate send: flushing twice after readiness only returns the pages the first time")
+    func noDuplicateSendAfterReadiness() {
+        var gate = GlassesReadinessGate()
+        _ = gate.requestDisplay(["HELLO FROM EVENAI"], ready: false)
+
+        #expect(gate.flushIfReady(ready: true) == ["HELLO FROM EVENAI"])
+        #expect(gate.flushIfReady(ready: true) == nil) // already consumed — nothing left to duplicate
+    }
+
+    @Test("disconnected: discardPending clears a queued display safely, with nothing flushed later")
+    func disconnectedDiscardsPendingSafely() {
+        var gate = GlassesReadinessGate()
+        _ = gate.requestDisplay(["HELLO FROM EVENAI"], ready: false)
+
+        gate.discardPending()
+
+        #expect(gate.pendingPages == nil)
+        #expect(gate.flushIfReady(ready: true) == nil)
+    }
+
+    @Test("newest-turn-wins: a second not-ready request replaces the first pending set, never both")
+    func secondRequestWhileNotReadyReplacesTheFirst() {
+        var gate = GlassesReadinessGate()
+        _ = gate.requestDisplay(["stale translation"], ready: false)
+        _ = gate.requestDisplay(["HELLO FROM EVENAI"], ready: false)
+
+        #expect(gate.pendingPages == ["HELLO FROM EVENAI"]) // only the newest survives
+        #expect(gate.flushIfReady(ready: true) == ["HELLO FROM EVENAI"])
+    }
+
+    @Test("a ready direct send supersedes anything still queued from a moment ago")
+    func readyDirectSendSupersedesStalePending() {
+        var gate = GlassesReadinessGate()
+        _ = gate.requestDisplay(["stale translation"], ready: false)
+
+        let result = gate.requestDisplay(["HELLO FROM EVENAI"], ready: true)
+
+        #expect(result == ["HELLO FROM EVENAI"])
+        #expect(gate.pendingPages == nil) // the stale queued set is gone, not flushed later
     }
 }

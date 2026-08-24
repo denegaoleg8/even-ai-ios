@@ -26,6 +26,16 @@ final class URLSessionRealtimeTranscriptionSocket: RealtimeTranscriptionSocket, 
     func connect() async throws -> AsyncThrowingStream<RealtimeTranscriptionEvent, Error> {
         var request = await apiClient.makeWebSocketRequest(path: Self.path)
         request.url = Self.webSocketURL(from: request.url) ?? request.url
+
+        // TEMPORARY diagnostics for the Milestone 8b physical-device
+        // failure — remove once root-caused. See DiagnosticTrace.swift.
+        // Never logs the token itself, only whether one is present —
+        // this directly tests whether `AuthenticatedAPIClient.accessToken`
+        // was actually populated (e.g. by RootView's launch-time
+        // restoreSession()) by the moment Live Translation starts.
+        let hasAuthHeader = request.value(forHTTPHeaderField: "Authorization") != nil
+        DiagnosticTrace.log("8B_TRACE", "AUTH url=\(request.url?.absoluteString ?? "nil") hasAuthorizationHeader=\(hasAuthHeader)")
+
         let newTask = urlSession.webSocketTask(with: request)
         task = newTask
         newTask.resume()
@@ -64,6 +74,15 @@ final class URLSessionRealtimeTranscriptionSocket: RealtimeTranscriptionSocket, 
             do {
                 message = try await task.receive()
             } catch {
+                // TEMPORARY — remove once root-caused. `closeCode`/
+                // `closeReason` are only populated once the task has
+                // actually finished closing, which is exactly the state
+                // `receive()` throwing puts it in.
+                let nsError = error as NSError
+                DiagnosticTrace.log(
+                    "8B_TRACE",
+                    "WS_CLOSED code=\(task.closeCode.rawValue) reason=\(task.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? "nil") error domain=\(nsError.domain) code=\(nsError.code) description=\(nsError.localizedDescription)"
+                )
                 continuation.finish(throwing: error)
                 return
             }
@@ -72,8 +91,11 @@ final class URLSessionRealtimeTranscriptionSocket: RealtimeTranscriptionSocket, 
             case .string(let text):
                 guard let data = text.data(using: .utf8) else { continue }
                 do {
-                    continuation.yield(try RealtimeTranscriptionEvent.decode(from: data))
+                    let decoded = try RealtimeTranscriptionEvent.decode(from: data)
+                    DiagnosticTrace.log("8B_TRACE", "IOS_DECODE event=\(decoded.caseName)")
+                    continuation.yield(decoded)
                 } catch {
+                    DiagnosticTrace.log("8B_TRACE", "ERROR malformed event from backend: \(error) raw=\(text.prefix(200))")
                     continuation.yield(.providerError("malformed event: \(error)"))
                 }
             case .data:

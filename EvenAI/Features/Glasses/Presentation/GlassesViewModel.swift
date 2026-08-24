@@ -7,6 +7,13 @@ final class GlassesViewModel {
     private(set) var connectionState: GlassesTransportState = .disconnected
     private(set) var isSendingTestText = false
     private(set) var sendError: String?
+    /// TEMPORARY — Display-First milestone. Proves "APP → G2 → visible
+    /// text" using the existing `GlassesTransport.displayPages(_:)` and
+    /// pagination path, with no STT/translation/AI in the loop at all.
+    /// Remove once the production G2 display path is physically
+    /// confirmed working end-to-end.
+    private(set) var isRunningDisplayTest = false
+    private(set) var displayTestError: String?
 
     private let transport: GlassesTransport
 
@@ -62,6 +69,34 @@ final class GlassesViewModel {
             try await transport.sendText("Hello from EvenAI")
         } catch {
             sendError = error.localizedDescription
+        }
+    }
+
+    /// TEMPORARY — Display-First milestone hard-coded 4-page test. Exact
+    /// pages required by the physical-device acceptance test: an English
+    /// translation-style line, its Ukrainian counterpart, an English
+    /// suggested reply, and its Ukrainian meaning — proving the primitive
+    /// the production turn-display path (Milestone 6's
+    /// `GlassesPresentationLayer`) will eventually reuse, without any
+    /// STT/translation/AI involved. Internal (not private) so
+    /// `GlassesViewModelTests` can assert on the exact page list without
+    /// duplicating it.
+    static let displayTestPages = [
+        "HELLO FROM EVENAI",
+        "Привіт від EvenAI",
+        "Sure, that works.",
+        "Так, це підходить.",
+    ]
+
+    func runHardCodedDisplayTest() async {
+        guard !isRunningDisplayTest else { return }
+        isRunningDisplayTest = true
+        defer { isRunningDisplayTest = false }
+        displayTestError = nil
+        do {
+            try await transport.displayPages(Self.displayTestPages)
+        } catch {
+            displayTestError = error.localizedDescription
         }
     }
 }

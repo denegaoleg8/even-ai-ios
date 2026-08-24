@@ -44,6 +44,47 @@ enum GlassesPresentationLayer {
         return pages
     }
 
+    /// Same content as `pages(for:)`, reordered so the FIRST reply page
+    /// comes first and the translation page(s) come last — for the
+    /// automatic "replies just finished generating" display update.
+    ///
+    /// `pages(for:)`'s translation-first order is correct for the
+    /// *initial* display call (there are no replies yet, so page 1 being
+    /// the translation is simply the only content that exists) — but a
+    /// transport only ever sends page 1 of whatever page set it's given;
+    /// later pages are reachable by swiping only (see
+    /// `MentraGlassesTransport.displayPages(_:)`). Calling `pages(for:)`
+    /// again once replies exist and displaying THAT page set means page 1
+    /// is still the translation the user already saw — the reply content
+    /// is delivered but sits unseen on page 2+ until a swipe. This is the
+    /// actual root cause of "replies require pressing a button on the
+    /// glasses to appear": nothing was technically broken about
+    /// generating or sending the replies, only about which page a fresh
+    /// `displayPages(_:)` call lands on by default.
+    ///
+    /// Swiping still works exactly as before afterward — this only
+    /// changes what's shown immediately, not how pagination itself
+    /// behaves; a gesture navigates whatever page set is currently
+    /// active, translation included.
+    static func replyLeadingPages(
+        for turn: ConversationTurn,
+        maxCharactersPerPage: Int = GlassesTextPaginator.defaultMaxCharactersPerPage
+    ) -> [String] {
+        guard let translation = turn.ukrainianTranslation?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !translation.isEmpty
+        else {
+            return []
+        }
+
+        let replies = replyPages(for: turn.suggestedReplies, maxCharactersPerPage: maxCharactersPerPage)
+        let translationPages = GlassesTextPaginator.pages(for: translation, maxCharactersPerPage: maxCharactersPerPage)
+        guard !replies.isEmpty else {
+            // Nothing to lead with — identical to the translation-only set.
+            return translationPages
+        }
+        return replies + translationPages
+    }
+
     /// Packs each reply + its Ukrainian meaning as one indivisible block,
     /// sorted by `ordering` (not array position — see
     /// `SuggestedReply.ordering`'s own doc comment) and capped at 3,

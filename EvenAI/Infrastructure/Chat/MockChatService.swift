@@ -64,6 +64,20 @@ actor MockChatService: ChatServicing {
             .map { $0.toDomain() }
     }
 
+    func appendMessage(chatID: Chat.ID, role: MessageRole, content: String) async throws -> Message {
+        let context = ModelContext(modelContainer)
+        guard let chatEntity = try fetchChatEntity(id: chatID, context: context) else {
+            throw ChatServiceError.chatNotFound
+        }
+        let message = MessageEntity(role: role, content: content, chat: chatEntity)
+        chatEntity.messages.append(message)
+        chatEntity.updatedAt = .now
+        chatEntity.lastMessagePreview = content
+        context.insert(message)
+        try context.save()
+        return message.toDomain()
+    }
+
     nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {

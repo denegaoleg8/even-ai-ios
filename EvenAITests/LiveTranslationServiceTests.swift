@@ -13,7 +13,15 @@ import Foundation
 @MainActor
 @Suite("LiveTranslationService")
 struct LiveTranslationServiceTests {
-    private static let propagationDelay: Duration = .milliseconds(30)
+    // Widened from 30ms: this suite now has ~30 tests, several running
+    // real (fake-backed) async work concurrently under Swift Testing's
+    // parallel scheduler — a 30ms budget was intermittently too tight
+    // under that contention (confirmed non-deterministic across reruns:
+    // a different, unrelated test/word failed each time, never the same
+    // one twice — the signature of a scheduling margin issue, not a
+    // logic bug). Test-only constant; does not reflect or affect any
+    // production timing.
+    private static let propagationDelay: Duration = .milliseconds(150)
 
     @Test("a foreign-language final phrase is translated and sent to the glasses")
     func foreignPhraseIsTranslatedAndSent() async throws {
@@ -79,6 +87,67 @@ struct LiveTranslationServiceTests {
         // Milestone 6: see `foreignPhraseIsTranslatedAndSent`'s comment —
         // `displayPages(_:)` is what actually carries this now.
         #expect(await spy.displayedPageSets == [["привіт"]])
+    }
+
+    @Test("a translation failure leaves the session alive — no turn/display for that phrase, and a later phrase still works")
+    func translationFailureLeavesSessionAlive() async throws {
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag", "hello there"], autoFinish: false),
+            translator: ThrowingLanguageTranslator(failingTexts: ["Guten Tag"], translation: "привіт"),
+            agentContextStore: store
+        )
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        // The failed phrase produced no turn and nothing was displayed —
+        // `handle(final:)` returns as soon as `translated == nil` — but
+        // the session stayed healthy enough to process the next, distinct
+        // phrase normally: exactly one turn, for "hello there" alone.
+        #expect(store.session.turns.map(\.originalText) == ["hello there"])
+        #expect(await spy.displayedPageSets == [["привіт"]])
+        // `state` never became `.error`, unlike a microphone-enable failure.
+        #expect(service.state == .listening)
+    }
+
+    /// Regression guard for a real physical-device hang (not merely
+    /// theorized): `AppleLanguageTranslator.translateToUkrainian` can
+    /// block forever if the on-device `Translation` framework needs to
+    /// present its own system UI at a moment another `.sheet` is already
+    /// covering the view that hosts its `TranslationSession` — see
+    /// `LiveTranslationService.translateWithTimeout`'s doc comment. Before
+    /// the timeout existed, a stuck translation call would silently wedge
+    /// `consume(_:)`'s sequential loop forever — every phrase after the
+    /// stuck one would simply never be processed, with no error, no
+    /// display update, and no visible sign anything had gone wrong.
+    @Test("a translation call that never returns times out — the session stays alive and a later phrase still works")
+    func translationTimeoutLeavesSessionAlive() async throws {
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag", "hello there"], autoFinish: false),
+            translator: HangingLanguageTranslator(
+                languageCodes: ["Guten Tag": "de", "hello there": "en"],
+                hangingTexts: ["Guten Tag"],
+                translation: "привіт"
+            ),
+            agentContextStore: store,
+            translationTimeout: .milliseconds(30)
+        )
+
+        await service.start()
+        try? await Task.sleep(for: .milliseconds(200)) // comfortably past the 30ms timeout
+
+        // The hung phrase produced no turn and nothing was displayed for
+        // it, but the session recovered and processed the next, distinct
+        // phrase completely normally.
+        #expect(store.session.turns.map(\.originalText) == ["hello there"])
+        #expect(await spy.displayedPageSets == [["привіт"]])
+        #expect(service.state == .listening)
     }
 
     @Test("an empty (or whitespace-only) final transcript is ignored")
@@ -217,5 +286,639 @@ struct LiveTranslationServiceTests {
         #expect(service.state == .listening)
         #expect(await transcriber.stopCallCount == 0)
         #expect(await spy.microphoneEnabledCalls == [true])
+    }
+
+    // MARK: - Short-utterance handling
+
+    /// Regression guard for the physically-confirmed "hello often dropped"
+    /// bug's *pipeline* half (the other half — real language-detection
+    /// confidence — is `AppleLanguageTranslatorTests`). Before the fix,
+    /// `lastRecognizedPhrase` was set unconditionally the moment any
+    /// non-empty final arrived, with no time bound — so a short phrase
+    /// that failed anywhere downstream still permanently "used up" that
+    /// exact text for deduping purposes, and every later retry of the
+    /// same word was silently treated as a duplicate forever. This proves
+    /// each of the exact words from the physical report is accepted and
+    /// reaches G2 given a translator that *can* identify its language —
+    /// isolating the pipeline's own dedupe logic from NLLanguageRecognizer
+    /// specifically.
+    @Test(
+        "each short valid utterance from the physical report is accepted and reaches G2",
+        arguments: ["hello", "hi", "yes", "no", "thanks", "okay", "goodbye"]
+    )
+    func shortValidUtterancesAreAccepted(word: String) async throws {
+        let spy = SpyGlassesTransport()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: [word]),
+            translator: ScriptedLanguageTranslator(languageCodes: [word: "en"], translation: "переклад")
+        )
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(await spy.displayedPageSets == [["переклад"]])
+    }
+
+    @Test("a short phrase repeated after the dedupe window elapses is accepted again as a new, distinct turn")
+    func shortPhraseRepeatedAfterWindowIsAcceptedAgain() async throws {
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(languageCodes: ["hello": "en"], translation: "привіт"),
+            agentContextStore: store,
+            duplicateSuppressionWindow: 0.05
+        )
+
+        await service.start()
+        await transcriber.emit("hello")
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(store.session.turns.count == 1)
+
+        // Past the 50ms window — a second, genuinely new "hello" utterance.
+        try? await Task.sleep(for: .milliseconds(60))
+        await transcriber.emit("hello")
+        try? await Task.sleep(for: .milliseconds(30))
+
+        #expect(store.session.turns.count == 2)
+        #expect(await spy.displayedPageSets == [["привіт"], ["привіт"]])
+    }
+
+    @Test("the same phrase repeated within the dedupe window is still rejected as a duplicate")
+    func shortPhraseRepeatedWithinWindowIsRejected() async throws {
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(languageCodes: ["hello": "en"], translation: "привіт"),
+            agentContextStore: store,
+            duplicateSuppressionWindow: 5
+        )
+
+        await service.start()
+        await transcriber.emit("hello")
+        try? await Task.sleep(for: .milliseconds(20))
+        await transcriber.emit("hello") // well within the 5s window
+        try? await Task.sleep(for: .milliseconds(20))
+
+        #expect(store.session.turns.count == 1)
+        #expect(await spy.displayedPageSets == [["привіт"]])
+    }
+
+    // MARK: - "Glasses Chat" persistence
+
+    @Test("a finalized turn is appended to the Glasses Chat as a real, persisted message")
+    func turnIsAppendedToGlassesChat() async throws {
+        let spy = SpyGlassesTransport()
+        let chatService = RecordingAppendChatService()
+        let provider = GlassesChatProvider(chatService: chatService, defaults: UserDefaults(suiteName: "test.\(UUID().uuidString)")!)
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
+            translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт"),
+            chatService: chatService,
+            glassesChatProvider: provider
+        )
+
+        await service.start()
+        try? await Task.sleep(for: .milliseconds(60))
+
+        let appended = await chatService.appendedMessages
+        #expect(appended.count == 1)
+        #expect(appended.first?.role == .user)
+        #expect(appended.first?.content.contains("hello there") == true)
+        #expect(appended.first?.content.contains("привіт") == true)
+    }
+
+    @Test("when no ChatServicing/GlassesChatProvider is configured, Live Translation still works normally — Chat persistence is simply skipped")
+    func noChatServiceConfiguredIsHarmless() async throws {
+        let spy = SpyGlassesTransport()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
+            translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт")
+        )
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(await spy.displayedPageSets == [["привіт"]])
+    }
+
+    // MARK: - Turn ordering / stale-async-task races
+
+    /// Regression guard: phrase A's Glasses Chat append and suggested-reply
+    /// generation are both slow (network-bound); phrase B finalizes before
+    /// either completes. Neither of A's late-arriving side effects may
+    /// disturb what's now on screen for B — A's chat message still gets
+    /// appended (history is preserved, per the product requirement — the
+    /// message itself is independent of "what's currently displayed"), but
+    /// A's suggested replies must never redisplay over B's translation.
+    @Test("phrase B's display is never clobbered by phrase A's slow, late-arriving suggested replies")
+    func newerTurnDisplayIsNeverClobberedByOlderStaleReplies() async throws {
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let generator = GatedSuggestedReplyGenerator(repliesByOriginalText: [
+            "phrase A": [SuggestedReply(originalLanguageText: "A-reply", ukrainianText: "А-відповідь", ordering: 0)],
+        ])
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["phrase A", "phrase B"]),
+            translator: ScriptedLanguageTranslator(
+                languageCodes: ["phrase A": "en", "phrase B": "en"],
+                translation: "переклад"
+            ),
+            agentContextStore: store,
+            replyGenerator: generator
+        )
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+        // Both translations displayed; A's replies still gated (never released).
+        #expect(await spy.displayedPageSets.count == 2)
+
+        // Release A's replies now, well after B is already the active turn.
+        await generator.release("phrase A")
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        let final = await spy.displayedPageSets
+        #expect(final.count == 2) // no third, stale display update from A
+        #expect(!final.contains { pages in pages.contains { $0.contains("A-reply") } })
+        #expect(store.session.latestTurn?.originalText == "phrase B")
+    }
+
+    /// Same race, one level up: A's *Chat* append (a real, awaited network
+    /// call in production) is slow enough to still be in flight when B
+    /// finalizes and B's own append starts. Both must complete and land in
+    /// history — chat history is a log, not a "latest wins" display — in
+    /// the order they actually reach the backend, without either call
+    /// corrupting or dropping the other.
+    @Test("phrase A's slow Glasses Chat append and phrase B's append never interfere with each other")
+    func concurrentGlassesChatAppendsDoNotInterfere() async throws {
+        let spy = SpyGlassesTransport()
+        let chatService = RecordingAppendChatService(artificialDelay: .milliseconds(40))
+        let provider = GlassesChatProvider(chatService: chatService, defaults: UserDefaults(suiteName: "test.\(UUID().uuidString)")!)
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["phrase A", "phrase B"]),
+            translator: ScriptedLanguageTranslator(
+                languageCodes: ["phrase A": "en", "phrase B": "en"],
+                translation: "переклад"
+            ),
+            chatService: chatService,
+            glassesChatProvider: provider
+        )
+
+        await service.start()
+        try? await Task.sleep(for: .milliseconds(200))
+
+        let appended = await chatService.appendedMessages
+        #expect(appended.count == 2)
+        #expect(appended.contains { $0.content.contains("phrase A") })
+        #expect(appended.contains { $0.content.contains("phrase B") })
+    }
+
+    // MARK: - Explicit source-language selection
+
+    /// Isolated `UserDefaults` for every test in this section — `sourceLanguageMode`
+    /// persists to `UserDefaults`, and these tests actively call
+    /// `setSourceLanguageMode(_:)`; sharing `.standard` across the whole
+    /// test target would leak a selection from one test into every other
+    /// test in this file (including ones that never touch language mode
+    /// at all and assume the `.auto` default).
+    private func freshDefaults() -> UserDefaults {
+        UserDefaults(suiteName: "LiveTranslationServiceTests.\(UUID().uuidString)")!
+    }
+
+    @Test("explicit English mode bypasses auto language detection entirely — a translator that can never detect anything still succeeds")
+    func explicitEnglishBypassesDetection() async throws {
+        let spy = SpyGlassesTransport()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["some phrase"]),
+            translator: ScriptedLanguageTranslator(languageCodes: [:], translation: "переклад"),
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.en)
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(await spy.displayedPageSets == [["переклад"]])
+    }
+
+    @Test("explicit German mode bypasses auto language detection entirely — a translator that can never detect anything still succeeds")
+    func explicitGermanBypassesDetection() async throws {
+        let spy = SpyGlassesTransport()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["ein Satz"]),
+            translator: ScriptedLanguageTranslator(languageCodes: [:], translation: "переклад"),
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.de)
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(await spy.displayedPageSets == [["переклад"]])
+    }
+
+    @Test("explicit Polish mode bypasses auto language detection entirely — a translator that can never detect anything still succeeds")
+    func explicitPolishBypassesDetection() async throws {
+        let spy = SpyGlassesTransport()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["jakieś zdanie"]),
+            translator: ScriptedLanguageTranslator(languageCodes: [:], translation: "переклад"),
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.pl)
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(await spy.displayedPageSets == [["переклад"]])
+    }
+
+    @Test("the selected source language mode persists across LiveTranslationService instances, simulating an app relaunch")
+    func sourceLanguageModePersists() async throws {
+        let defaults = freshDefaults()
+        let service1 = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: []),
+            translator: ScriptedLanguageTranslator(languageCodes: [:]),
+            defaults: defaults
+        )
+        #expect(service1.sourceLanguageMode == .auto) // nothing persisted yet
+        service1.setSourceLanguageMode(.de)
+
+        // A fresh instance reading the SAME defaults — stands in for the
+        // app relaunching, since LiveTranslationService is constructed
+        // once at app level in production.
+        let service2 = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: []),
+            translator: ScriptedLanguageTranslator(languageCodes: [:]),
+            defaults: defaults
+        )
+        #expect(service2.sourceLanguageMode == .de)
+    }
+
+    // MARK: - Auto mode detection, locking, and hysteresis
+
+    @Test("Auto detects and locks English from the first confidently-detected utterance")
+    func autoLocksEnglish() async throws {
+        let store = AgentContextStore()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
+            translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "переклад"),
+            agentContextStore: store,
+            defaults: freshDefaults()
+        )
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(store.session.turns.last?.detectedLanguage == "en")
+    }
+
+    @Test("Auto detects and locks German from the first confidently-detected utterance")
+    func autoLocksGerman() async throws {
+        let store = AgentContextStore()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
+            translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "переклад"),
+            agentContextStore: store,
+            defaults: freshDefaults()
+        )
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(store.session.turns.last?.detectedLanguage == "de")
+    }
+
+    @Test("Auto detects and locks Polish from the first confidently-detected utterance")
+    func autoLocksPolish() async throws {
+        let store = AgentContextStore()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: ["Dzień dobry"]),
+            translator: ScriptedLanguageTranslator(languageCodes: ["Dzień dobry": "pl"], translation: "переклад"),
+            agentContextStore: store,
+            defaults: freshDefaults()
+        )
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(store.session.turns.last?.detectedLanguage == "pl")
+    }
+
+    /// The core hysteresis regression guard: the translator is scripted so
+    /// that if detection were consulted for "okay", it would say English —
+    /// the WRONG answer once the session is locked to German. A correctly
+    /// implemented lock reuses German instead of trusting that detection,
+    /// exactly matching "short ambiguous phrases... must not cause
+    /// unnecessary language switching."
+    @Test("Auto reuses the locked language for a short ambiguous phrase, even when detection alone would disagree")
+    func autoReusesLockForShortAmbiguousPhraseDespiteConflictingDetection() async throws {
+        let store = AgentContextStore()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag", "okay"], autoFinish: false),
+            translator: ScriptedLanguageTranslator(
+                languageCodes: ["Guten Tag": "de", "okay": "en"],
+                translation: "переклад"
+            ),
+            agentContextStore: store,
+            defaults: freshDefaults()
+        )
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(store.session.turns.map(\.detectedLanguage) == ["de", "de"])
+    }
+
+    @Test("Auto does not oscillate away from a locked language when a later, longer phrase confidently agrees with it")
+    func autoDoesNotOscillateWhenDetectionAgrees() async throws {
+        let store = AgentContextStore()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag", "Wie geht es dir heute"], autoFinish: false),
+            translator: ScriptedLanguageTranslator(
+                languageCodes: ["Guten Tag": "de", "Wie geht es dir heute": "de"],
+                translation: "переклад"
+            ),
+            agentContextStore: store,
+            defaults: freshDefaults()
+        )
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(store.session.turns.map(\.detectedLanguage) == ["de", "de"])
+    }
+
+    @Test("Auto switches the lock when a longer, later phrase confidently detects a genuinely different primary language")
+    func autoSwitchesOnStrongEvidence() async throws {
+        let store = AgentContextStore()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag", "How are you doing today"], autoFinish: false),
+            translator: ScriptedLanguageTranslator(
+                languageCodes: ["Guten Tag": "de", "How are you doing today": "en"],
+                translation: "переклад"
+            ),
+            agentContextStore: store,
+            defaults: freshDefaults()
+        )
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(store.session.turns.map(\.detectedLanguage) == ["de", "en"])
+    }
+
+    @Test("a new Live Translation session resets the Auto lock — a stale lock from a previous session never survives stop()/start()")
+    func newSessionResetsAutoLock() async throws {
+        let store = AgentContextStore()
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de", "okay": "en"], translation: "переклад"),
+            agentContextStore: store,
+            defaults: freshDefaults()
+        )
+
+        await service.start()
+        await transcriber.emit("Guten Tag")
+        try? await Task.sleep(for: Self.propagationDelay)
+        #expect(store.session.turns.last?.detectedLanguage == "de")
+
+        await service.stop()
+        await service.start() // a new session — the Auto lock must reset
+
+        // "okay" is short/ambiguous. If the German lock had survived,
+        // it would be reused as "de"; a correctly reset lock runs
+        // detection fresh instead and gets "en".
+        await transcriber.emit("okay")
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(store.session.turns.last?.detectedLanguage == "en")
+    }
+
+    // MARK: - Per-turn concurrency / "hangs on one phrase" regression guards
+
+    /// The core regression guard for the actual reported bug: before the
+    /// per-turn task split, `consume(_:)`'s loop awaited the ENTIRE
+    /// pipeline (including translation) for one phrase before it could
+    /// even read the next final transcript — a translation that never
+    /// returns meant phrase B was never processed AT ALL, no matter how
+    /// long the test waits. `translationTimeout` is set far longer than
+    /// this test's own wait so it can't be timeout recovery masking the
+    /// real fix: B must complete while A's translation task is still
+    /// genuinely, unboundedly pending.
+    @Test("translation A never returns — phrase B still processes independently, without waiting for A")
+    func stuckTranslationDoesNotBlockLaterPhrase() async throws {
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["phrase A", "phrase B"], autoFinish: false),
+            translator: HangingLanguageTranslator(
+                languageCodes: ["phrase A": "en", "phrase B": "en"],
+                hangingTexts: ["phrase A"],
+                translation: "переклад"
+            ),
+            agentContextStore: store,
+            translationTimeout: .seconds(3600) // effectively unbounded for this test's lifetime
+        )
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        // B completed and displayed even though A's translation task is
+        // still (and will remain, for this test's duration) pending. A
+        // itself is present in history as an early-appended draft (still
+        // `ukrainianTranslation == nil` — the early-append design needed
+        // for correct arrival-order history), but was never displayed.
+        #expect(store.session.turns.map(\.originalText) == ["phrase A", "phrase B"])
+        #expect(store.session.turns.first(where: { $0.originalText == "phrase A" })?.ukrainianTranslation == nil)
+        #expect(await spy.displayedPageSets == [["переклад"]])
+    }
+
+    /// Same guard, one stage later: replies A never return, but that must
+    /// never delay or block phrase B's own translation/display — replies
+    /// were already decoupled via their own `Task` before this milestone,
+    /// but this proves it explicitly, with the new per-turn architecture.
+    @Test("replies A never return — phrase B still processes independently, translation is never blocked by stuck reply generation")
+    func stuckReplyGenerationDoesNotBlockLaterPhrase() async throws {
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let generator = GatedSuggestedReplyGenerator() // "phrase A" is never release()d
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["phrase A", "phrase B"], autoFinish: false),
+            translator: ScriptedLanguageTranslator(
+                languageCodes: ["phrase A": "en", "phrase B": "en"],
+                translation: "переклад"
+            ),
+            agentContextStore: store,
+            replyGenerator: generator,
+            repliesTimeout: .seconds(3600) // effectively unbounded for this test's lifetime
+        )
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        // Both phrases translated and displayed normally; A's reply
+        // generation is still (and will remain) pending the whole time.
+        #expect(store.session.turns.map(\.originalText) == ["phrase A", "phrase B"])
+        #expect(await spy.displayedPageSets.count == 2)
+    }
+
+    @Test("a translation that times out cleans up after itself — no turn left behind, session stays alive, later phrases still work")
+    func translationTimeoutCleansUpCleanly() async throws {
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["phrase A", "phrase B"], autoFinish: false),
+            translator: HangingLanguageTranslator(
+                languageCodes: ["phrase A": "en", "phrase B": "en"],
+                hangingTexts: ["phrase A"],
+                translation: "переклад"
+            ),
+            agentContextStore: store,
+            translationTimeout: .milliseconds(50)
+        )
+
+        await service.start()
+        try? await Task.sleep(for: .milliseconds(300))
+
+        // A timed out: no lingering draft turn, nothing displayed for it.
+        // B: entirely normal.
+        #expect(store.session.turns.map(\.originalText) == ["phrase B"])
+        #expect(await spy.displayedPageSets == [["переклад"]])
+        #expect(service.state == .listening)
+    }
+
+    @Test("suggested-reply generation that times out cleans up after itself — no replies shown, translation for that turn is unaffected")
+    func repliesTimeoutCleansUpCleanly() async throws {
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let generator = GatedSuggestedReplyGenerator(repliesByOriginalText: [
+            "phrase A": [SuggestedReply(originalLanguageText: "A-reply", ukrainianText: "А-відповідь", ordering: 0)],
+        ]) // never release()d — the generator call itself never returns
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["phrase A"], autoFinish: false),
+            translator: ScriptedLanguageTranslator(languageCodes: ["phrase A": "en"], translation: "переклад"),
+            agentContextStore: store,
+            replyGenerator: generator,
+            repliesTimeout: .milliseconds(50)
+        )
+
+        await service.start()
+        try? await Task.sleep(for: .milliseconds(300))
+
+        // Translation displayed normally; replies never arrived (timed
+        // out), so no second display call and no replies recorded.
+        #expect(await spy.displayedPageSets == [["переклад"]])
+        #expect(store.session.turns.first?.suggestedReplies.isEmpty == true)
+        #expect(service.state == .listening)
+    }
+
+    /// Direct regression guard for the sequence-based staleness fix,
+    /// exercised at the *translation* level (existing tests already cover
+    /// this for replies) — phrase A is spoken first but its translation
+    /// is deliberately slower than phrase B's, so B displays first; when
+    /// A's translation finally resolves, it must never overwrite B's
+    /// already-shown, newer content. Before this fix, the staleness check
+    /// compared against "has a newer turn been *spoken*" rather than "has
+    /// a newer turn already *displayed*" — which could suppress a turn's
+    /// translation entirely even when nothing newer had displayed yet;
+    /// this test's shape (A slower, B faster) is exactly the case that
+    /// requires the corrected "newest-displayed-wins" comparison to get
+    /// right in both directions.
+    @Test("phrase A's slower translation, arriving after phrase B's faster one already displayed, never overwrites B on G2")
+    func slowerOlderTranslationNeverOverwritesFasterNewerOne() async throws {
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let translator = DelayedLanguageTranslator(
+            languageCodes: ["phrase A": "en", "phrase B": "en"],
+            delays: ["phrase A": .milliseconds(120)],
+            translations: ["phrase A": "А-переклад", "phrase B": "Б-переклад"]
+        )
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["phrase A", "phrase B"], autoFinish: false),
+            translator: translator,
+            agentContextStore: store
+        )
+
+        await service.start()
+        try? await Task.sleep(for: .milliseconds(220))
+
+        // B displayed (it was faster); A's later-arriving translation was
+        // correctly discarded from display — but both turns still exist
+        // in history (a log, not "latest wins").
+        let displayed = await spy.displayedPageSets
+        #expect(displayed.contains(["Б-переклад"]))
+        #expect(!displayed.contains(["А-переклад"]))
+        #expect(store.session.turns.map(\.originalText).sorted() == ["phrase A", "phrase B"])
+    }
+}
+
+/// Records every `appendMessage` call — used to verify "Glasses Chat"
+/// integration without a real backend. `createChat`/`fetchChat` behave
+/// like a normal, empty, always-succeeding backend so `GlassesChatProvider`
+/// resolves a chat the first time it's asked.
+private actor RecordingAppendChatService: ChatServicing {
+    private(set) var appendedMessages: [Message] = []
+    private var chatsByID: [Chat.ID: Chat] = [:]
+    private let artificialDelay: Duration
+
+    init(artificialDelay: Duration = .zero) {
+        self.artificialDelay = artificialDelay
+    }
+
+    func fetchChats() async throws -> [Chat] { Array(chatsByID.values) }
+
+    func fetchChat(id: Chat.ID) async throws -> Chat {
+        guard let chat = chatsByID[id] else { throw FailingChatService.Failure() }
+        return chat
+    }
+
+    func createChat(title: String) async throws -> Chat {
+        let chat = Chat(title: title)
+        chatsByID[chat.id] = chat
+        return chat
+    }
+
+    func renameChat(id: Chat.ID, title: String) async throws -> Chat { Chat(id: id, title: title) }
+    func deleteChat(id: Chat.ID) async throws { chatsByID[id] = nil }
+    func fetchMessages(chatID: Chat.ID) async throws -> [Message] { [] }
+
+    func appendMessage(chatID: Chat.ID, role: MessageRole, content: String) async throws -> Message {
+        if artificialDelay > .zero { try? await Task.sleep(for: artificialDelay) }
+        let message = Message(chatID: chatID, role: role, content: content)
+        appendedMessages.append(message)
+        return message
+    }
+
+    nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
+        AsyncThrowingStream { $0.finish() }
     }
 }

@@ -69,16 +69,39 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
         isActive = true
         hasReconnectedSinceLastSuccess = false
 
+        // TEMPORARY diagnostics for the Milestone 8b physical-device
+        // failure ("Live Translation stopped unexpectedly") — remove
+        // once root-caused. See DiagnosticTrace.swift.
+        DiagnosticTrace.log("8B_TRACE", "START OpenAIRealtimeTranscriber.startTranscribing")
+
         let newSocket = await makeSocket()
         socket = newSocket
-        let eventStream = try await newSocket.connect()
+        do {
+            let eventStream = try await newSocket.connect()
+            DiagnosticTrace.log("8B_TRACE", "WS_CONNECTED backend socket connected")
+            return try buildStream(from: eventStream, pcmUpdates: pcmUpdates, socket: newSocket)
+        } catch {
+            DiagnosticTrace.log("8B_TRACE", "ERROR connect() threw before any stream existed: \(error)")
+            throw error
+        }
+    }
 
+    private func buildStream(
+        from eventStream: AsyncThrowingStream<RealtimeTranscriptionEvent, Error>,
+        pcmUpdates: AsyncStream<Data>,
+        socket newSocket: RealtimeTranscriptionSocket
+    ) throws -> AsyncThrowingStream<String, Error> {
         return AsyncThrowingStream { continuation in
             self.continuation = continuation
 
+            var hasLoggedFirstPCM = false
             pcmConsumerTask = Task { [weak self] in
                 for await data in pcmUpdates {
                     guard let self, self.isActive else { break }
+                    if !hasLoggedFirstPCM {
+                        hasLoggedFirstPCM = true
+                        DiagnosticTrace.log("8B_TRACE", "FIRST_PCM forwarding first PCM chunk, bytes=\(data.count)")
+                    }
                     try? await newSocket.sendPCM(data)
                 }
             }
@@ -103,9 +126,14 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
     /// reconnect was already handed off to a new `eventConsumerTask` —
     /// never a silently-abandoned connection.
     private func consume(_ events: AsyncThrowingStream<RealtimeTranscriptionEvent, Error>, from currentSocket: RealtimeTranscriptionSocket) async {
+        var hasLoggedFirstEvent = false
         do {
             for try await event in events {
                 guard isActive else { return }
+                if !hasLoggedFirstEvent {
+                    hasLoggedFirstEvent = true
+                    DiagnosticTrace.log("8B_TRACE", "FIRST_EVENT \(event)")
+                }
                 switch event {
                 case .sessionStarted:
                     hasReconnectedSinceLastSuccess = false
@@ -113,24 +141,32 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
                     continue // ContinuousTranscribing yields finalized utterances only
                 case .finalTranscript(let text):
                     hasReconnectedSinceLastSuccess = false
+                    // TEMPORARY — upstream-path diagnostic. Remove once
+                    // root-caused. See DiagnosticTrace.swift.
+                    DiagnosticTrace.log("UPSTREAM_TRACE", "STT_FINAL text=\"\(text.prefix(60))\"")
+                    DiagnosticTrace.log("8B_TRACE", "FINAL_CALLBACK yielding final transcript, length=\(text.count)")
                     continuation?.yield(text)
                 case .languageInfo(let languages):
                     lastKnownLanguages = languages
-                case .providerError:
+                case .providerError(let message):
+                    DiagnosticTrace.log("8B_TRACE", "ERROR providerError (non-fatal): \(message)")
                     // Non-fatal — same "log and keep going" policy
                     // GlassesSpeechTranscriber already applies to a
                     // recognition-session-boundary error: one failure
                     // doesn't end an otherwise-healthy stream.
                     continue
-                case .closed:
+                case .closed(let reason):
+                    DiagnosticTrace.log("8B_TRACE", "WS_CLOSED reason=\(reason ?? "nil")")
                     await handleUnexpectedClose(previousSocket: currentSocket, error: nil)
                     return
                 }
             }
             guard isActive else { return }
+            DiagnosticTrace.log("8B_TRACE", "WS_CLOSED event stream ended with no explicit .closed event")
             await handleUnexpectedClose(previousSocket: currentSocket, error: nil)
         } catch {
             guard isActive else { return }
+            DiagnosticTrace.log("8B_TRACE", "ERROR event stream threw: \(error)")
             await handleUnexpectedClose(previousSocket: currentSocket, error: error)
         }
     }
@@ -144,26 +180,33 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
         await previousSocket.close()
 
         guard !hasReconnectedSinceLastSuccess else {
+            DiagnosticTrace.log("8B_TRACE", "STOP reason=second consecutive disconnect, giving up: \(String(describing: error))")
             continuation?.finish(throwing: error ?? RealtimeTranscriptionSocketError.notConnected)
             stopInternal()
             return
         }
         hasReconnectedSinceLastSuccess = true
+        DiagnosticTrace.log("8B_TRACE", "reconnect attempt starting (previous error=\(String(describing: error)))")
 
         let newSocket = await makeSocket()
         socket = newSocket
         do {
             let eventStream = try await newSocket.connect()
+            DiagnosticTrace.log("8B_TRACE", "WS_CONNECTED (reconnect) backend socket connected")
             eventConsumerTask = Task { [weak self] in
                 await self?.consume(eventStream, from: newSocket)
             }
         } catch {
+            DiagnosticTrace.log("8B_TRACE", "STOP reason=reconnect's own connect() threw: \(error)")
             continuation?.finish(throwing: error)
             stopInternal()
         }
     }
 
     private func stopInternal() {
+        if isActive {
+            DiagnosticTrace.log("8B_TRACE", "STOP reason=stopTranscribing()/stream terminated")
+        }
         isActive = false
         pcmConsumerTask?.cancel()
         pcmConsumerTask = nil
