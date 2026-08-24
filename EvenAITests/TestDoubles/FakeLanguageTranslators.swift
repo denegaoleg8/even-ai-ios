@@ -26,6 +26,40 @@ actor ScriptedLanguageTranslator: LanguageTranslating {
     }
 }
 
+/// Records every `detectedLanguageCode(for:)` call — lets a test assert
+/// language detection was (or, critically, was NOT) invoked at all,
+/// independent of whatever it would have returned. Also records every
+/// `translateToUkrainian(_:from:)` call, including exactly which
+/// `sourceLanguageCode` was passed — the pair of these is what actually
+/// proves "explicit mode never runs detection AND translates using the
+/// selected language, with no detector involved at all," not just one or
+/// the other. `detectionResult` defaults to `nil` (total, permanent
+/// detection failure) — the worst case a test can throw at explicit mode
+/// to prove detection failure is structurally incapable of affecting it.
+actor RecordingLanguageTranslator: LanguageTranslating {
+    private(set) var detectionCallCount = 0
+    private(set) var detectionCalls: [String] = []
+    private(set) var translateCalls: [(text: String, languageCode: String)] = []
+    private let detectionResult: String?
+    private let translation: String
+
+    init(detectionResult: String? = nil, translation: String = "translated") {
+        self.detectionResult = detectionResult
+        self.translation = translation
+    }
+
+    func detectedLanguageCode(for text: String) async -> String? {
+        detectionCallCount += 1
+        detectionCalls.append(text)
+        return detectionResult
+    }
+
+    func translateToUkrainian(_ text: String, from sourceLanguageCode: String) async throws -> String {
+        translateCalls.append((text, sourceLanguageCode))
+        return translation
+    }
+}
+
 /// Detects every input as a fixed, always-foreign language; translation
 /// throws only for texts named in `failingTexts` (everything else
 /// succeeds with `translation`) — lets a test verify

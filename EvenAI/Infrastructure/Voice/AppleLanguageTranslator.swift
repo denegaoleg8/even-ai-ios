@@ -102,26 +102,82 @@ final class AppleLanguageTranslator: LanguageTranslating, @unchecked Sendable {
         pendingArrival = nil
     }
 
-    private func nextPendingTranslation() async -> PendingTranslation {
+    /// Returns the next queued item, or `nil` once this `runSession(_:)`
+    /// call's own `Task` has been cancelled — never hangs forever on a
+    /// stuck `CheckedContinuation` the way a plain `await
+    /// withCheckedContinuation { ... }` would (see
+    /// `waitForArrivalOrCancellation()`'s own doc comment for why that
+    /// distinction matters now more than it used to).
+    private func nextPendingTranslation() async -> PendingTranslation? {
         while true {
             if !pendingTranslations.isEmpty {
                 return pendingTranslations.removeFirst()
             }
-            await withCheckedContinuation { pendingArrival = $0 }
+            guard !Task.isCancelled else { return nil }
+            await waitForArrivalOrCancellation()
+            if Task.isCancelled { return nil }
         }
     }
 
-    /// Call from `LiveTranslationView`'s `.translationTask(_:action:)`
-    /// closure: `.translationTask(configuration) { session in await
-    /// translator.runSession(session) }`. Runs until the task is cancelled
-    /// (the view disappearing/`translationConfiguration` changing), so it
-    /// naturally stops resolving requests once Live Translation is no
-    /// longer on screen; any request still pending at that point simply
-    /// never resolves — `LiveTranslationViewModel` already tears down its
-    /// consume loop on `stop()`, so nothing is left awaiting it.
+    /// Root-cause fix (major performance pass — language-selection state
+    /// bug): `RootView` now reconfigures/recreates the real
+    /// `TranslationSession` whenever `LiveTranslationService
+    /// .resolvedSourceLanguageCode` changes (an explicit EN/DE/PL switch,
+    /// or Auto's first lock) — a LEGITIMATE, expected event now, not a
+    /// rare edge case. When that happens, `.translationTask`'s modifier
+    /// cancels the OLD `runSession(_:)` call's `Task`. A plain `await
+    /// withCheckedContinuation { pendingArrival = $0 }` does NOT respond
+    /// to that cancellation on its own — `CheckedContinuation` only ever
+    /// resumes when something explicitly calls `.resume()` — so if the
+    /// queue happened to be idle (the common case: reconfiguration is a
+    /// deliberate user action, not something that happens mid-utterance),
+    /// `runSession(_:)`'s loop would hang forever on this exact await,
+    /// NEVER reaching its own `while !Task.isCancelled` recheck — a
+    /// leaked, permanently-blocked Task. Worse: since `AppleLanguageTranslator`
+    /// is one shared, long-lived instance (constructed once in
+    /// `EvenAIApp`), the NEXT `runSession(_:)` call (for the new session)
+    /// would then run CONCURRENTLY with this leaked, still-alive old one
+    /// — two consumers racing to dequeue from the same
+    /// `pendingTranslations` array. `withTaskCancellationHandler` is what
+    /// actually closes this gap: `onCancel` fires the moment cancellation
+    /// is requested (from an unspecified, `Sendable`-only context, hence
+    /// the `Task { @MainActor in ... }` hop back) and proactively resumes
+    /// the parked continuation, letting the loop wake up and see
+    /// `Task.isCancelled == true` immediately instead of never.
+    private func waitForArrivalOrCancellation() async {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                pendingArrival = continuation
+            }
+        } onCancel: {
+            Task { @MainActor [self] in
+                self.resumeArrivalIfWaiting()
+            }
+        }
+    }
+
+    private func resumeArrivalIfWaiting() {
+        pendingArrival?.resume()
+        pendingArrival = nil
+    }
+
+    /// Call from `RootView`'s `.translationTask(_:action:)` closure:
+    /// `.translationTask(configuration) { session in await
+    /// translator.runSession(session) }`. Runs until the task is
+    /// cancelled (the configuration changing — see
+    /// `nextPendingTranslation()`'s own doc comment — or the view
+    /// disappearing), so it naturally stops resolving requests once Live
+    /// Translation is no longer on screen. Any request still queued at
+    /// that point is failed immediately with `SessionEndedError` — never
+    /// left to silently hang until a caller's own external timeout
+    /// (`LiveTranslationService.translateWithTimeout(_:from:)`'s 8s)
+    /// eventually recovers it. This is what makes a deliberate language-
+    /// mode switch "immediately recover the current session" rather than
+    /// stalling any translation that happened to be mid-flight for up to
+    /// 8 extra seconds.
     func runSession(_ session: TranslationSession) async {
         while !Task.isCancelled {
-            let pending = await nextPendingTranslation()
+            guard let pending = await nextPendingTranslation() else { break }
             do {
                 let targetText = try await translate(pending.text, using: session)
                 pending.continuation.resume(returning: targetText)
@@ -129,6 +185,20 @@ final class AppleLanguageTranslator: LanguageTranslating, @unchecked Sendable {
                 pending.continuation.resume(throwing: error)
             }
         }
+        failAllPending()
+    }
+
+    private func failAllPending() {
+        guard !pendingTranslations.isEmpty else { return }
+        let stillPending = pendingTranslations
+        pendingTranslations.removeAll()
+        for pending in stillPending {
+            pending.continuation.resume(throwing: SessionEndedError())
+        }
+    }
+
+    private struct SessionEndedError: Error, CustomStringConvertible {
+        var description: String { "the on-device translation session ended (reconfigured or torn down) before this request was reached" }
     }
 
     /// See `perCallTimeout`'s doc comment for why this — not a plain

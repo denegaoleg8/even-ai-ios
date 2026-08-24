@@ -98,6 +98,7 @@ struct LiveTranslationView: View {
             ForEach(SourceLanguageMode.allCases, id: \.self) { mode in
                 let isSelected = liveTranslation.sourceLanguageMode == mode
                 Button {
+                    DiagnosticTrace.log("LANGUAGE_MODE_UI_CHANGED", "mode=\(mode.rawValue)")
                     liveTranslation.setSourceLanguageMode(mode)
                 } label: {
                     Text(mode.displayLabel)

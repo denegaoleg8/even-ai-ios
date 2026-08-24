@@ -1116,6 +1116,310 @@ struct LiveTranslationServiceTests {
         #expect(service.currentPartialTranslation == "переклад")
         #expect(await spy.displayedPageSets.count == 2)
     }
+
+    // MARK: - Explicit language-selection state bug ("select a language" repeating loop)
+
+    /// Physical bug: selecting EN/DE/PL never actually reached the real
+    /// on-device `TranslationSession` (only `RootView`'s own doc comment
+    /// and `LiveTranslationService.resolvedSourceLanguageCode`'s doc
+    /// comment tell that full story — this file can't touch the real
+    /// `TranslationSession` at all). What IS fully unit-testable, and
+    /// what these tests pin down: `sourceLanguageMode` and
+    /// `resolvedSourceLanguageCode` update synchronously, immediately,
+    /// the instant `setSourceLanguageMode(_:)` is called — no delay, no
+    /// restart, no async gap where a stale value could leak through.
+    @Test("selecting EN updates the active service's mode and resolved language immediately")
+    func selectingEnglishUpdatesImmediately() {
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: []),
+            translator: ScriptedLanguageTranslator(languageCodes: [:]),
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.en)
+        #expect(service.sourceLanguageMode == .en)
+        #expect(service.resolvedSourceLanguageCode == "en")
+    }
+
+    @Test("selecting DE updates the active service's mode and resolved language immediately")
+    func selectingGermanUpdatesImmediately() {
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: []),
+            translator: ScriptedLanguageTranslator(languageCodes: [:]),
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.de)
+        #expect(service.sourceLanguageMode == .de)
+        #expect(service.resolvedSourceLanguageCode == "de")
+    }
+
+    @Test("selecting PL updates the active service's mode and resolved language immediately")
+    func selectingPolishUpdatesImmediately() {
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: []),
+            translator: ScriptedLanguageTranslator(languageCodes: [:]),
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.pl)
+        #expect(service.sourceLanguageMode == .pl)
+        #expect(service.resolvedSourceLanguageCode == "pl")
+    }
+
+    @Test(
+        "explicit mode's PARTIAL translation never invokes language detection, for every explicit language",
+        arguments: [SourceLanguageMode.en, .de, .pl]
+    )
+    func explicitPartialNeverInvokesDetection(mode: SourceLanguageMode) async throws {
+        let recorder = RecordingLanguageTranslator(translation: "переклад")
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: transcriber,
+            translator: recorder,
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(mode)
+
+        await service.start()
+        await transcriber.emitPartial("some phrase")
+        try? await Task.sleep(for: .milliseconds(250))
+
+        #expect(await recorder.detectionCallCount == 0)
+        let translateCalls = await recorder.translateCalls
+        #expect(translateCalls.count == 1)
+        #expect(translateCalls.first?.languageCode == mode.explicitLanguageCode)
+    }
+
+    @Test(
+        "explicit mode's FINAL translation never invokes language detection, for every explicit language",
+        arguments: [SourceLanguageMode.en, .de, .pl]
+    )
+    func explicitFinalNeverInvokesDetection(mode: SourceLanguageMode) async throws {
+        let recorder = RecordingLanguageTranslator(translation: "переклад")
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: ["some phrase"]),
+            translator: recorder,
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(mode)
+
+        await service.start()
+        try? await Task.sleep(for: .milliseconds(100))
+
+        #expect(await recorder.detectionCallCount == 0)
+        let translateCalls = await recorder.translateCalls
+        #expect(translateCalls.count == 1)
+        #expect(translateCalls.first?.languageCode == mode.explicitLanguageCode)
+    }
+
+    /// The literal "a detection failure must not be capable of producing
+    /// a language-selection-required state while explicit mode is
+    /// active" requirement: `RecordingLanguageTranslator`'s default
+    /// `detectionResult: nil` simulates TOTAL, permanent detection
+    /// failure — the worst case Apple's own on-device detector could ever
+    /// produce. Explicit mode must still translate and display normally,
+    /// completely unaffected, because it never asks the detector
+    /// anything in the first place.
+    @Test("total detection failure cannot block or degrade explicit-mode translation — detection is never consulted")
+    func detectionFailureCannotAffectExplicitMode() async throws {
+        let recorder = RecordingLanguageTranslator(translation: "переклад") // detectionResult defaults to nil
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["some phrase"], autoFinish: false),
+            translator: recorder,
+            agentContextStore: store,
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.en)
+
+        await service.start()
+        try? await Task.sleep(for: .milliseconds(100))
+
+        #expect(await recorder.detectionCallCount == 0)
+        #expect(store.session.turns.map(\.originalText) == ["some phrase"])
+        #expect(await spy.displayedPageSets == [["some phrase\n\nUA: переклад"]])
+        #expect(service.state == .listening)
+    }
+
+    @Test("switching Auto → EN while the session is already running affects the very next partial immediately")
+    func switchingAutoToExplicitAffectsNextPartialImmediately() async throws {
+        let recorder = RecordingLanguageTranslator(translation: "переклад")
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: transcriber,
+            translator: recorder,
+            defaults: freshDefaults()
+        )
+        #expect(service.sourceLanguageMode == .auto)
+
+        await service.start()
+        service.setSourceLanguageMode(.en)
+        await transcriber.emitPartial("some phrase")
+        try? await Task.sleep(for: .milliseconds(250))
+
+        #expect(await recorder.detectionCallCount == 0)
+        let translateCalls = await recorder.translateCalls
+        #expect(translateCalls.first?.languageCode == "en")
+    }
+
+    @Test("switching EN → DE mid-session affects the very next partial immediately — no restart needed")
+    func switchingExplicitLanguagesAffectsNextPartialImmediately() async throws {
+        let recorder = RecordingLanguageTranslator(translation: "переклад")
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: transcriber,
+            translator: recorder,
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.en)
+        await service.start()
+
+        await transcriber.emitPartial("first phrase")
+        try? await Task.sleep(for: .milliseconds(250))
+        #expect(await recorder.translateCalls.last?.languageCode == "en")
+
+        // Switch mid-session — no stop()/start() anywhere in this test.
+        service.setSourceLanguageMode(.de)
+        await transcriber.emit("first phrase") // finalize so the next utterance starts clean
+        try? await Task.sleep(for: .milliseconds(60))
+
+        await transcriber.emitPartial("second phrase")
+        try? await Task.sleep(for: .milliseconds(250))
+
+        #expect(await recorder.translateCalls.last?.languageCode == "de")
+        #expect(await recorder.detectionCallCount == 0)
+    }
+
+    @Test("an explicit selection survives multiple consecutive turns — every one resolves to the same language")
+    func explicitSelectionSurvivesMultipleTurns() async throws {
+        let recorder = RecordingLanguageTranslator(translation: "переклад")
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: ["one", "two", "three"], autoFinish: false),
+            translator: recorder,
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.de)
+
+        await service.start()
+        try? await Task.sleep(for: .milliseconds(150))
+
+        #expect(await recorder.detectionCallCount == 0)
+        let languages = await recorder.translateCalls.map(\.languageCode)
+        #expect(languages == ["de", "de", "de"])
+        #expect(service.sourceLanguageMode == .de)
+    }
+
+    @Test("an explicit selection survives suggested replies being generated and displayed")
+    func explicitSelectionSurvivesReplies() async throws {
+        let recorder = RecordingLanguageTranslator(translation: "переклад")
+        let generator = FakeSuggestedReplyGenerator(defaultReplies: [
+            SuggestedReply(originalLanguageText: "Sure", ukrainianText: "Так", ordering: 0),
+        ])
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
+            translator: recorder,
+            replyGenerator: generator,
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.de)
+
+        await service.start()
+        try? await Task.sleep(for: .milliseconds(100)) // translation + replies both settle
+
+        #expect(service.sourceLanguageMode == .de)
+        #expect(service.resolvedSourceLanguageCode == "de")
+        #expect(await recorder.detectionCallCount == 0)
+    }
+
+    @Test("an explicit selection survives the streaming partial-to-final transition for the same utterance")
+    func explicitSelectionSurvivesPartialToFinalTransition() async throws {
+        let recorder = RecordingLanguageTranslator(translation: "переклад")
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: transcriber,
+            translator: recorder,
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.pl)
+        await service.start()
+
+        await transcriber.emitPartial("Gdzie")
+        try? await Task.sleep(for: .milliseconds(250))
+        await transcriber.emit("Gdzie jesteś")
+        try? await Task.sleep(for: .milliseconds(100))
+
+        #expect(await recorder.detectionCallCount == 0)
+        let languages = await recorder.translateCalls.map(\.languageCode)
+        #expect(languages.allSatisfy { $0 == "pl" })
+        #expect(service.finalTranscript == "Gdzie jesteś")
+    }
+
+    /// Auto mode's own detection failure (an undetectable phrase — no
+    /// entry in `languageCodes`, matching `LanguageTranslating`'s
+    /// "uncertain ⇒ nil" contract) must never loop, block, or interrupt
+    /// listening — it just drops that one phrase and keeps going.
+    @Test("repeated Auto-mode detection failures never block listening or create any kind of prompt loop")
+    func autoDetectionFailureNeverLoops() async throws {
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(
+                finals: ["mmm", "uhh", "hmm"], // none present in languageCodes below — all undetectable
+                autoFinish: false
+            ),
+            translator: ScriptedLanguageTranslator(languageCodes: [:]),
+            defaults: freshDefaults()
+        )
+
+        await service.start()
+        try? await Task.sleep(for: .milliseconds(150))
+
+        // Nothing was ever detectable, but the session is still healthy,
+        // still listening, and never entered any error state.
+        #expect(service.state == .listening)
+    }
+
+    /// The literal end-to-end recovery scenario: Auto fails to detect,
+    /// the user picks EN (exactly what the "select a language" surface
+    /// is for), and the NEXT phrase must translate correctly without
+    /// stopping/restarting Live Translation at all.
+    @Test("after an Auto detection failure, selecting EN lets the next phrase translate without restarting the session")
+    func autoFailureThenExplicitSelectionRecoversWithoutRestart() async throws {
+        let recorder = RecordingLanguageTranslator(detectionResult: nil, translation: "переклад")
+        let transcriber = ManualContinuousTranscriber()
+        let store = AgentContextStore()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: transcriber,
+            translator: recorder,
+            agentContextStore: store,
+            defaults: freshDefaults()
+        )
+
+        await service.start()
+        await transcriber.emit("undetectable phrase")
+        try? await Task.sleep(for: .milliseconds(60))
+        #expect(store.session.turns.isEmpty) // Auto couldn't determine a language — dropped, not stuck
+
+        // No stop()/start() here — the exact "must not require restarting
+        // Live Translation" requirement.
+        service.setSourceLanguageMode(.en)
+        await transcriber.emit("now it works")
+        try? await Task.sleep(for: .milliseconds(60))
+
+        #expect(store.session.turns.map(\.originalText) == ["now it works"])
+        #expect(await recorder.translateCalls.last?.languageCode == "en")
+        #expect(service.state == .listening)
+    }
 }
 
 /// Records every `appendMessage` call — used to verify "Glasses Chat"

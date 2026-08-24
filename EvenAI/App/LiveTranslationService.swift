@@ -396,6 +396,53 @@ final class LiveTranslationService {
         defaults.set(mode.rawValue, forKey: Self.sourceLanguageModeDefaultsKey)
         autoLockedLanguage = nil
         DiagnosticTrace.log("LANGUAGE_MODE", "selected=\(mode.rawValue)")
+        // Confirms the SERVICE actually received and applied the change —
+        // see `resolvedSourceLanguageCode`'s doc comment for why this,
+        // not `sourceLanguageMode` alone, is what actually mattered for
+        // the physical "select EN/DE/PL but the app keeps asking again"
+        // bug: `sourceLanguageMode` itself was ALWAYS updated correctly
+        // and instantly by this method — the break was one level deeper,
+        // in the real on-device `TranslationSession`'s own `source`
+        // configuration never being told about this change at all (see
+        // `RootView.syncTranslationConfiguration()`).
+        DiagnosticTrace.log("LANGUAGE_MODE_SERVICE_UPDATED", "mode=\(mode.rawValue)")
+    }
+
+    /// THE single authoritative resolved source language for the current
+    /// moment — explicit mode returns its fixed code immediately; Auto
+    /// mode returns whatever it's currently locked to (`nil` before the
+    /// first lock this session). Priority is structural, not a runtime
+    /// check: explicit mode's own state (`sourceLanguageMode
+    /// .explicitLanguageCode`) is consulted FIRST and, if present,
+    /// `autoLockedLanguage` is never even read — an explicit selection
+    /// can never be overridden by a stale Auto lock from before the
+    /// switch (also cleared outright by `setSourceLanguageMode(_:)`).
+    ///
+    /// This is what `RootView` observes to keep the real
+    /// `TranslationSession`'s own `Configuration.source` in sync — see
+    /// that type's doc comment for the actual root cause this exists to
+    /// fix: `AppleLanguageTranslator.translateToUkrainian(_:from:)`'s
+    /// `sourceLanguageCode` parameter has no effect on Apple's
+    /// `Translation` framework at all (there is no per-call source
+    /// override in that framework's API — confirmed against the
+    /// `Translation.framework` interface: `TranslationSession.Request`
+    /// carries only `sourceText`/`clientIdentifier`, and `translate(_:)`
+    /// always uses the session's own fixed `Configuration.source`/
+    /// `sourceLanguage`). Every one of THIS class's own language-
+    /// resolution call sites (`resolveLanguageForNewUtterance()`,
+    /// `resolveSourceLanguage(for:)`) already correctly skip detection in
+    /// explicit mode — the missing piece was that the REAL underlying
+    /// `TranslationSession` was still configured with `source: nil`
+    /// (auto-detect) regardless, so Apple's own framework kept running
+    /// its own, entirely separate internal detection on every call and
+    /// could still fail/prompt ("Не вдалось визначити мову...") no
+    /// matter what the user picked in this app's own UI. Without a
+    /// concrete `source` on the session itself, there was no way to make
+    /// explicit mode "never run detection" at the actual translation-API
+    /// level — only at this class's own (already-correct, but
+    /// insufficient on its own) decision layer.
+    var resolvedSourceLanguageCode: String? {
+        sourceLanguageMode.explicitLanguageCode ?? autoLockedLanguage
     }
 
     /// Enables the G2 microphone and starts the continuous transcribe →
@@ -656,8 +703,10 @@ final class LiveTranslationService {
     /// which can lock the session for every utterance after it).
     private func resolveLanguageForNewUtterance() -> String? {
         if let explicitCode = sourceLanguageMode.explicitLanguageCode {
+            DiagnosticTrace.log("PARTIAL_LANGUAGE_RESOLVED", "mode=explicit source=\(explicitCode)")
             return explicitCode
         }
+        DiagnosticTrace.log("PARTIAL_LANGUAGE_RESOLVED", "mode=auto source=\(autoLockedLanguage ?? "nil")")
         return autoLockedLanguage
     }
 
@@ -1040,6 +1089,17 @@ final class LiveTranslationService {
     ///   without touching the lock at all. That last case is what keeps
     ///   Ukrainian speech correctly filtered downstream even mid-session.
     private func resolveSourceLanguage(for text: String) async -> String? {
+        let result = await computeSourceLanguage(for: text)
+        // Single, unavoidable exit point for the trace the product asked
+        // for — every one of `computeSourceLanguage(for:)`'s several
+        // return statements funnels through here, so this can't be
+        // accidentally skipped by a future return added to that function.
+        let mode = sourceLanguageMode.explicitLanguageCode != nil ? "explicit" : "auto"
+        DiagnosticTrace.log("FINAL_LANGUAGE_RESOLVED", "mode=\(mode) source=\(result ?? "nil")")
+        return result
+    }
+
+    private func computeSourceLanguage(for text: String) async -> String? {
         if let explicitCode = sourceLanguageMode.explicitLanguageCode {
             DiagnosticTrace.log("LANGUAGE_EXPLICIT_USED", "language=\(explicitCode) text=\"\(text.prefix(60))\"")
             return explicitCode
