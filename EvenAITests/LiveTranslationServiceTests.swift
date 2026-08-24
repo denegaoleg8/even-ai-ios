@@ -39,7 +39,7 @@ struct LiveTranslationServiceTests {
         // `displayPages(_:)` (through `GlassesPresentationLayer`), not a
         // direct `sendText(_:)` call — `sentTexts` legitimately stays
         // empty; this is what actually carries the translation now.
-        #expect(await spy.displayedPageSets == [["привіт"]])
+        #expect(await spy.displayedPageSets == [["hello there\n\nUA: привіт"]])
     }
 
     @Test("Ukrainian speech is never translated or displayed")
@@ -86,7 +86,7 @@ struct LiveTranslationServiceTests {
 
         // Milestone 6: see `foreignPhraseIsTranslatedAndSent`'s comment —
         // `displayPages(_:)` is what actually carries this now.
-        #expect(await spy.displayedPageSets == [["привіт"]])
+        #expect(await spy.displayedPageSets == [["hello\n\nUA: привіт"]])
     }
 
     @Test("a translation failure leaves the session alive — no turn/display for that phrase, and a later phrase still works")
@@ -108,7 +108,7 @@ struct LiveTranslationServiceTests {
         // the session stayed healthy enough to process the next, distinct
         // phrase normally: exactly one turn, for "hello there" alone.
         #expect(store.session.turns.map(\.originalText) == ["hello there"])
-        #expect(await spy.displayedPageSets == [["привіт"]])
+        #expect(await spy.displayedPageSets == [["hello there\n\nUA: привіт"]])
         // `state` never became `.error`, unlike a microphone-enable failure.
         #expect(service.state == .listening)
     }
@@ -146,7 +146,7 @@ struct LiveTranslationServiceTests {
         // it, but the session recovered and processed the next, distinct
         // phrase completely normally.
         #expect(store.session.turns.map(\.originalText) == ["hello there"])
-        #expect(await spy.displayedPageSets == [["привіт"]])
+        #expect(await spy.displayedPageSets == [["hello there\n\nUA: привіт"]])
         #expect(service.state == .listening)
     }
 
@@ -317,7 +317,7 @@ struct LiveTranslationServiceTests {
         await service.start()
         try? await Task.sleep(for: Self.propagationDelay)
 
-        #expect(await spy.displayedPageSets == [["переклад"]])
+        #expect(await spy.displayedPageSets == [["\(word)\n\nUA: переклад"]])
     }
 
     @Test("a short phrase repeated after the dedupe window elapses is accepted again as a new, distinct turn")
@@ -344,7 +344,7 @@ struct LiveTranslationServiceTests {
         try? await Task.sleep(for: .milliseconds(30))
 
         #expect(store.session.turns.count == 2)
-        #expect(await spy.displayedPageSets == [["привіт"], ["привіт"]])
+        #expect(await spy.displayedPageSets == [["hello\n\nUA: привіт"], ["hello\n\nUA: привіт"]])
     }
 
     @Test("the same phrase repeated within the dedupe window is still rejected as a duplicate")
@@ -367,7 +367,7 @@ struct LiveTranslationServiceTests {
         try? await Task.sleep(for: .milliseconds(20))
 
         #expect(store.session.turns.count == 1)
-        #expect(await spy.displayedPageSets == [["привіт"]])
+        #expect(await spy.displayedPageSets == [["hello\n\nUA: привіт"]])
     }
 
     // MARK: - "Glasses Chat" persistence
@@ -407,7 +407,7 @@ struct LiveTranslationServiceTests {
         await service.start()
         try? await Task.sleep(for: Self.propagationDelay)
 
-        #expect(await spy.displayedPageSets == [["привіт"]])
+        #expect(await spy.displayedPageSets == [["hello there\n\nUA: привіт"]])
     }
 
     // MARK: - Turn ordering / stale-async-task races
@@ -509,7 +509,7 @@ struct LiveTranslationServiceTests {
         await service.start()
         try? await Task.sleep(for: Self.propagationDelay)
 
-        #expect(await spy.displayedPageSets == [["переклад"]])
+        #expect(await spy.displayedPageSets == [["some phrase\n\nUA: переклад"]])
     }
 
     @Test("explicit German mode bypasses auto language detection entirely — a translator that can never detect anything still succeeds")
@@ -526,7 +526,7 @@ struct LiveTranslationServiceTests {
         await service.start()
         try? await Task.sleep(for: Self.propagationDelay)
 
-        #expect(await spy.displayedPageSets == [["переклад"]])
+        #expect(await spy.displayedPageSets == [["ein Satz\n\nUA: переклад"]])
     }
 
     @Test("explicit Polish mode bypasses auto language detection entirely — a translator that can never detect anything still succeeds")
@@ -543,7 +543,7 @@ struct LiveTranslationServiceTests {
         await service.start()
         try? await Task.sleep(for: Self.propagationDelay)
 
-        #expect(await spy.displayedPageSets == [["переклад"]])
+        #expect(await spy.displayedPageSets == [["jakieś zdanie\n\nUA: переклад"]])
     }
 
     @Test("the selected source language mode persists across LiveTranslationService instances, simulating an app relaunch")
@@ -755,7 +755,7 @@ struct LiveTranslationServiceTests {
         // for correct arrival-order history), but was never displayed.
         #expect(store.session.turns.map(\.originalText) == ["phrase A", "phrase B"])
         #expect(store.session.turns.first(where: { $0.originalText == "phrase A" })?.ukrainianTranslation == nil)
-        #expect(await spy.displayedPageSets == [["переклад"]])
+        #expect(await spy.displayedPageSets == [["phrase B\n\nUA: переклад"]])
     }
 
     /// Same guard, one stage later: replies A never return, but that must
@@ -810,7 +810,7 @@ struct LiveTranslationServiceTests {
         // A timed out: no lingering draft turn, nothing displayed for it.
         // B: entirely normal.
         #expect(store.session.turns.map(\.originalText) == ["phrase B"])
-        #expect(await spy.displayedPageSets == [["переклад"]])
+        #expect(await spy.displayedPageSets == [["phrase B\n\nUA: переклад"]])
         #expect(service.state == .listening)
     }
 
@@ -835,7 +835,7 @@ struct LiveTranslationServiceTests {
 
         // Translation displayed normally; replies never arrived (timed
         // out), so no second display call and no replies recorded.
-        #expect(await spy.displayedPageSets == [["переклад"]])
+        #expect(await spy.displayedPageSets == [["phrase A\n\nUA: переклад"]])
         #expect(store.session.turns.first?.suggestedReplies.isEmpty == true)
         #expect(service.state == .listening)
     }
@@ -875,8 +875,8 @@ struct LiveTranslationServiceTests {
         // correctly discarded from display — but both turns still exist
         // in history (a log, not "latest wins").
         let displayed = await spy.displayedPageSets
-        #expect(displayed.contains(["Б-переклад"]))
-        #expect(!displayed.contains(["А-переклад"]))
+        #expect(displayed.contains(["phrase B\n\nUA: Б-переклад"]))
+        #expect(!displayed.contains(["phrase A\n\nUA: А-переклад"]))
         #expect(store.session.turns.map(\.originalText).sorted() == ["phrase A", "phrase B"])
     }
 }

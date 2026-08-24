@@ -2,11 +2,16 @@ import Testing
 import Foundation
 @testable import EvenAI
 
-/// Milestone 6: `LiveTranslationService`'s integration with
+/// `LiveTranslationService`'s integration with
 /// `GlassesTransport.displayPages(_:)` and `GlassesPresentationLayer` —
-/// no real STT/Azure/OpenAI, no real `SuggestedReplyGenerator`. Covers
-/// exactly the sequencing/safety behavior this milestone adds on top of
-/// Milestones 2-5, which stay covered by their own test files.
+/// no real STT/Azure/OpenAI, no real `SuggestedReplyGenerator`.
+///
+/// Every displayed page set is now the UNIFIED header+reply format (see
+/// `GlassesPresentationLayer`'s doc comment): a turn's original phrase and
+/// Ukrainian translation are baked into every page, so a reply update
+/// never removes them — `header(_:_:)` below is the one place these
+/// tests build the exact expected header text, matching
+/// `GlassesPresentationLayer`'s own (private) `conversationHeader`.
 @MainActor
 @Suite("LiveTranslationService + G2 display (GlassesPresentationLayer)")
 struct LiveTranslationServiceG2DisplayTests {
@@ -14,6 +19,10 @@ struct LiveTranslationServiceG2DisplayTests {
 
     private static func reply(_ original: String, _ ukrainian: String, ordering: Int) -> SuggestedReply {
         SuggestedReply(originalLanguageText: original, ukrainianText: ukrainian, ordering: ordering)
+    }
+
+    private static func header(_ originalText: String, _ translation: String) -> String {
+        "\(originalText)\n\nUA: \(translation)"
     }
 
     @Test("the translation is displayed immediately, without waiting for reply generation")
@@ -33,10 +42,10 @@ struct LiveTranslationServiceG2DisplayTests {
         await service.start()
         try? await Task.sleep(for: Self.propagationDelay)
 
-        #expect(await spy.displayedPageSets == [["Добрий день"]])
+        #expect(await spy.displayedPageSets == [[Self.header("Guten Tag", "Добрий день")]])
     }
 
-    @Test("suggested replies update G2's display once generation completes")
+    @Test("suggested replies update G2's display with a reply section ADDED BELOW the still-visible header, never replacing it")
     func repliesUpdateDisplayAfterArrival() async throws {
         let replies = [Self.reply("Sure", "Так", ordering: 0)]
         let generator = FakeSuggestedReplyGenerator(defaultReplies: replies)
@@ -54,7 +63,7 @@ struct LiveTranslationServiceG2DisplayTests {
 
         let calls = await spy.displayedPageSets
         #expect(calls.count == 2)
-        #expect(calls[0] == ["Добрий день"])
+        #expect(calls[0] == [Self.header("Guten Tag", "Добрий день")])
 
         let expectedTurn = ConversationTurn.liveConversationTurn(
             originalText: "Guten Tag",
@@ -62,13 +71,13 @@ struct LiveTranslationServiceG2DisplayTests {
             ukrainianTranslation: "Добрий день",
             suggestedReplies: replies
         )
-        // replyLeadingPages(for:), not pages(for:) — the automatic reply
-        // update must show the first reply page immediately, not re-show
-        // the translation the user already saw with the reply content
-        // sitting unreachable without a swipe. See
+        // Unified pages(for:) — the reply update carries the SAME header
+        // as the first call, with the reply section added below it. See
         // LiveTranslationService.generateSuggestedReplies(for:)'s doc
-        // comment for the physical bug this fixes.
-        #expect(calls[1] == GlassesPresentationLayer.replyLeadingPages(for: expectedTurn))
+        // comment for the physical bug this fixes (the translation used
+        // to visibly disappear when replies arrived).
+        #expect(calls[1] == GlassesPresentationLayer.pages(for: expectedTurn))
+        #expect(calls[1].allSatisfy { $0.contains("Guten Tag") && $0.contains("Добрий день") })
     }
 
     @Test("the reply update replaces G2's page set — it never duplicates or appends a redundant third call")
@@ -88,14 +97,15 @@ struct LiveTranslationServiceG2DisplayTests {
         try? await Task.sleep(for: Self.propagationDelay)
 
         let calls = await spy.displayedPageSets
-        // Exactly two calls total: translation-only, then reply-leading —
-        // never a third call, and the second call is one coherent page
-        // set (the first reply page immediately visible, translation
-        // reachable afterward by swipe — see replyLeadingPages(for:)),
-        // not the reply pages appended as a separate display.
+        // Exactly two calls total: header-only, then header+reply pages —
+        // never a third call. With two replies, the second call is TWO
+        // pages (one per reply — see GlassesPresentationLayer's doc
+        // comment), each still carrying the header.
         #expect(calls.count == 2)
-        #expect(calls[1].first?.contains("Sure") == true)
-        #expect(calls[1].contains("Добрий день"))
+        #expect(calls[1].count == 2)
+        #expect(calls[1][0].contains("Sure"))
+        #expect(calls[1][1].contains("Thursday"))
+        #expect(calls[1].allSatisfy { $0.contains("Guten Tag") && $0.contains("Добрий день") })
     }
 
     @Test("newest finalized turn always becomes the active G2 content — a stale, late-arriving reply never overwrites it")
@@ -186,7 +196,7 @@ struct LiveTranslationServiceG2DisplayTests {
         #expect(await spy.displayedPageSets.isEmpty)
     }
 
-    @Test("when the generator returns no replies, G2's display stays translation-only — no redundant second call")
+    @Test("when the generator returns no replies, G2's display stays header-only — no redundant second call")
     func emptySuggestedRepliesLeavesTranslationOnlyDisplay() async throws {
         let generator = FakeSuggestedReplyGenerator() // defaultReplies: []
         let spy = SpyGlassesTransport()
@@ -201,7 +211,7 @@ struct LiveTranslationServiceG2DisplayTests {
         await service.start()
         try? await Task.sleep(for: Self.propagationDelay)
 
-        #expect(await spy.displayedPageSets == [["Добрий день"]])
+        #expect(await spy.displayedPageSets == [[Self.header("Guten Tag", "Добрий день")]])
     }
 
     @Test("Ukrainian speech produces no G2 display update at all")
@@ -238,7 +248,7 @@ struct LiveTranslationServiceG2DisplayTests {
 
         await service.start()
         try? await Task.sleep(for: Self.propagationDelay)
-        #expect(await spy.displayedPageSets == [["Добрий день"]])
+        #expect(await spy.displayedPageSets == [[Self.header("Guten Tag", "Добрий день")]])
 
         await service.stop()
         try? await Task.sleep(for: Self.propagationDelay)
@@ -248,6 +258,139 @@ struct LiveTranslationServiceG2DisplayTests {
         await generator.release("Guten Tag")
         try? await Task.sleep(for: Self.propagationDelay)
 
-        #expect(await spy.displayedPageSets == [["Добрий день"]])
+        #expect(await spy.displayedPageSets == [[Self.header("Guten Tag", "Добрий день")]])
+    }
+
+    // MARK: - "Live Translation stops listening after replies appear" regression guards
+
+    /// The exact scenario reported physically: turn A translates and
+    /// displays, its replies then display (adding a reply section below
+    /// the still-visible header — see `GlassesPresentationLayer`), and
+    /// ONLY THEN does the user (or in this test, the fake transcriber)
+    /// produce turn B. `ManualContinuousTranscriber` — not
+    /// `ScriptedContinuousTranscriber` — is what makes this possible:
+    /// `emit(_:)` lets the test control the real ordering, actually
+    /// waiting for A's replies to display before B is ever spoken, rather
+    /// than both finals being queued up front. `service.state` and
+    /// `currentTurnDisplayState` are asserted directly at each step —
+    /// this is the literal state-machine claim the product bug report
+    /// makes ("stops listening"), not merely "eventually recovers."
+    @Test("turn A's replies displaying does not stop the session from listening — turn B, spoken next, translates and displays immediately, no gesture or restart needed")
+    func repliesDisplayingNeverStopsListeningForTheNextTurn() async throws {
+        let generator = FakeSuggestedReplyGenerator(repliesByOriginalText: [
+            "Guten Tag": [Self.reply("Hi", "Привіт", ordering: 0)],
+        ])
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(
+                languageCodes: ["Guten Tag": "de", "Wie geht es dir": "de"],
+                translation: "переклад"
+            ),
+            agentContextStore: store,
+            replyGenerator: generator
+        )
+
+        await service.start()
+        #expect(service.state == .listening)
+
+        await transcriber.emit("Guten Tag")
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        // Turn A: translated, then its replies displayed below the still-
+        // visible header. This is the exact moment the physical report
+        // describes as "Live Translation stops listening."
+        #expect(await spy.displayedPageSets.count == 2)
+        #expect(service.state == .listening)
+        guard case .withReplies(_, let replyCount) = service.currentTurnDisplayState else {
+            Issue.record("expected .withReplies after turn A's replies displayed, got \(service.currentTurnDisplayState)")
+            return
+        }
+        #expect(replyCount == 1)
+
+        // Turn B — spoken only now, strictly after A's replies are
+        // already on screen. No stop()/start(), no swipe, nothing but a
+        // new final transcript.
+        await transcriber.emit("Wie geht es dir")
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(service.state == .listening)
+        #expect(store.session.turns.map(\.originalText) == ["Guten Tag", "Wie geht es dir"])
+        let calls = await spy.displayedPageSets
+        #expect(calls.count == 3) // A translated, A+replies, B translated
+        #expect(calls.last == [Self.header("Wie geht es dir", "переклад")])
+        #expect(service.currentTurnDisplayState == .translated(turnID: store.session.turns.last!.id))
+    }
+
+    /// A new turn's header must never be contaminated by the previous
+    /// turn's reply content — even in the ordinary, non-racing sequential
+    /// case (turn A fully finishes, replies included, before turn B is
+    /// even spoken). `pagination.start(withPages:)` fully replaces on
+    /// every `displayPages(_:)` call, but this proves it at the
+    /// `GlassesPresentationLayer` page-content level, not just the call
+    /// count.
+    @Test("a new turn's header-only display never carries over the previous turn's stale reply content")
+    func newTurnClearsStaleRepliesFromPreviousTurn() async throws {
+        let generator = FakeSuggestedReplyGenerator(repliesByOriginalText: [
+            "first phrase": [Self.reply("Old reply", "Стара відповідь", ordering: 0)],
+        ])
+        let spy = SpyGlassesTransport()
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(
+                languageCodes: ["first phrase": "en", "second phrase": "en"],
+                translation: "переклад"
+            ),
+            replyGenerator: generator
+        )
+
+        await service.start()
+        await transcriber.emit("first phrase")
+        try? await Task.sleep(for: Self.propagationDelay)
+        #expect(await spy.displayedPageSets.count == 2) // translated, then +replies
+
+        await transcriber.emit("second phrase")
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        let calls = await spy.displayedPageSets
+        #expect(calls.count == 3)
+        // Turn B's header-only page must be exactly the header — no trace
+        // of turn A's "Old reply" content.
+        #expect(calls.last == [Self.header("second phrase", "переклад")])
+        #expect(!calls.last!.contains { $0.contains("Old reply") })
+    }
+
+    @Test("swiping through reply pages never removes the header — every page in a with-replies update contains the original phrase and its translation")
+    func swipingRetainsHeaderAcrossReplyPages() async throws {
+        let replies = [
+            Self.reply("I'm good, thank you.", "У мене все добре, дякую.", ordering: 0),
+            Self.reply("Pretty well. How about you?", "Досить добре. А ти?", ordering: 1),
+        ]
+        let generator = FakeSuggestedReplyGenerator(defaultReplies: replies)
+        let spy = SpyGlassesTransport()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["How are you?"]),
+            translator: ScriptedLanguageTranslator(languageCodes: ["How are you?": "en"], translation: "Як ти?"),
+            agentContextStore: AgentContextStore(),
+            replyGenerator: generator
+        )
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        let calls = await spy.displayedPageSets
+        #expect(calls.count == 2)
+        let replyPages = calls[1]
+        #expect(replyPages.count == 2) // one page per reply — never packed together
+        for page in replyPages {
+            #expect(page.contains("How are you?"))
+            #expect(page.contains("Як ти?"))
+        }
     }
 }

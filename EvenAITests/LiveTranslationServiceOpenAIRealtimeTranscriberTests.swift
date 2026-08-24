@@ -60,7 +60,11 @@ struct LiveTranslationServiceOpenAIRealtimeTranscriberTests {
 
         #expect(store.session.turns.map(\.originalText) == ["Good morning", "Guten Tag", "Dzień dobry"])
         #expect(store.session.turns.map(\.detectedLanguage) == ["en", "de", "pl"])
-        #expect(await spy.displayedPageSets == [["переклад"], ["переклад"], ["переклад"]])
+        #expect(await spy.displayedPageSets == [
+            ["Good morning\n\nUA: переклад"],
+            ["Guten Tag\n\nUA: переклад"],
+            ["Dzień dobry\n\nUA: переклад"],
+        ])
     }
 
     @Test("Ukrainian speech is recognized but never becomes a live-conversation turn")

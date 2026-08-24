@@ -74,7 +74,7 @@ struct LiveTranslationServiceAgentContextTests {
         // recording is purely additive to the existing display path.
         // Milestone 6: the translation reaches G2 via `displayPages(_:)`,
         // not a direct `sendText(_:)` call.
-        #expect(await spy.displayedPageSets == [["привіт"]])
+        #expect(await spy.displayedPageSets == [["hello there\n\nUA: привіт"]])
         #expect(store.session.turns.count == 1)
     }
 

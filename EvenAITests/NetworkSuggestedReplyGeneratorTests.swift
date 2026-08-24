@@ -290,7 +290,7 @@ struct NetworkSuggestedReplyGeneratorTests {
 
         // Never crashes, and the translation itself is still there and
         // still on G2 — a reply-generation failure never hides it.
-        #expect(await spy.displayedPageSets == [["Добрий день"]])
+        #expect(await spy.displayedPageSets == [["Guten Tag\n\nUA: Добрий день"]])
         let turn = try #require(store.session.latestTurn)
         #expect(turn.ukrainianTranslation == "Добрий день")
         #expect(turn.suggestedReplies.isEmpty)

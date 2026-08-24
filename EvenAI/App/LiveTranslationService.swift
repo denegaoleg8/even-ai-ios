@@ -86,7 +86,40 @@ final class LiveTranslationService {
         case error(String)
     }
 
-    private(set) var state: State = .idle
+    /// Explicit model of what's currently on G2 for the active turn —
+    /// orthogonal to `state` (session listening on/off): the session can
+    /// stay `.listening` through every one of these transitions, and none
+    /// of them ever stop or restart STT. `.none` before any turn has ever
+    /// displayed anything (or after a turn's translation fails/times out
+    /// and is removed, leaving nothing on screen); `.translated` the
+    /// moment a turn's Source+Ukrainian header is shown, with no reply
+    /// section yet — a legitimate, stable display state on its own (see
+    /// `GlassesPresentationLayer`'s doc comment: "Source + Translation, no
+    /// reply section yet" is allowed, not a placeholder needing a spinner);
+    /// `.withReplies` once that same turn's reply section has been added
+    /// below the still-visible header. A new turn's `.translated` update
+    /// always replaces whatever this held before — see `processTurn`'s
+    /// staleness guard for what actually decides whether a given turn is
+    /// allowed to make that transition.
+    enum TurnDisplayState: Sendable, Equatable {
+        case none
+        case translated(turnID: ConversationTurn.ID)
+        case withReplies(turnID: ConversationTurn.ID, replyCount: Int)
+    }
+
+    private(set) var state: State = .idle {
+        didSet {
+            guard state != oldValue else { return }
+            DiagnosticTrace.log("SESSION_LISTENING_STATE", "state=\(state)")
+        }
+    }
+    /// See `TurnDisplayState`'s own doc comment. `private(set)` — the only
+    /// writes happen at the exact two points G2's display actually
+    /// changes (end of `processTurn`'s display block, end of
+    /// `generateSuggestedReplies`'s display block), both gated by the same
+    /// sequence-based staleness guard that decides whether the underlying
+    /// `displayPages` call itself was even attempted.
+    private(set) var currentTurnDisplayState: TurnDisplayState = .none
     /// The most recent recognized (source-language) phrase — read-only
     /// live information `ChatView` displays alongside `lastTranslation`.
     private(set) var lastRecognizedPhrase: String?
@@ -267,6 +300,7 @@ final class LiveTranslationService {
         autoLockedLanguage = nil
         turnSequenceCounter = 0
         highestDisplayedTurnSequence = 0
+        currentTurnDisplayState = .none
 
         do {
             try await glassesTransport.setMicrophoneEnabled(true)
@@ -332,6 +366,16 @@ final class LiveTranslationService {
                 // TEMPORARY — upstream-path diagnostic. Remove once
                 // root-caused. See DiagnosticTrace.swift.
                 DiagnosticTrace.log("UPSTREAM_TRACE", "TRANSCRIPT_RECEIVED text=\"\(final.prefix(60))\"")
+                // Proves the loop is still pulling from `finals` — this is
+                // the ONE place in the whole pipeline where "continuous
+                // listening" is either true or it isn't: if this line
+                // never logs again after replies for a previous turn
+                // displayed, the STT stream itself stalled (or its
+                // upstream producer did), not anything in this class's own
+                // per-turn task graph — see this class's own doc comment
+                // for why `prepareAndDispatch`/`processTurn` can't be the
+                // cause of that (nothing here awaits either of them).
+                DiagnosticTrace.log("NEXT_TRANSCRIPT_ACCEPTED", "text=\"\(final.prefix(60))\" sessionState=\(state)")
                 await prepareAndDispatch(final: final)
             }
             if state == .listening { state = .idle }
@@ -417,11 +461,19 @@ final class LiveTranslationService {
             ukrainianTranslation: nil
         )
         DiagnosticTrace.log("TURN_RECEIVED", "id=\(turn.id) text=\"\(text.prefix(60))\" language=\(languageCode)")
+        DiagnosticTrace.log("FINAL_TRANSCRIPT_RECEIVED", "turnID=\(turn.id) text=\"\(text.prefix(60))\"")
         DiagnosticTrace.log("LATENCY_TRACE", "STT_FINAL id=\(turn.id) timestamp=\(turnStartTime.timeIntervalSince1970)")
+        DiagnosticTrace.log("LATENCY_TRACE", "FINAL_TRANSCRIPT_TS id=\(turn.id) value=\(turnStartTime.timeIntervalSince1970)")
         DiagnosticTrace.log("REAL_TURN_TRACE", "TURN_CREATED id=\(turn.id) originalText=\"\(text.prefix(60))\"")
         DiagnosticTrace.log("UPSTREAM_TRACE", "TURN_CREATED id=\(turn.id)")
         DiagnosticTrace.log("POST_STT_TRACE", "TURN_CREATED id=\(turn.id)")
         agentContextStore.appendTurn(turn)
+        // Confirms the listener/dispatch path itself is healthy at the
+        // moment this turn was accepted — independent of whether this
+        // turn's own translation/replies ever succeed. See
+        // `NEXT_TRANSCRIPT_ACCEPTED` (in `consume(_:)`) for the
+        // complementary proof that the STT stream itself keeps producing.
+        DiagnosticTrace.log("LISTENER_STILL_ACTIVE", "turnID=\(turn.id) sessionState=\(state)")
 
         turnSequenceCounter += 1
         let sequence = turnSequenceCounter
@@ -443,12 +495,14 @@ final class LiveTranslationService {
     /// can only ever block itself, never any later turn.
     private func processTurn(_ turn: ConversationTurn, text: String, languageCode: String, turnStartTime: Date, sequence: Int) async {
         let turnID = turn.id
+        DiagnosticTrace.log("TURN_PROCESSING_STARTED", "turnID=\(turnID) sequence=\(sequence)")
 
         DiagnosticTrace.log("UPSTREAM_TRACE", "TRANSLATION_START text=\"\(text.prefix(60))\"")
         DiagnosticTrace.log("POST_STT_TRACE", "TRANSLATION_REQUEST_SENT language=\(languageCode)")
         DiagnosticTrace.log("TRANSLATION_TASK_START", "id=\(turnID)")
         let translationStart = Date()
         DiagnosticTrace.log("LATENCY_TRACE", "TRANSLATION_START id=\(turnID)")
+        DiagnosticTrace.log("LATENCY_TRACE", "TRANSLATION_START_TS id=\(turnID) value=\(translationStart.timeIntervalSince1970)")
         DiagnosticTrace.log(
             "LATENCY_TRACE",
             "STT_TO_TRANSLATION_START_MS id=\(turnID) value=\(Int(translationStart.timeIntervalSince(turnStartTime) * 1000))"
@@ -457,8 +511,10 @@ final class LiveTranslationService {
         let translated: String
         do {
             translated = try await translateWithTimeout(text, from: languageCode)
-            let translationLatencyMs = Int(Date().timeIntervalSince(translationStart) * 1000)
+            let translationDoneAt = Date()
+            let translationLatencyMs = Int(translationDoneAt.timeIntervalSince(translationStart) * 1000)
             DiagnosticTrace.log("LATENCY_TRACE", "TRANSLATION_END id=\(turnID)")
+            DiagnosticTrace.log("LATENCY_TRACE", "TRANSLATION_DONE_TS id=\(turnID) value=\(translationDoneAt.timeIntervalSince1970)")
             DiagnosticTrace.log("LATENCY_TRACE", "TRANSLATION_LATENCY_MS id=\(turnID) value=\(translationLatencyMs)")
             DiagnosticTrace.log("TRANSLATION_TASK_END", "id=\(turnID)")
             DiagnosticTrace.log("POST_STT_TRACE", "TRANSLATION_RESPONSE_RECEIVED length=\(translated.count)")
@@ -570,15 +626,24 @@ final class LiveTranslationService {
         // Suggested-reply generation starts now, concurrently with the G2
         // display call below — translation display must never wait on
         // replies, and replies don't need display to have finished, only
-        // the translated turn itself. Tracked in `turnTasks` so `stop()`
-        // can cancel it.
+        // the translated turn itself. `sequence` is threaded through so
+        // the reply stage's own staleness guard uses the exact same
+        // "has anything newer already displayed" comparison as this one
+        // (see `generateSuggestedReplies`'s doc comment for why that
+        // consistency matters). Tracked in `turnTasks` so `stop()` can
+        // cancel it.
         let replyTask = Task { [weak self] in
             guard let self else { return }
-            await self.generateSuggestedReplies(for: translatedTurn)
+            await self.generateSuggestedReplies(for: translatedTurn, sequence: sequence, turnStartTime: turnStartTime)
         }
         turnTasks.append(replyTask)
 
         DiagnosticTrace.log("UPSTREAM_TRACE", "DISPLAY_CALLBACK text=\"\(displayText.prefix(60))\"")
+        // Header-only pages — `translatedTurn.suggestedReplies` is still
+        // empty at this point, so `GlassesPresentationLayer.pages(for:)`
+        // naturally produces just the Source+Ukrainian header (see that
+        // type's doc comment for the unified page format this now shares
+        // with the reply-stage display call below).
         let translationPages = GlassesPresentationLayer.pages(for: translatedTurn)
         DiagnosticTrace.log("REAL_TURN_TRACE", "PAGES stage=translationOnly turnID=\(turnID) count=\(translationPages.count)")
         DiagnosticTrace.log("POST_STT_TRACE", "PRESENTATION_PAGES_CREATED count=\(translationPages.count)")
@@ -589,13 +654,20 @@ final class LiveTranslationService {
             DiagnosticTrace.log("REAL_TURN_TRACE", "DISPLAY_REQUEST stage=translationOnly turnID=\(turnID)")
             DiagnosticTrace.log("POST_STT_TRACE", "DISPLAY_REQUEST turnID=\(turnID)")
             try await glassesTransport.displayPages(translationPages)
+            currentTurnDisplayState = .translated(turnID: turnID)
             DiagnosticTrace.log("REAL_TURN_TRACE", "DISPLAY_DONE stage=translationOnly turnID=\(turnID)")
             DiagnosticTrace.log("DISPLAY_END", "id=\(turnID)")
+            DiagnosticTrace.log("TURN_TRANSLATION_DISPLAYED", "turnID=\(turnID)")
             let now = Date()
             DiagnosticTrace.log("LATENCY_TRACE", "DISPLAY_CALL_END id=\(turnID)")
+            DiagnosticTrace.log("LATENCY_TRACE", "TRANSLATION_DISPLAY_TS id=\(turnID) value=\(now.timeIntervalSince1970)")
             DiagnosticTrace.log(
                 "LATENCY_TRACE",
                 "TRANSLATION_TO_DISPLAY_MS id=\(turnID) value=\(Int(now.timeIntervalSince(translationStart) * 1000))"
+            )
+            DiagnosticTrace.log(
+                "LATENCY_TRACE",
+                "TRANSLATION_DISPLAY_LATENCY_MS id=\(turnID) value=\(Int(now.timeIntervalSince(displayCallStart) * 1000))"
             )
             DiagnosticTrace.log(
                 "LATENCY_TRACE",
@@ -713,57 +785,72 @@ final class LiveTranslationService {
     ///
     /// Automatically updates G2 with the suggested replies once generation
     /// completes — this used to require the user to swipe/press a button
-    /// on the glasses to ever see them at all. The actual bug: the combined
-    /// "translation + replies" page set built by
-    /// `GlassesPresentationLayer.pages(for:)` always puts the translation
-    /// on page 1 (by design, for the *first* display call, before any
-    /// replies exist) — but `MentraGlassesTransport.displayPages(_:)`
-    /// always resets to page 1 and only ever sends that one page to the
-    /// device; later pages are only reachable by swiping. Calling
-    /// `displayPages(_:)` with that same translation-first page set for
-    /// the *reply* update therefore just re-sent the translation the user
-    /// already saw — the reply text was sitting on page 2+, delivered but
-    /// invisible without a gesture. `GlassesPresentationLayer.replyLeadingPages(for:)`
-    /// (new) reorders so the first reply page is what's actually shown;
-    /// gestures still work exactly as before (forward/back through
-    /// whatever page set is currently active), now genuinely just for
-    /// *navigating* between reply options/the translation, never for
-    /// triggering their initial appearance.
+    /// on the glasses to ever see them at all. `GlassesPresentationLayer
+    /// .pages(for:)` (unified — see that type's doc comment) now produces
+    /// one page per reply, each one carrying the SAME Source+Ukrainian
+    /// header the initial translation-only display already showed, so
+    /// this update adds a reply section below the header without ever
+    /// making the translation itself disappear.
     ///
-    /// Also guards, right before updating G2's display, that `turn` is
-    /// still the session's latest turn — "newest finalized turn always
-    /// becomes the active G2 content," so a slower-to-generate older
-    /// turn's replies must never overwrite what a newer turn has already
-    /// put on screen. The turn's own `suggestedReplies` are still recorded
-    /// in `agentContextStore` either way (visible in Chat/history), only
-    /// the G2 *display* update is skipped when stale.
-    private func generateSuggestedReplies(for turn: ConversationTurn) async {
+    /// Guards, right before updating G2's display, using the exact same
+    /// sequence-based "has anything newer already displayed" comparison
+    /// `processTurn(_:text:languageCode:turnStartTime:sequence:)` uses for
+    /// the translation stage — deliberately NOT
+    /// `agentContextStore.session.latestTurn?.id == turn.id` (what this
+    /// used to compare against): that compares against "has a newer turn
+    /// been *spoken*", which is too aggressive here for the same reason it
+    /// was for translation display — a newer turn B can already be
+    /// `latestTurn` while still mid-translation (or after B's own
+    /// translation fails/times out and is removed), in which case turn A's
+    /// perfectly good, already-generated replies would be silently
+    /// discarded even though B never displayed anything at all, leaving
+    /// the user looking at A's translation with no replies forever. The
+    /// sequence comparison only defers to B once B has *actually
+    /// displayed* something. The turn's own `suggestedReplies` are still
+    /// recorded in `agentContextStore` either way (visible in Chat/
+    /// history), only the G2 *display* update is skipped when stale.
+    private func generateSuggestedReplies(for turn: ConversationTurn, sequence: Int, turnStartTime: Date) async {
         guard !Task.isCancelled else { return }
         let turnID = turn.id
+        DiagnosticTrace.log("REPLIES_GENERATION_STARTED", "turnID=\(turnID)")
 
         DiagnosticTrace.log("POST_STT_TRACE", "SUGGESTED_REPLIES_START turnID=\(turnID)")
         DiagnosticTrace.log("SUGGESTED_REPLIES_START", "turnID=\(turnID)")
         DiagnosticTrace.log("REPLIES_TASK_START", "id=\(turnID)")
         let repliesStart = Date()
         DiagnosticTrace.log("LATENCY_TRACE", "REPLIES_START id=\(turnID)")
+        DiagnosticTrace.log("LATENCY_TRACE", "REPLIES_REQUEST_START_TS id=\(turnID) value=\(repliesStart.timeIntervalSince1970)")
+        // Bounded to the minimum history genuinely useful for reply
+        // relevance (matches the backend's own MAX_RECENT_TURNS/
+        // MAX_CONTEXT_ITEMS caps — see suggestedReplies/routes.js) —
+        // trimmed further than "everything ever spoken" specifically to
+        // keep the request small (and therefore fast): reply relevance
+        // depends overwhelmingly on the last few turns, not the full
+        // session history.
         let context = SuggestedReplyContext(
-            recentTurns: agentContextStore.session.turns.filter { $0.id != turnID },
+            recentTurns: Array(agentContextStore.session.turns.filter { $0.id != turnID }.suffix(6)),
             contextItems: agentContextStore.session.contextItems
         )
         let replies: [SuggestedReply]
         do {
             replies = try await generateRepliesWithTimeout(for: turn, context: context)
-            let repliesLatencyMs = Int(Date().timeIntervalSince(repliesStart) * 1000)
+            let repliesDoneAt = Date()
+            let repliesLatencyMs = Int(repliesDoneAt.timeIntervalSince(repliesStart) * 1000)
             DiagnosticTrace.log("LATENCY_TRACE", "REPLIES_END id=\(turnID)")
+            DiagnosticTrace.log("LATENCY_TRACE", "REPLIES_RESPONSE_TS id=\(turnID) value=\(repliesDoneAt.timeIntervalSince1970)")
             DiagnosticTrace.log("LATENCY_TRACE", "REPLIES_LATENCY_MS id=\(turnID) value=\(repliesLatencyMs)")
+            DiagnosticTrace.log("LATENCY_TRACE", "REPLIES_GENERATION_LATENCY_MS id=\(turnID) value=\(repliesLatencyMs)")
             DiagnosticTrace.log("REPLIES_TASK_END", "id=\(turnID)")
+            DiagnosticTrace.log("REPLIES_GENERATION_FINISHED", "turnID=\(turnID) count=\(replies.count)")
         } catch is CancellationError {
             DiagnosticTrace.log("REPLIES_TASK_CANCELLED", "id=\(turnID)")
+            DiagnosticTrace.log("REPLIES_GENERATION_FINISHED", "turnID=\(turnID) reason=cancelled")
             DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=repliesCancelled")
             return
         } catch is RepliesTimeoutError {
             DiagnosticTrace.log("REPLIES_TASK_TIMEOUT", "id=\(turnID)")
             DiagnosticTrace.log("LIVE_TRACE", "suggested-reply generation timed out for turnID=\(turnID)")
+            DiagnosticTrace.log("REPLIES_GENERATION_FINISHED", "turnID=\(turnID) reason=timeout")
             DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=repliesTimeout")
             return
         } catch {
@@ -771,6 +858,7 @@ final class LiveTranslationService {
             DiagnosticTrace.log("REAL_TURN_TRACE", "REPLIES failed turnID=\(turnID) error=\(error)")
             DiagnosticTrace.log("POST_STT_TRACE", "SUGGESTED_REPLIES_RESULT turnID=\(turnID) error type=\(type(of: error)) message=\(error)")
             DiagnosticTrace.log("SUGGESTED_REPLIES_RESULT", "turnID=\(turnID) error type=\(type(of: error)) message=\(error)")
+            DiagnosticTrace.log("REPLIES_GENERATION_FINISHED", "turnID=\(turnID) reason=error")
             DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=repliesFailed")
             return
         }
@@ -790,9 +878,9 @@ final class LiveTranslationService {
         DiagnosticTrace.log("SUGGESTED_REPLIES_RESULT", "id=\(turnID) count=\(updatedTurn.suggestedReplies.count)")
         agentContextStore.updateTurn(updatedTurn)
 
-        guard agentContextStore.session.latestTurn?.id == updatedTurn.id else {
-            DiagnosticTrace.log("REAL_TURN_TRACE", "DISPLAY_REQUEST skipped turnID=\(turnID) reason=staleTurn(newerTurnExists)")
-            DiagnosticTrace.log("SUGGESTED_REPLIES_DISPLAY_ERROR", "turnID=\(turnID) reason=staleTurn(newerTurnExists) — a newer turn is now active, this update is intentionally discarded")
+        guard sequence >= highestDisplayedTurnSequence else {
+            DiagnosticTrace.log("REAL_TURN_TRACE", "DISPLAY_REQUEST skipped turnID=\(turnID) reason=staleTurn(newerTurnAlreadyDisplayed)")
+            DiagnosticTrace.log("SUGGESTED_REPLIES_DISPLAY_ERROR", "turnID=\(turnID) reason=staleTurn(newerTurnAlreadyDisplayed) — a newer turn has already displayed, this update is intentionally discarded")
             DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=staleAfterReplies")
             return
         }
@@ -804,17 +892,30 @@ final class LiveTranslationService {
             DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=noRepliesToShow")
             return
         }
-        let replyPages = GlassesPresentationLayer.replyLeadingPages(for: updatedTurn)
+        let replyPages = GlassesPresentationLayer.pages(for: updatedTurn)
         DiagnosticTrace.log("REAL_TURN_TRACE", "PAGES stage=withReplies turnID=\(turnID) count=\(replyPages.count)")
         DiagnosticTrace.log("SUGGESTED_REPLIES_PAGES_CREATED", "id=\(turnID) count=\(replyPages.count)")
+        let replyDisplayStart = Date()
         do {
             DiagnosticTrace.log("REAL_TURN_TRACE", "DISPLAY_REQUEST stage=withReplies turnID=\(turnID)")
             DiagnosticTrace.log("SUGGESTED_REPLIES_DISPLAY_REQUEST", "turnID=\(turnID)")
             DiagnosticTrace.log("SUGGESTED_REPLIES_AUTO_DISPLAY_START", "id=\(turnID)")
             try await glassesTransport.displayPages(replyPages)
+            currentTurnDisplayState = .withReplies(turnID: turnID, replyCount: updatedTurn.suggestedReplies.count)
+            let now = Date()
             DiagnosticTrace.log("REAL_TURN_TRACE", "DISPLAY_DONE stage=withReplies turnID=\(turnID)")
             DiagnosticTrace.log("SUGGESTED_REPLIES_DISPLAY_DONE", "turnID=\(turnID)")
             DiagnosticTrace.log("SUGGESTED_REPLIES_AUTO_DISPLAY_DONE", "id=\(turnID)")
+            DiagnosticTrace.log("REPLIES_DISPLAYED", "turnID=\(turnID) replyCount=\(updatedTurn.suggestedReplies.count)")
+            DiagnosticTrace.log("LATENCY_TRACE", "REPLIES_DISPLAY_TS id=\(turnID) value=\(now.timeIntervalSince1970)")
+            DiagnosticTrace.log(
+                "LATENCY_TRACE",
+                "REPLIES_DISPLAY_LATENCY_MS id=\(turnID) value=\(Int(now.timeIntervalSince(replyDisplayStart) * 1000))"
+            )
+            DiagnosticTrace.log(
+                "LATENCY_TRACE",
+                "TOTAL_REPLIES_LATENCY_MS id=\(turnID) value=\(Int(now.timeIntervalSince(turnStartTime) * 1000))"
+            )
         } catch {
             DiagnosticTrace.log("LIVE_TRACE", "displayPages (suggested replies) failed: \(error)")
             DiagnosticTrace.log("REAL_TURN_TRACE", "DISPLAY_REQUEST failed stage=withReplies turnID=\(turnID) error=\(error)")

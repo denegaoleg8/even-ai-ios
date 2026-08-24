@@ -9,26 +9,53 @@ import Foundation
 /// `GlassesTextPaginator`, and the Dependency Rule (`ARCHITECTURE.md`)
 /// only allows that dependency direction, not the reverse.
 ///
-/// NOT wired to `MentraGlassesTransport`/`sendText` yet — that's
-/// Milestone 6; this type never imports/references either, and produces
-/// exactly the `[String]` shape `GlassesPaginationState.start(withPages:)`
-/// already accepts unchanged, so no adapter should be needed when that
-/// wiring happens.
+/// ## The "translation disappears when replies arrive" bug this fixes
 ///
-/// Page 1 (and any overflow pages `GlassesTextPaginator` itself
-/// produces) is the Ukrainian translation alone — nothing else ever
-/// shares that page, so it stays visually distinct from the suggested
-/// replies that follow. Every subsequent page packs one or more numbered
-/// reply + Ukrainian-meaning blocks; a block is never split across a
-/// page boundary except in the rare case a single reply is, on its own,
-/// too long to fit on any page at all — an edge case the product's own
-/// "replies must be short enough for G2" requirement makes uncommon, not
-/// the path this type optimizes for.
+/// The previous design produced TWO DIFFERENT page sets for one turn: a
+/// translation-only set for the first display call, and a completely
+/// separate `replyLeadingPages(for:)` set (replies first, translation
+/// pages after) for the automatic "replies just finished" update. Because
+/// `MentraGlassesTransport.displayPages(_:)` always resets to page 1 of
+/// whatever set it's given, going from "page 1 = translation" to "page 1 =
+/// reply 1" meant the translation the user was just reading visibly
+/// vanished, replaced by reply content — exactly the physical symptom
+/// reported ("translated text appears first, then it disappears,
+/// suggested replies replace it").
+///
+/// The fix: there is now only ONE page format per turn, produced by this
+/// one function, used for BOTH the initial translation-only display call
+/// and the later "replies arrived" update call. Every page carries the
+/// SAME header — the original spoken phrase and its Ukrainian translation
+/// — with a reply (if any) shown below it. Before any replies exist, the
+/// header is the only page. Once replies arrive, calling this function
+/// again for the same turn produces one page per reply, each still
+/// carrying the identical header — so redisplaying never removes the
+/// translation, it only adds a reply section beneath it. Swiping (see
+/// `MentraGlassesTransport`'s touch-event handling, unchanged) still just
+/// moves through whatever page set is currently active — which now means
+/// "moves between replies," never "moves away from the translation,"
+/// since the translation is baked into every page.
 enum GlassesPresentationLayer {
     /// `[]` for a turn with no translation (Ukrainian speech, or a turn
-    /// whose translation is empty/whitespace-only) — no translation page
-    /// and no reply pages either, since replies only ever exist
-    /// alongside a genuinely translated foreign-language turn.
+    /// whose translation is empty/whitespace-only) — no page at all,
+    /// matching the product rule that G2 only ever shows a genuinely
+    /// translated foreign-language turn.
+    ///
+    /// With no replies yet (or once generation finishes with nothing
+    /// usable), the result is the single-page (or, for a very long
+    /// phrase/translation, multi-page) header alone — "Source +
+    /// translation, no reply section yet" is an explicitly allowed
+    /// display state (see this type's doc comment and
+    /// `LiveTranslationService`'s turn/display state model), not a
+    /// placeholder needing special-casing here.
+    ///
+    /// With replies present, the result is one page PER reply (capped at
+    /// 3, sorted by `ordering`, empty-text replies dropped and the rest
+    /// renumbered contiguously) — never multiple replies packed onto one
+    /// page — because the product requirement is "swiping moves to the
+    /// next reply," which only holds if each reply is its own page. Each
+    /// such page repeats the full header, so the header is never the
+    /// thing a swipe navigates away from.
     static func pages(
         for turn: ConversationTurn,
         maxCharactersPerPage: Int = GlassesTextPaginator.defaultMaxCharactersPerPage
@@ -39,106 +66,37 @@ enum GlassesPresentationLayer {
             return []
         }
 
-        var pages = GlassesTextPaginator.pages(for: translation, maxCharactersPerPage: maxCharactersPerPage)
-        pages.append(contentsOf: replyPages(for: turn.suggestedReplies, maxCharactersPerPage: maxCharactersPerPage))
-        return pages
-    }
-
-    /// Same content as `pages(for:)`, reordered so the FIRST reply page
-    /// comes first and the translation page(s) come last — for the
-    /// automatic "replies just finished generating" display update.
-    ///
-    /// `pages(for:)`'s translation-first order is correct for the
-    /// *initial* display call (there are no replies yet, so page 1 being
-    /// the translation is simply the only content that exists) — but a
-    /// transport only ever sends page 1 of whatever page set it's given;
-    /// later pages are reachable by swiping only (see
-    /// `MentraGlassesTransport.displayPages(_:)`). Calling `pages(for:)`
-    /// again once replies exist and displaying THAT page set means page 1
-    /// is still the translation the user already saw — the reply content
-    /// is delivered but sits unseen on page 2+ until a swipe. This is the
-    /// actual root cause of "replies require pressing a button on the
-    /// glasses to appear": nothing was technically broken about
-    /// generating or sending the replies, only about which page a fresh
-    /// `displayPages(_:)` call lands on by default.
-    ///
-    /// Swiping still works exactly as before afterward — this only
-    /// changes what's shown immediately, not how pagination itself
-    /// behaves; a gesture navigates whatever page set is currently
-    /// active, translation included.
-    static func replyLeadingPages(
-        for turn: ConversationTurn,
-        maxCharactersPerPage: Int = GlassesTextPaginator.defaultMaxCharactersPerPage
-    ) -> [String] {
-        guard let translation = turn.ukrainianTranslation?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !translation.isEmpty
-        else {
-            return []
-        }
-
-        let replies = replyPages(for: turn.suggestedReplies, maxCharactersPerPage: maxCharactersPerPage)
-        let translationPages = GlassesTextPaginator.pages(for: translation, maxCharactersPerPage: maxCharactersPerPage)
-        guard !replies.isEmpty else {
-            // Nothing to lead with — identical to the translation-only set.
-            return translationPages
-        }
-        return replies + translationPages
-    }
-
-    /// Packs each reply + its Ukrainian meaning as one indivisible block,
-    /// sorted by `ordering` (not array position — see
-    /// `SuggestedReply.ordering`'s own doc comment) and capped at 3,
-    /// matching the product's G2 display limit regardless of how many a
-    /// generator actually returned. A reply whose own text is empty/
-    /// whitespace-only is dropped before numbering, so the remaining
-    /// replies are numbered contiguously (never "1., 3." with a gap).
-    private static func replyPages(for replies: [SuggestedReply], maxCharactersPerPage: Int) -> [String] {
-        let validReplies = replies
+        let header = conversationHeader(originalText: turn.originalText, translation: translation)
+        let validReplies = turn.suggestedReplies
             .sorted { $0.ordering < $1.ordering }
             .prefix(3)
             .filter { !$0.originalLanguageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
-        let blocks = validReplies.enumerated().map { index, reply in
-            "\(index + 1). \(reply.originalLanguageText)\n\(reply.ukrainianText)"
+        guard !validReplies.isEmpty else {
+            return GlassesTextPaginator.pages(for: header, maxCharactersPerPage: maxCharactersPerPage)
         }
 
-        var pages: [String] = []
-        var currentBlocks: [String] = []
-        var currentLength = 0
-
-        for block in blocks {
-            let separatorLength = currentBlocks.isEmpty ? 0 : 2 // "\n\n" between blocks sharing a page
-            let addedLength = block.count + separatorLength
-
-            if !currentBlocks.isEmpty, currentLength + addedLength > maxCharactersPerPage {
-                pages.append(currentBlocks.joined(separator: "\n\n"))
-                currentBlocks = []
-                currentLength = 0
-            }
-
-            if block.count > maxCharactersPerPage {
-                // A single reply pair too long to fit on any page alone —
-                // rare (replies are meant to be short), handled rather
-                // than silently overflowing: split via the same
-                // paginator used for translations, in isolation so
-                // nothing else shares in its overflow.
-                if !currentBlocks.isEmpty {
-                    pages.append(currentBlocks.joined(separator: "\n\n"))
-                    currentBlocks = []
-                    currentLength = 0
-                }
-                pages.append(contentsOf: GlassesTextPaginator.pages(for: block, maxCharactersPerPage: maxCharactersPerPage))
-                continue
-            }
-
-            currentBlocks.append(block)
-            currentLength += addedLength
+        return validReplies.enumerated().flatMap { index, reply -> [String] in
+            let replyBlock = "Reply \(index + 1):\n\(reply.originalLanguageText)\nUA: \(reply.ukrainianText)"
+            let combined = header + "\n\n" + replyBlock
+            guard combined.count > maxCharactersPerPage else { return [combined] }
+            // Rare overflow (a reply too long, alongside the header, to
+            // fit in one page) — degrade to GlassesTextPaginator's normal
+            // multi-page split rather than silently truncating. No
+            // overlap-word repetition here (that feature is meant for
+            // continuous prose being read top-to-bottom, not a
+            // header+reply block); the header only survives onto the
+            // first of these overflow pages, which is an accepted, rare
+            // degradation, not a regression from the previous behavior.
+            return GlassesTextPaginator.pages(for: combined, maxCharactersPerPage: maxCharactersPerPage, overlapWordCount: 0)
         }
+    }
 
-        if !currentBlocks.isEmpty {
-            pages.append(currentBlocks.joined(separator: "\n\n"))
-        }
-
-        return pages
+    /// The persistent header shown on every page for a turn: the original
+    /// spoken phrase, then its Ukrainian translation — see this type's
+    /// doc comment for why this is now baked into every page rather than
+    /// living on a page of its own.
+    private static func conversationHeader(originalText: String, translation: String) -> String {
+        "\(originalText)\n\nUA: \(translation)"
     }
 }

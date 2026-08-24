@@ -136,7 +136,7 @@ struct LiveTranslationServiceSuggestedRepliesTests {
         // The translation itself must still be there and still sent to
         // G2 — a reply-generation failure never hides it. Milestone 6:
         // it reaches G2 via `displayPages(_:)`, not `sendText(_:)`.
-        #expect(await spy.displayedPageSets == [["Добрий день"]])
+        #expect(await spy.displayedPageSets == [["Guten Tag\n\nUA: Добрий день"]])
         let turn = try #require(store.session.latestTurn)
         #expect(turn.ukrainianTranslation == "Добрий день")
         #expect(turn.suggestedReplies.isEmpty)

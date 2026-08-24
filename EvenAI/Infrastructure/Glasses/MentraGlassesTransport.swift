@@ -87,6 +87,45 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
     /// physically confirmed reliable.
     private var displayCallCounter = 0
 
+    /// Tracks the caller's mic intent (`setMicrophoneEnabled(true)` was
+    /// called and hasn't since been turned off) — see `performDisplay`'s
+    /// proactive re-arm below for why this exists as its own flag rather
+    /// than being inferred from `sdk.glasses` state.
+    ///
+    /// ## Physical hypothesis: "Live Translation stops listening after
+    /// suggested replies appear"
+    ///
+    /// Confirmed by reading the vendored SDK source (`G2.swift`): G2's mic
+    /// only exists inside a live "EvenHub page" — the firmware can tear
+    /// down that page (and, with it, the mic) at any time via a
+    /// `systemExit`/`abnormalExit`/dashboard-close event, entirely outside
+    /// this app's control. The SDK has its own internal self-heal for this
+    /// (`recoverPageAndMic(reason:)`, triggered from the paired
+    /// dashboard-close event), which reads `DeviceStore`'s own mic-intent
+    /// flag and re-arms the mic if it doesn't match reality — but that
+    /// recovery is debounced (`RECOVERY_DEBOUNCE_MS`, "at most one rebuild
+    /// per window, the firmware spams these events ~1x/sec") and entirely
+    /// dependent on firmware event timing this app has no visibility into
+    /// or control over. A display update landing in the same narrow
+    /// window as a torn-down page is exactly the kind of event that could
+    /// get swallowed by that debounce.
+    ///
+    /// Rather than trust that timing, `performDisplay(_:callID:)`
+    /// proactively re-asserts mic intent after every successful display
+    /// call while Live Translation actually wants the mic on — cheap
+    /// (fire-and-forget, never awaited, never blocks a later display or
+    /// translation), idempotent (`G2.setMicEnabled(true)` while already
+    /// enabled performs exactly the documented off→on re-arm toggle the
+    /// SDK itself uses for recovery — this is calling the SDK's OWN
+    /// self-heal mechanism on a predictable cadence tied to this app's own
+    /// protocol activity, not a new, invented behavior), and does not
+    /// require modifying the vendored SDK or touching the transport's
+    /// public surface. This is the concrete fix for the physical symptom
+    /// "after suggested replies appear, Live Translation often stops
+    /// listening" — the reply-stage display call is exactly the moment
+    /// this transport now re-confirms the mic is actually still armed.
+    private var microphoneIntentEnabled = false
+
     /// Upper bound on how long `connect()` will wait for CoreBluetooth's
     /// central-manager state to settle before giving up — see
     /// `BluetoothReadinessWatcher`. This is a safety net for a wait that is
@@ -154,6 +193,7 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
         sdk.disconnect()
         pagination.clear()
         readinessGate.discardPending()
+        microphoneIntentEnabled = false
         broadcast(.disconnected)
     }
 
@@ -273,6 +313,20 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
         DiagnosticTrace.log("G2_DISPLAY_TRACE", "DISPLAY_COMMAND_SEND_RESULT callID=\(callID) result=returnedWithoutThrowing (NOT proof of physical display — see G2_SDK_LOG for the SDK's own internal reconcile/send activity)")
         DiagnosticTrace.log("G2_DISPLAY_TRACE", "PAGE_1_SENT callID=\(callID) text=\"\(firstPage.prefix(60))\"")
         DiagnosticTrace.log("G2_DISPLAY_TRACE", "DISPLAY_COMPLETE callID=\(callID)")
+        reaffirmMicrophoneIfNeeded(afterCallID: callID)
+    }
+
+    /// See `microphoneIntentEnabled`'s doc comment for the full physical
+    /// hypothesis this exists to cover. Fire-and-forget, never awaited by
+    /// `performDisplay(_:callID:)` — this must never add latency to a
+    /// display call, and it has no result any caller needs. A no-op
+    /// (nothing sent) whenever Live Translation doesn't currently want the
+    /// mic on.
+    private func reaffirmMicrophoneIfNeeded(afterCallID callID: Int) {
+        guard microphoneIntentEnabled, isSDKStarted, sdk.glasses.connected else { return }
+        DiagnosticTrace.log("G2_DISPLAY_TRACE", "MIC_REAFFIRM_START callID=\(callID)")
+        sdk.setMicState(enabled: true, useGlassesMic: true, sendTranscript: false, sendLc3Data: false)
+        DiagnosticTrace.log("G2_DISPLAY_TRACE", "MIC_REAFFIRM_SENT callID=\(callID)")
     }
 
     /// See `pcmContinuations`. No seeding of a "current" value — unlike
@@ -325,6 +379,7 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
     /// that entire window. Sized with margin above the traced worst case.
     func setMicrophoneEnabled(_ enabled: Bool) async throws {
         guard enabled else {
+            microphoneIntentEnabled = false
             if isSDKStarted {
                 sdk.setMicState(enabled: false, useGlassesMic: true)
             }
@@ -333,6 +388,7 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
         guard isSDKStarted, sdk.glasses.connected else {
             throw GlassesTransportError.notConnected
         }
+        microphoneIntentEnabled = true
         sdk.setMicState(enabled: true, useGlassesMic: true, sendTranscript: false, sendLc3Data: false)
         try? await Task.sleep(for: Self.micArmSettleDelay)
     }
