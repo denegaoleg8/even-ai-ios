@@ -59,7 +59,7 @@ final class GlassesSpeechTranscriber: ContinuousTranscribing, @unchecked Sendabl
     private var task: SFSpeechRecognitionTask?
     private var pcmConsumerTask: Task<Void, Never>?
     private var isActive = false
-    private var continuation: AsyncThrowingStream<String, Error>.Continuation?
+    private var continuation: AsyncThrowingStream<TranscriptionUpdate, Error>.Continuation?
 
     /// Debounce-timer task for silence-based utterance finalization — see
     /// `scheduleFinalization(sessionID:)`. `SFSpeechAudioBufferRecognitionRequest`
@@ -102,7 +102,7 @@ final class GlassesSpeechTranscriber: ContinuousTranscribing, @unchecked Sendabl
         pcmConsumerTask?.cancel()
     }
 
-    func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<String, Error> {
+    func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<TranscriptionUpdate, Error> {
         stopInternal()
 
         guard let recognizer, recognizer.isAvailable, let audioFormat else {
@@ -183,12 +183,13 @@ final class GlassesSpeechTranscriber: ContinuousTranscribing, @unchecked Sendabl
         if let result, result.isFinal {
             finalizationTask?.cancel()
             finalizationTask = nil
-            continuation?.yield(result.bestTranscription.formattedString)
+            continuation?.yield(.final(result.bestTranscription.formattedString))
             beginNewSession(recognizer: recognizer)
             return
         }
 
         if let result, !result.isFinal {
+            continuation?.yield(.partial(result.bestTranscription.formattedString))
             scheduleFinalization(sessionID: sessionID)
             return
         }

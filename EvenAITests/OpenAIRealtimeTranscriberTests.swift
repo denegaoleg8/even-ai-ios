@@ -32,7 +32,9 @@ struct OpenAIRealtimeTranscriberTests {
         let finals = try await transcriber.startTranscribing(pcmUpdates: pcmStream)
         var received: [String] = []
         let collectTask = Task {
-            for try await value in finals { received.append(value) }
+            for try await value in finals {
+                if case .final(let text) = value { received.append(text) }
+            }
         }
 
         let sockets = await factory.createdSockets
@@ -44,16 +46,16 @@ struct OpenAIRealtimeTranscriberTests {
         collectTask.cancel()
     }
 
-    @Test("partial transcripts are filtered out — only finals are yielded")
-    func partialsAreFiltered() async throws {
+    @Test("partial transcripts are yielded as .partial(_:), distinct from and never confused with .final(_:)")
+    func partialsAreYieldedDistinctlyFromFinals() async throws {
         let factory = FakeRealtimeTranscriptionSocketFactory()
         let transcriber = makeTranscriber(factory)
         let (pcmStream, _) = AsyncStream<Data>.makeStream()
 
-        let finals = try await transcriber.startTranscribing(pcmUpdates: pcmStream)
-        var received: [String] = []
+        let updates = try await transcriber.startTranscribing(pcmUpdates: pcmStream)
+        var received: [TranscriptionUpdate] = []
         let collectTask = Task {
-            for try await value in finals { received.append(value) }
+            for try await value in updates { received.append(value) }
         }
 
         let socket = await factory.createdSockets[0]
@@ -62,7 +64,11 @@ struct OpenAIRealtimeTranscriberTests {
         await socket.emit(.finalTranscript("Guten Tag"))
         try? await Task.sleep(for: Self.propagationDelay)
 
-        #expect(received == ["Guten Tag"])
+        #expect(received == [
+            .partial("Guten Ta"),
+            .partial("Guten Tag jetzt"),
+            .final("Guten Tag"),
+        ])
         collectTask.cancel()
     }
 
@@ -78,7 +84,9 @@ struct OpenAIRealtimeTranscriberTests {
         let finals = try await transcriber.startTranscribing(pcmUpdates: pcmStream)
         var received: [String] = []
         let collectTask = Task {
-            for try await value in finals { received.append(value) }
+            for try await value in finals {
+                if case .final(let text) = value { received.append(text) }
+            }
         }
 
         let socket = await factory.createdSockets[0]
@@ -101,7 +109,9 @@ struct OpenAIRealtimeTranscriberTests {
         var received: [String] = []
         var finished = false
         let collectTask = Task {
-            for try await value in finals { received.append(value) }
+            for try await value in finals {
+                if case .final(let text) = value { received.append(text) }
+            }
             finished = true
         }
 
@@ -133,7 +143,9 @@ struct OpenAIRealtimeTranscriberTests {
         var threw = false
         let collectTask = Task {
             do {
-                for try await value in finals { received.append(value) }
+                for try await value in finals {
+                    if case .final(let text) = value { received.append(text) }
+                }
             } catch {
                 threw = true
             }
@@ -160,7 +172,9 @@ struct OpenAIRealtimeTranscriberTests {
         var threw = false
         let collectTask = Task {
             do {
-                for try await value in finals { received.append(value) }
+                for try await value in finals {
+                    if case .final(let text) = value { received.append(text) }
+                }
             } catch {
                 threw = true
             }

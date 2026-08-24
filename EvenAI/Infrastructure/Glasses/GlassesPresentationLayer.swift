@@ -92,6 +92,29 @@ enum GlassesPresentationLayer {
         }
     }
 
+    /// A single, unpaginated page for a still-in-progress (partial) or
+    /// just-finalized utterance being streamed to G2 in place — major
+    /// performance pass ("translation should begin appearing as close to
+    /// real time as technically possible"). Deliberately NOT run through
+    /// `GlassesTextPaginator`/multi-page splitting: a streaming update
+    /// has no reply section to swipe to yet, so there is nothing for
+    /// pagination to serve, and a growing partial changing every ~150ms
+    /// isn't a stable enough target for a swipeable multi-page layout
+    /// anyway — this always sends exactly one page.
+    ///
+    /// `translation == nil` (no language known yet for this utterance, or
+    /// the debounced translate call hasn't resolved yet) renders `source`
+    /// alone — the same "Source, no translation section yet" allowance
+    /// `pages(for:)` already makes for "no replies yet," extended one
+    /// level earlier in the turn's lifecycle.
+    static func streamingPage(source: String, translation: String?) -> String {
+        let trimmedSource = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let translation = translation?.trimmingCharacters(in: .whitespacesAndNewlines), !translation.isEmpty else {
+            return trimmedSource
+        }
+        return conversationHeader(originalText: trimmedSource, translation: translation)
+    }
+
     /// The persistent header shown on every page for a turn: the original
     /// spoken phrase, then its Ukrainian translation — see this type's
     /// doc comment for why this is now baked into every page rather than

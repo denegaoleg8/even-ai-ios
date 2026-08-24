@@ -77,6 +77,42 @@ import Observation
 /// used for suggested replies, now also used for the translation display
 /// itself) meaningful: `latestTurn` always means "most recently *spoken*,"
 /// never "most recently finished processing."
+///
+/// ## Streaming translation (major performance pass)
+///
+/// Waiting for a full utterance to finalize (silence-debounced, ~1.3s of
+/// dead air on the STT side alone) before translation even started made
+/// "perceptually immediate" translation structurally impossible — the
+/// product goal is translated text appearing while the speaker is still
+/// talking, refined once the final arrives, not created by it.
+/// `ContinuousTranscribing` now yields `.partial(_:)` updates for the
+/// utterance currently being spoken as well as the terminal `.final(_:)`
+/// — `handlePartial(_:)` reacts to those: it updates
+/// `currentPartialTranscript` immediately (free — local state, no I/O),
+/// then debounces (`partialDebounceInterval`, 150ms) before actually
+/// translating and redisplaying, so a burst of rapidly-growing partials
+/// collapses into one G2/network round trip instead of one per partial.
+/// `.final(_:)` always wins immediately — any in-flight partial debounce
+/// for the same utterance is cancelled the moment a final for it arrives
+/// (see `consume(_:)`), and `prepareAndDispatch(final:)` reuses that
+/// utterance's already-claimed display-ordering slot
+/// (`utteranceSequence`) so the final's own display participates in
+/// EXACTLY the same newest-wins ordering a partial's would have — a
+/// stale, late-settling partial for an old utterance can never overwrite
+/// either a newer utterance's partial OR that same utterance's own final.
+/// Partials are never persisted: no `ConversationTurn` is created, and
+/// nothing reaches Glasses Chat, until `.final(_:)` arrives — see
+/// `prepareAndDispatch(final:)`, unchanged in that respect.
+///
+/// Priority order, enforced structurally, not by convention: (1) keep
+/// listening — `handlePartial(_:)` is synchronous and `consume(_:)`'s
+/// loop never awaits translation/display/replies for ANY utterance,
+/// partial or final; (2) show translation immediately — the debounced
+/// partial path exists for exactly this; (3) persist the final turn —
+/// `processTurn(...)`'s translation/display/Chat-append steps, unchanged;
+/// (4) generate replies asynchronously — `generateSuggestedReplies(...)`
+/// only ever starts after (3), in its own untracked-by-priority `Task`,
+/// and can never delay, block, or take priority over (1)-(3).
 @MainActor
 @Observable
 final class LiveTranslationService {
@@ -103,6 +139,11 @@ final class LiveTranslationService {
     /// allowed to make that transition.
     enum TurnDisplayState: Sendable, Equatable {
         case none
+        /// A partial (still-growing) transcript/translation for the
+        /// utterance currently being spoken is on screen — see the
+        /// "Streaming translation" section of this class's doc comment.
+        /// Never backed by a persisted `ConversationTurn`.
+        case streaming(utteranceID: UUID)
         case translated(turnID: ConversationTurn.ID)
         case withReplies(turnID: ConversationTurn.ID, replyCount: Int)
     }
@@ -125,6 +166,27 @@ final class LiveTranslationService {
     private(set) var lastRecognizedPhrase: String?
     /// The most recent Ukrainian translation actually sent to G2.
     private(set) var lastTranslation: String?
+    /// Required streaming-translation state (major performance pass) —
+    /// `finalTranscript`/`finalTranslation` are simply the authoritative
+    /// names for `lastRecognizedPhrase`/`lastTranslation` above (kept as
+    /// computed aliases rather than a second copy of the same data, so
+    /// there's no way for the two to diverge).
+    var finalTranscript: String? { lastRecognizedPhrase }
+    var finalTranslation: String? { lastTranslation }
+    /// The utterance currently being spoken's still-growing recognized
+    /// text — `nil` whenever no utterance is in progress (between
+    /// utterances, or right after one finalizes). Updated on every
+    /// `.partial(_:)` update; never itself debounced (cheap, local, no
+    /// I/O) — only the G2 display/translation call that *reacts* to it is
+    /// debounced (see `handlePartial(_:)`).
+    private(set) var currentPartialTranscript: String?
+    /// The current best-effort Ukrainian translation of
+    /// `currentPartialTranscript`, once the debounced translate call for
+    /// it resolves — `nil` until then, or whenever no language is known
+    /// yet for this utterance (Auto mode, not yet locked; see
+    /// `resolveLanguageForNewUtterance()`). Never persisted anywhere;
+    /// wiped the moment the utterance's own final transcript arrives.
+    private(set) var currentPartialTranslation: String?
     /// The most recent raw final transcript accepted past the empty
     /// check, and when — used only for the short, time-bounded
     /// duplicate-suppression window in `prepareAndDispatch(final:)`. See
@@ -196,6 +258,55 @@ final class LiveTranslationService {
     /// a new session's sequence numbers start fresh.
     private var turnSequenceCounter = 0
     private var highestDisplayedTurnSequence = 0
+    /// Identifies the utterance currently in progress (partials received,
+    /// no final yet) — `nil` between utterances. Not a `ConversationTurn`
+    /// id and never becomes one; purely a correlation token so a
+    /// debounced partial-translation response can tell "am I still
+    /// talking about the utterance that scheduled me, or has it already
+    /// finalized / been superseded" — see `handlePartial(_:)`/
+    /// `settlePartial(...)`.
+    private var utteranceID: UUID?
+    /// The global display-ordering slot claimed for the utterance
+    /// currently in progress — assigned from the SAME `turnSequenceCounter`
+    /// finals use, the moment the utterance's first partial arrives (not
+    /// when it finalizes). This is what lets a newer utterance's partial
+    /// correctly pre-empt an older utterance's still-in-flight FINAL
+    /// display (and vice versa never happening): both partials and finals
+    /// share one ordering, checked against the same
+    /// `highestDisplayedTurnSequence`. Reused, not reassigned, when this
+    /// same utterance's final is dispatched in `prepareAndDispatch(final:)`.
+    private var utteranceSequence: Int?
+    /// The language resolved for the utterance currently in progress —
+    /// see `resolveLanguageForNewUtterance()`. `nil` means either no
+    /// utterance is in progress, or Auto mode hasn't locked onto a
+    /// language yet (in which case partials for this utterance show
+    /// source text only, no translation, until the final runs full
+    /// detection).
+    private var utteranceLanguageCode: String?
+    /// Cancelled and replaced on every `.partial(_:)` update — only the
+    /// most recent partial's debounced translate-and-display ever runs;
+    /// see `handlePartial(_:)`.
+    private var partialDebounceTask: Task<Void, Never>?
+    /// Monotonically increasing per-partial generation, reset implicitly
+    /// by `utteranceID` changing (a new utterance always means a
+    /// completely fresh comparison). Captured at dispatch time in
+    /// `settlePartial(...)` so a stale response — one superseded by
+    /// either a newer partial of the SAME utterance or that utterance's
+    /// own final — can detect it and discard itself, both before AND
+    /// after the network round trip.
+    private var partialGenerationCounter = 0
+    /// How long to wait after a partial stops changing before actually
+    /// translating/displaying it — deliberately short: this is the whole
+    /// point of the streaming path (translation "as close to real time as
+    /// technically possible"), not a batching optimization. 150ms is
+    /// below normal human perception of a delay, comfortably above the
+    /// rate successive partials for the same word/phrase tend to arrive
+    /// at (avoiding a translate call per single-character growth), and
+    /// matches this repo's own established "short debounce, not a
+    /// multi-second wait" convention (see `GlassesSpeechTranscriber
+    /// .silenceDebounceInterval` for the analogous, much longer,
+    /// deliberately-different-purpose utterance-boundary debounce).
+    private static let partialDebounceInterval: Duration = .milliseconds(150)
     /// The user's explicit on/off intent, distinct from `state` — guards
     /// `observeConnection()` so a disconnect/reconnect cycle before the
     /// user has ever started Live Translation doesn't do anything.
@@ -301,14 +412,15 @@ final class LiveTranslationService {
         turnSequenceCounter = 0
         highestDisplayedTurnSequence = 0
         currentTurnDisplayState = .none
+        resetUtteranceState()
 
         do {
             try await glassesTransport.setMicrophoneEnabled(true)
             let pcmUpdates = await glassesTransport.microphonePCMUpdates()
-            let finals = try await transcriber.startTranscribing(pcmUpdates: pcmUpdates)
+            let updates = try await transcriber.startTranscribing(pcmUpdates: pcmUpdates)
             state = .listening
             consumeTask = Task { [weak self] in
-                await self?.consume(finals)
+                await self?.consume(updates)
             }
         } catch {
             // TEMPORARY — Milestone 8b physical-device diagnosis. Remove
@@ -334,6 +446,7 @@ final class LiveTranslationService {
         // attempting it, and avoids leaving orphaned tasks running).
         turnTasks.forEach { $0.cancel() }
         turnTasks.removeAll()
+        resetUtteranceState()
         await transcriber.stopTranscribing()
         try? await glassesTransport.setMicrophoneEnabled(false)
         // Only clears a `.listening` state — an `.error` set immediately
@@ -360,23 +473,38 @@ final class LiveTranslationService {
         }
     }
 
-    private func consume(_ finals: AsyncThrowingStream<String, Error>) async {
+    private func consume(_ updates: AsyncThrowingStream<TranscriptionUpdate, Error>) async {
         do {
-            for try await final in finals {
-                // TEMPORARY — upstream-path diagnostic. Remove once
-                // root-caused. See DiagnosticTrace.swift.
-                DiagnosticTrace.log("UPSTREAM_TRACE", "TRANSCRIPT_RECEIVED text=\"\(final.prefix(60))\"")
-                // Proves the loop is still pulling from `finals` — this is
+            for try await update in updates {
+                // Proves the loop is still pulling from `updates` — this is
                 // the ONE place in the whole pipeline where "continuous
                 // listening" is either true or it isn't: if this line
                 // never logs again after replies for a previous turn
                 // displayed, the STT stream itself stalled (or its
                 // upstream producer did), not anything in this class's own
                 // per-turn task graph — see this class's own doc comment
-                // for why `prepareAndDispatch`/`processTurn` can't be the
-                // cause of that (nothing here awaits either of them).
-                DiagnosticTrace.log("NEXT_TRANSCRIPT_ACCEPTED", "text=\"\(final.prefix(60))\" sessionState=\(state)")
-                await prepareAndDispatch(final: final)
+                // for why neither `handlePartial(_:)` nor
+                // `prepareAndDispatch`/`processTurn` can be the cause of
+                // that (nothing here awaits any of them).
+                DiagnosticTrace.log("NEXT_TRANSCRIPT_ACCEPTED", "sessionState=\(state)")
+                switch update {
+                case .partial(let text):
+                    // Synchronous/cheap — schedules a debounced task and
+                    // returns immediately; never blocks this loop from
+                    // reading the next update. See `handlePartial(_:)`.
+                    handlePartial(text)
+                case .final(let text):
+                    // TEMPORARY — upstream-path diagnostic. Remove once
+                    // root-caused. See DiagnosticTrace.swift.
+                    DiagnosticTrace.log("UPSTREAM_TRACE", "TRANSCRIPT_RECEIVED text=\"\(text.prefix(60))\"")
+                    // A final always supersedes any still-pending partial
+                    // for the same utterance — translation has absolute
+                    // priority, and a partial's job is done the moment the
+                    // authoritative text exists.
+                    partialDebounceTask?.cancel()
+                    partialDebounceTask = nil
+                    await prepareAndDispatch(final: text)
+                }
             }
             if state == .listening { state = .idle }
         } catch {
@@ -404,6 +532,15 @@ final class LiveTranslationService {
         let turnStartTime = Date()
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         DiagnosticTrace.log("SHORT_UTTERANCE_TRACE", "RECEIVED raw=\"\(rawText)\" normalized=\"\(text)\"")
+
+        // The final always ends whatever utterance was streaming partials
+        // — reuse its already-claimed display-ordering slot (if any) so
+        // the eventual translation display participates in the SAME
+        // newest-wins ordering as any partial that already showed on
+        // screen (see `utteranceSequence`'s doc comment), then clear all
+        // partial-streaming state so the NEXT utterance starts fresh.
+        let reusedSequence = utteranceSequence
+        resetUtteranceState()
 
         guard !text.isEmpty else {
             DiagnosticTrace.log("SHORT_UTTERANCE_TRACE", "REJECTED reason=emptyAfterTrim")
@@ -475,13 +612,194 @@ final class LiveTranslationService {
         // complementary proof that the STT stream itself keeps producing.
         DiagnosticTrace.log("LISTENER_STILL_ACTIVE", "turnID=\(turn.id) sessionState=\(state)")
 
-        turnSequenceCounter += 1
-        let sequence = turnSequenceCounter
+        let sequence: Int
+        if let reusedSequence {
+            sequence = reusedSequence
+        } else {
+            // No partial ever streamed for this utterance (a transcriber
+            // that doesn't emit partials, or the very first final of a
+            // session) — claim a fresh slot exactly as before.
+            turnSequenceCounter += 1
+            sequence = turnSequenceCounter
+        }
         let task = Task { [weak self] in
             guard let self else { return }
             await self.processTurn(turn, text: text, languageCode: languageCode, turnStartTime: turnStartTime, sequence: sequence)
         }
         turnTasks.append(task)
+    }
+
+    /// Clears every piece of state associated with the utterance currently
+    /// streaming partials — called both when that utterance's own final
+    /// arrives (it's done, the next one starts fresh) and on `stop()`
+    /// (nothing should survive a stopped session). See `utteranceID`'s and
+    /// `partialDebounceTask`'s own doc comments for why each field exists.
+    private func resetUtteranceState() {
+        partialDebounceTask?.cancel()
+        partialDebounceTask = nil
+        utteranceID = nil
+        utteranceSequence = nil
+        utteranceLanguageCode = nil
+        currentPartialTranscript = nil
+        currentPartialTranslation = nil
+    }
+
+    /// Language for a JUST-STARTED utterance's partials — deliberately
+    /// never runs real detection (`translator.detectedLanguageCode`):
+    /// a growing partial's first few words carry too little/unreliable
+    /// signal, and detection itself has real latency that would undercut
+    /// the entire point of streaming translation. Explicit modes resolve
+    /// instantly, as always; Auto mode reuses whatever this session has
+    /// already locked onto (`nil` if not locked yet — that utterance's
+    /// partials simply show source text only, with no translation, until
+    /// its OWN final runs the full `resolveSourceLanguage(for:)` path,
+    /// which can lock the session for every utterance after it).
+    private func resolveLanguageForNewUtterance() -> String? {
+        if let explicitCode = sourceLanguageMode.explicitLanguageCode {
+            return explicitCode
+        }
+        return autoLockedLanguage
+    }
+
+    /// Handles one `.partial(_:)` update — see this class's own doc
+    /// comment ("Streaming translation") for the full design. Entirely
+    /// synchronous and cheap: updates `currentPartialTranscript`
+    /// immediately (local state, no I/O), then schedules (replacing any
+    /// previous one) a debounced `Task` that will translate-and-display
+    /// this text if nothing newer supersedes it within
+    /// `partialDebounceInterval`. Never awaited by `consume(_:)`'s loop.
+    private func handlePartial(_ rawText: String) {
+        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, text != currentPartialTranscript else { return }
+
+        if utteranceID == nil {
+            let newUtteranceID = UUID()
+            utteranceID = newUtteranceID
+            turnSequenceCounter += 1
+            utteranceSequence = turnSequenceCounter
+            utteranceLanguageCode = resolveLanguageForNewUtterance()
+            currentPartialTranslation = nil
+            DiagnosticTrace.log(
+                "UTTERANCE_STARTED",
+                "id=\(newUtteranceID.uuidString) language=\(utteranceLanguageCode ?? "unresolved")"
+            )
+        }
+        currentPartialTranscript = text
+        DiagnosticTrace.log("PARTIAL_TRANSCRIPT_RECEIVED", "text=\"\(text.prefix(60))\"")
+
+        guard let utteranceID, let utteranceSequence else { return } // always set just above
+        let languageCode = utteranceLanguageCode
+        let partialArrivedAt = Date()
+
+        partialGenerationCounter += 1
+        let generation = partialGenerationCounter
+
+        partialDebounceTask?.cancel()
+        partialDebounceTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.partialDebounceInterval)
+            guard !Task.isCancelled else { return }
+            await self?.settlePartial(
+                text: text,
+                languageCode: languageCode,
+                utteranceID: utteranceID,
+                utteranceSequence: utteranceSequence,
+                generation: generation,
+                partialArrivedAt: partialArrivedAt
+            )
+        }
+    }
+
+    /// Runs after `partialDebounceInterval` of no newer partial for the
+    /// same utterance. Translates the now-stable partial (if a language
+    /// is known) and updates G2 in place — but only after confirming,
+    /// BOTH before and after the network round trip, that nothing newer
+    /// (a later partial, or this utterance's own final) has already
+    /// superseded it. This is the literal "stale partial translation
+    /// responses never overwrite newer text" requirement: the check
+    /// before the call is cheap and catches the common case (a burst of
+    /// rapid partials cancelling each other's debounce); the check after
+    /// is the one that actually matters, since the translate call itself
+    /// is the only place real time passes where something newer could
+    /// legitimately arrive.
+    private func settlePartial(
+        text: String,
+        languageCode: String?,
+        utteranceID: UUID,
+        utteranceSequence: Int,
+        generation: Int,
+        partialArrivedAt: Date
+    ) async {
+        guard self.utteranceID == utteranceID, generation == partialGenerationCounter else {
+            DiagnosticTrace.log("PARTIAL_TRANSLATION_STALE", "reason=supersededBeforeStart generation=\(generation)")
+            return
+        }
+
+        guard let languageCode, languageCode != Self.ukrainianLanguageCode else {
+            // No language known yet for this utterance (Auto, unlocked)
+            // or Ukrainian speech — show the source partial alone; there
+            // is nothing to translate.
+            await displayPartial(source: text, translation: nil, utteranceID: utteranceID, utteranceSequence: utteranceSequence)
+            return
+        }
+
+        let requestStart = Date()
+        DiagnosticTrace.log(
+            "LATENCY_TRACE",
+            "PARTIAL_TO_TRANSLATION_REQUEST_MS value=\(Int(requestStart.timeIntervalSince(partialArrivedAt) * 1000))"
+        )
+        var translated: String?
+        do {
+            translated = try await translateWithTimeout(text, from: languageCode)
+        } catch {
+            // A failed/timed-out partial translation is not worth
+            // surfacing as an error — this debounce tick simply shows
+            // source-only; the next partial (or the eventual, always-
+            // retried final) tries again. A partial never blocks on or
+            // retries its own failure.
+            translated = nil
+            DiagnosticTrace.log("LIVE_TRACE", "partial translation failed/timed out for \"\(text.prefix(60))\": \(error)")
+        }
+        let translationDoneAt = Date()
+        DiagnosticTrace.log(
+            "LATENCY_TRACE",
+            "PARTIAL_TRANSLATION_LATENCY_MS value=\(Int(translationDoneAt.timeIntervalSince(requestStart) * 1000))"
+        )
+
+        guard self.utteranceID == utteranceID, generation == partialGenerationCounter else {
+            DiagnosticTrace.log("PARTIAL_TRANSLATION_STALE", "reason=supersededDuringTranslation generation=\(generation)")
+            return
+        }
+
+        currentPartialTranslation = translated
+        await displayPartial(source: text, translation: translated, utteranceID: utteranceID, utteranceSequence: utteranceSequence)
+        DiagnosticTrace.log(
+            "LATENCY_TRACE",
+            "PARTIAL_TO_G2_MS value=\(Int(Date().timeIntervalSince(partialArrivedAt) * 1000))"
+        )
+    }
+
+    /// Updates G2 in place with a provisional (source-only, or source +
+    /// partial translation) page — never a `ConversationTurn`, never
+    /// persisted anywhere, never sent to Glasses Chat (see this class's
+    /// own doc comment on that requirement). Gated by the SAME
+    /// sequence-based "has anything newer already displayed" guard the
+    /// final-turn pipeline uses (`highestDisplayedTurnSequence`), so a
+    /// late-settling partial for an utterance that's already been
+    /// superseded — by a newer utterance's own partials, or by its final
+    /// — can never clobber what's already on screen.
+    private func displayPartial(source: String, translation: String?, utteranceID: UUID, utteranceSequence: Int) async {
+        guard utteranceSequence >= highestDisplayedTurnSequence else {
+            DiagnosticTrace.log("PARTIAL_DISPLAY_SKIPPED", "reason=staleUtterance(newerAlreadyDisplayed)")
+            return
+        }
+        highestDisplayedTurnSequence = utteranceSequence
+        let page = GlassesPresentationLayer.streamingPage(source: source, translation: translation)
+        do {
+            try await glassesTransport.displayPages([page])
+            currentTurnDisplayState = .streaming(utteranceID: utteranceID)
+        } catch {
+            DiagnosticTrace.log("LIVE_TRACE", "displayPages (partial) failed: \(error)")
+        }
     }
 
     /// The independent, per-turn pipeline: translation (bounded by

@@ -36,7 +36,7 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
     private var socket: RealtimeTranscriptionSocket?
     private var pcmConsumerTask: Task<Void, Never>?
     private var eventConsumerTask: Task<Void, Never>?
-    private var continuation: AsyncThrowingStream<String, Error>.Continuation?
+    private var continuation: AsyncThrowingStream<TranscriptionUpdate, Error>.Continuation?
 
     /// The most recent `language_info` the backend reported, if any —
     /// captured for future use/observability only. `ContinuousTranscribing`'s
@@ -64,7 +64,7 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
         self.init(makeSocket: { URLSessionRealtimeTranscriptionSocket(apiClient: apiClient) })
     }
 
-    func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<String, Error> {
+    func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<TranscriptionUpdate, Error> {
         stopInternal()
         isActive = true
         hasReconnectedSinceLastSuccess = false
@@ -90,7 +90,7 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
         from eventStream: AsyncThrowingStream<RealtimeTranscriptionEvent, Error>,
         pcmUpdates: AsyncStream<Data>,
         socket newSocket: RealtimeTranscriptionSocket
-    ) throws -> AsyncThrowingStream<String, Error> {
+    ) throws -> AsyncThrowingStream<TranscriptionUpdate, Error> {
         return AsyncThrowingStream { continuation in
             self.continuation = continuation
 
@@ -137,15 +137,20 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
                 switch event {
                 case .sessionStarted:
                     hasReconnectedSinceLastSuccess = false
-                case .partialTranscript:
-                    continue // ContinuousTranscribing yields finalized utterances only
+                case .partialTranscript(let text):
+                    // Streaming-translation path (major performance pass):
+                    // previously discarded — see TranscriptionUpdate's doc
+                    // comment for why surfacing this is what actually makes
+                    // "translation appears near-real-time" possible.
+                    DiagnosticTrace.log("LATENCY_TRACE", "AUDIO_TO_PARTIAL_TS value=\(Date().timeIntervalSince1970)")
+                    continuation?.yield(.partial(text))
                 case .finalTranscript(let text):
                     hasReconnectedSinceLastSuccess = false
                     // TEMPORARY — upstream-path diagnostic. Remove once
                     // root-caused. See DiagnosticTrace.swift.
                     DiagnosticTrace.log("UPSTREAM_TRACE", "STT_FINAL text=\"\(text.prefix(60))\"")
                     DiagnosticTrace.log("8B_TRACE", "FINAL_CALLBACK yielding final transcript, length=\(text.count)")
-                    continuation?.yield(text)
+                    continuation?.yield(.final(text))
                 case .languageInfo(let languages):
                     lastKnownLanguages = languages
                 case .providerError(let message):

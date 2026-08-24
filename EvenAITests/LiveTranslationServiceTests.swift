@@ -879,6 +879,243 @@ struct LiveTranslationServiceTests {
         #expect(!displayed.contains(["phrase A\n\nUA: А-переклад"]))
         #expect(store.session.turns.map(\.originalText).sorted() == ["phrase A", "phrase B"])
     }
+
+    // MARK: - Streaming translation (major performance pass)
+
+    /// The core streaming behavior: a partial transcript, on its own,
+    /// produces a provisional translation and updates G2 in place — no
+    /// need to wait for a final. `ScriptedContinuousTranscriber` (no
+    /// partials) can't express this; `ManualContinuousTranscriber
+    /// .emitPartial(_:)` can.
+    @Test("a partial transcript triggers a provisional translation and updates G2 in place")
+    func partialTranscriptTriggersProvisionalTranslation() async throws {
+        let spy = SpyGlassesTransport()
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(languageCodes: ["Where are": "en"], translation: "Куди ви"),
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.en)
+
+        await service.start()
+        await transcriber.emitPartial("Where are")
+        try? await Task.sleep(for: .milliseconds(250)) // past the 150ms partial debounce
+
+        #expect(service.currentPartialTranscript == "Where are")
+        #expect(service.currentPartialTranslation == "Куди ви")
+        #expect(await spy.displayedPageSets == [["Where are\n\nUA: Куди ви"]])
+    }
+
+    /// A second, later partial for the same utterance supersedes the
+    /// first before its debounce ever fires — only the newest partial's
+    /// translation is ever requested, matching "only newest partial
+    /// matters, never queue dozens of old requests."
+    @Test("a newer partial supersedes an older one before its debounce fires — only the latest text is ever translated/displayed")
+    func newerPartialSupersedesOlderBeforeDebounce() async throws {
+        let spy = SpyGlassesTransport()
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(
+                languageCodes: ["Where": "en", "Where are you going": "en"],
+                translation: "Куди ви йдете?"
+            ),
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.en)
+
+        await service.start()
+        await transcriber.emitPartial("Where")
+        try? await Task.sleep(for: .milliseconds(40)) // well under the 150ms debounce
+        await transcriber.emitPartial("Where are you going")
+        try? await Task.sleep(for: .milliseconds(250))
+
+        #expect(service.currentPartialTranscript == "Where are you going")
+        let displayed = await spy.displayedPageSets
+        // Exactly one display call — "Where" never got far enough to
+        // translate or display anything at all.
+        #expect(displayed.count == 1)
+        #expect(displayed == [["Where are you going\n\nUA: Куди ви йдете?"]])
+    }
+
+    /// The harder case: "Where"'s debounce DOES fire and its (slow)
+    /// translation call is genuinely in flight when "Where are you going"
+    /// arrives — its own (fast) translation settles first. "Where"'s
+    /// stale response, whenever it eventually resolves, must never
+    /// overwrite what's already on screen.
+    @Test("a stale, slower partial translation response can never overwrite a newer, faster-settling partial's result")
+    func stalePartialTranslationNeverOverwritesNewer() async throws {
+        let spy = SpyGlassesTransport()
+        let transcriber = ManualContinuousTranscriber()
+        let translator = DelayedLanguageTranslator(
+            languageCodes: ["Where": "en", "Where are you going": "en"],
+            delays: ["Where": .milliseconds(400)],
+            translations: ["Where": "Де", "Where are you going": "Куди ви йдете?"]
+        )
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: transcriber,
+            translator: translator,
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.en)
+
+        await service.start()
+        await transcriber.emitPartial("Where")
+        // Past the 150ms debounce — "Where"'s slow (400ms) translate call
+        // is now genuinely in flight, not merely scheduled.
+        try? await Task.sleep(for: .milliseconds(220))
+        await transcriber.emitPartial("Where are you going")
+        // Past both the new debounce AND "Where"'s full 400ms delay.
+        try? await Task.sleep(for: .milliseconds(600))
+
+        #expect(service.currentPartialTranscript == "Where are you going")
+        #expect(service.currentPartialTranslation == "Куди ви йдете?")
+        let displayed = await spy.displayedPageSets
+        #expect(!displayed.contains { pages in pages.contains { $0.contains("Де") } })
+        #expect(displayed.last == ["Where are you going\n\nUA: Куди ви йдете?"])
+    }
+
+    /// Once the utterance's final arrives, it supersedes ALL provisional
+    /// (partial) state — the authoritative final translation is what
+    /// remains, and the streaming state is cleared for the next
+    /// utterance.
+    @Test("the final translation supersedes provisional partial state and clears it for the next utterance")
+    func finalTranslationSupersedesProvisionalState() async throws {
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(
+                languageCodes: ["Where are": "en", "Where are you going": "en"],
+                translation: "Куди ви йдете?"
+            ),
+            agentContextStore: store,
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.en)
+
+        await service.start()
+        await transcriber.emitPartial("Where are")
+        try? await Task.sleep(for: .milliseconds(250))
+        #expect(service.currentPartialTranscript != nil)
+
+        await transcriber.emit("Where are you going")
+        try? await Task.sleep(for: .milliseconds(100))
+
+        #expect(service.currentPartialTranscript == nil)
+        #expect(service.currentPartialTranslation == nil)
+        #expect(service.finalTranscript == "Where are you going")
+        #expect(service.finalTranslation == "Куди ви йдете?")
+        #expect(store.session.turns.map(\.originalText) == ["Where are you going"])
+    }
+
+    /// The explicit "no ConversationTurn history for every partial"
+    /// requirement — several partials for one utterance must never
+    /// accumulate into `agentContextStore.session.turns`; only the final
+    /// does, and exactly once.
+    @Test("partials never create ConversationTurn history entries — only the final does, exactly once")
+    func partialsNeverCreateHistoryEntries() async throws {
+        let store = AgentContextStore()
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(
+                languageCodes: ["W": "en", "Wh": "en", "Whe": "en", "Where are you going": "en"],
+                translation: "Куди ви йдете?"
+            ),
+            agentContextStore: store,
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.en)
+
+        await service.start()
+        await transcriber.emitPartial("W")
+        await transcriber.emitPartial("Wh")
+        await transcriber.emitPartial("Whe")
+        try? await Task.sleep(for: .milliseconds(250))
+        #expect(store.session.turns.isEmpty) // still nothing — all partials so far
+
+        await transcriber.emit("Where are you going")
+        try? await Task.sleep(for: .milliseconds(100))
+
+        #expect(store.session.turns.count == 1)
+        #expect(store.session.turns.first?.originalText == "Where are you going")
+    }
+
+    /// The Glasses Chat side of the same requirement: partials must never
+    /// reach Chat persistence at all — only the final's own append call
+    /// does, exactly once.
+    @Test("partials are never persisted to Glasses Chat — only the final turn is, exactly once")
+    func partialsNeverReachGlassesChat() async throws {
+        let chatService = RecordingAppendChatService()
+        let provider = GlassesChatProvider(chatService: chatService, defaults: UserDefaults(suiteName: "test.\(UUID().uuidString)")!)
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(
+                languageCodes: ["Where are": "en", "Where are you going": "en"],
+                translation: "Куди ви йдете?"
+            ),
+            chatService: chatService,
+            glassesChatProvider: provider,
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.en)
+
+        await service.start()
+        await transcriber.emitPartial("Where are")
+        try? await Task.sleep(for: .milliseconds(250))
+        #expect(await chatService.appendedMessages.isEmpty) // partial alone: nothing persisted yet
+
+        await transcriber.emit("Where are you going")
+        try? await Task.sleep(for: .milliseconds(100))
+
+        let appended = await chatService.appendedMessages
+        #expect(appended.count == 1)
+        #expect(appended.first?.content.contains("Where are you going") == true)
+    }
+
+    /// Reply generation for an OLDER, already-finalized turn must never
+    /// delay or block a NEWER utterance's streaming partial translation
+    /// — translation has absolute priority over replies (Section C).
+    @Test("suggested-reply generation for an older turn never blocks or delays a newer utterance's streaming partial translation")
+    func repliesForOlderTurnNeverBlockNewerPartial() async throws {
+        let spy = SpyGlassesTransport()
+        let generator = GatedSuggestedReplyGenerator() // never released — replies for "Guten Tag" hang forever
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(
+                languageCodes: ["Guten Tag": "de", "Wie geht": "de"],
+                translation: "переклад"
+            ),
+            replyGenerator: generator,
+            defaults: freshDefaults()
+        )
+        service.setSourceLanguageMode(.de)
+
+        await service.start()
+        await transcriber.emit("Guten Tag")
+        try? await Task.sleep(for: .milliseconds(60))
+        #expect(await spy.displayedPageSets.count == 1) // translated; replies still gated/pending forever
+
+        // A brand-new utterance's partial must still stream normally.
+        await transcriber.emitPartial("Wie geht")
+        try? await Task.sleep(for: .milliseconds(250))
+
+        #expect(service.currentPartialTranscript == "Wie geht")
+        #expect(service.currentPartialTranslation == "переклад")
+        #expect(await spy.displayedPageSets.count == 2)
+    }
 }
 
 /// Records every `appendMessage` call — used to verify "Glasses Chat"

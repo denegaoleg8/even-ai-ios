@@ -18,19 +18,19 @@ actor ScriptedContinuousTranscriber: ContinuousTranscribing {
     private let finals: [String]
     private let autoFinish: Bool
     private(set) var stopCallCount = 0
-    private var continuation: AsyncThrowingStream<String, Error>.Continuation?
+    private var continuation: AsyncThrowingStream<TranscriptionUpdate, Error>.Continuation?
 
     init(finals: [String], autoFinish: Bool = true) {
         self.finals = finals
         self.autoFinish = autoFinish
     }
 
-    func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<String, Error> {
+    func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<TranscriptionUpdate, Error> {
         let finals = self.finals
         let autoFinish = self.autoFinish
         return AsyncThrowingStream { continuation in
             for final in finals {
-                continuation.yield(final)
+                continuation.yield(.final(final))
             }
             if autoFinish {
                 continuation.finish()
@@ -40,7 +40,7 @@ actor ScriptedContinuousTranscriber: ContinuousTranscribing {
         }
     }
 
-    private func retain(_ continuation: AsyncThrowingStream<String, Error>.Continuation) {
+    private func retain(_ continuation: AsyncThrowingStream<TranscriptionUpdate, Error>.Continuation) {
         self.continuation = continuation
     }
 
@@ -51,26 +51,33 @@ actor ScriptedContinuousTranscriber: ContinuousTranscribing {
     }
 }
 
-/// Like `ScriptedContinuousTranscriber`, but finals are emitted on demand
-/// via `emit(_:)` rather than all up front — lets a test control the real
-/// wall-clock gap between two finals (e.g. to test a time-bounded dedupe
-/// window's boundary), which a fixed, synchronously-yielded array can't.
+/// Like `ScriptedContinuousTranscriber`, but updates are emitted on demand
+/// via `emit(_:)`/`emitPartial(_:)` rather than all up front — lets a test
+/// control the real wall-clock gap between two updates (e.g. to test a
+/// time-bounded dedupe window's boundary, or a streaming-translation race
+/// between two partials), which a fixed, synchronously-yielded array can't.
 actor ManualContinuousTranscriber: ContinuousTranscribing {
     private(set) var stopCallCount = 0
-    private var continuation: AsyncThrowingStream<String, Error>.Continuation?
+    private var continuation: AsyncThrowingStream<TranscriptionUpdate, Error>.Continuation?
 
-    func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<String, Error> {
+    func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<TranscriptionUpdate, Error> {
         AsyncThrowingStream { continuation in
             Task { await self.retain(continuation) }
         }
     }
 
-    private func retain(_ continuation: AsyncThrowingStream<String, Error>.Continuation) {
+    private func retain(_ continuation: AsyncThrowingStream<TranscriptionUpdate, Error>.Continuation) {
         self.continuation = continuation
     }
 
+    /// Emits a final transcript — the old, still-most-common test shape.
     func emit(_ text: String) {
-        continuation?.yield(text)
+        continuation?.yield(.final(text))
+    }
+
+    /// Emits a still-growing partial for the utterance in progress.
+    func emitPartial(_ text: String) {
+        continuation?.yield(.partial(text))
     }
 
     func stopTranscribing() async {
