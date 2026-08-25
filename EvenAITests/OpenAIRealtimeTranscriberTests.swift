@@ -14,7 +14,7 @@ import Foundation
 @MainActor
 @Suite("OpenAIRealtimeTranscriber")
 struct OpenAIRealtimeTranscriberTests {
-    private static let propagationDelay: Duration = .milliseconds(30)
+    private static let propagationDelay: Duration = .milliseconds(200)
 
     private func makeTranscriber(_ factory: FakeRealtimeTranscriptionSocketFactory) -> ContinuousTranscribing {
         // Typed as the protocol itself — this is also the
@@ -243,6 +243,54 @@ struct OpenAIRealtimeTranscriberTests {
 
         let socket = await factory.createdSockets[0]
         #expect(await socket.sentPCM == [chunk])
+        collectTask.cancel()
+    }
+
+    /// Regression test for a real bug found auditing reconnect behavior
+    /// (Conversation Mode follow-up, Section 4): the one long-lived PCM-
+    /// forwarding task is created exactly once, in `startTranscribing`,
+    /// and is deliberately never recreated on reconnect (see
+    /// `buildStream(from:pcmUpdates:socket:)`'s own doc comment for why
+    /// running a second consumer over the same `AsyncStream` concurrently
+    /// would be unsafe) — it used to keep routing every chunk to the
+    /// FIRST socket's `sendPCM(_:)`, captured once and never updated, so
+    /// after any reconnect the new socket's event stream could still
+    /// yield transcripts (as `reconnectsOnceAndResumes` above proves) but
+    /// the backend would never receive another byte of audio to
+    /// transcribe from — a real "recovery" gap this specific test now
+    /// closes.
+    @Test("PCM sent after a reconnect is forwarded to the NEW socket, not the closed original one")
+    func pcmAfterReconnectRoutesToNewSocket() async throws {
+        let factory = FakeRealtimeTranscriptionSocketFactory()
+        let transcriber = makeTranscriber(factory)
+        let (pcmStream, pcmContinuation) = AsyncStream<Data>.makeStream()
+
+        let finals = try await transcriber.startTranscribing(pcmUpdates: pcmStream)
+        let collectTask = Task {
+            for try await _ in finals {}
+        }
+
+        let beforeReconnectChunk = Data([1, 2, 3])
+        pcmContinuation.yield(beforeReconnectChunk)
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        let firstSocket = await factory.createdSockets[0]
+        #expect(await firstSocket.sentPCM == [beforeReconnectChunk])
+
+        await firstSocket.emit(.closed(reason: "network blip"))
+        try? await Task.sleep(for: Self.propagationDelay)
+        #expect(await factory.createdSockets.count == 2)
+        let secondSocket = await factory.createdSockets[1]
+
+        let afterReconnectChunk = Data([4, 5, 6])
+        pcmContinuation.yield(afterReconnectChunk)
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(await secondSocket.sentPCM == [afterReconnectChunk])
+        // The original socket never receives anything past the moment
+        // it closed — no chunk is silently lost into the void, and none
+        // is duplicated onto the wrong socket either.
+        #expect(await firstSocket.sentPCM == [beforeReconnectChunk])
         collectTask.cancel()
     }
 

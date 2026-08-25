@@ -344,7 +344,13 @@ struct LiveTranslationServiceTests {
         try? await Task.sleep(for: .milliseconds(30))
 
         #expect(store.session.turns.count == 2)
-        #expect(await spy.displayedPageSets == [["hello\n\nUA: привіт"], ["hello\n\nUA: привіт"]])
+        // The second "hello" now also carries one page of look-back
+        // context (the first "hello" turn) — see
+        // GlassesPresentationLayer.conversationPages(for:previousTurn:).
+        #expect(await spy.displayedPageSets == [
+            ["hello\n\nUA: привіт"],
+            ["hello\n\nUA: привіт", "Previous:\nhello\n\nUA: привіт"],
+        ])
     }
 
     @Test("the same phrase repeated within the dedupe window is still rejected as a duplicate")
@@ -1540,6 +1546,437 @@ struct LiveTranslationServiceTests {
         #expect(store.session.turns.map(\.originalText) == ["now it works"])
         #expect(await recorder.translateCalls.last?.languageCode == "en")
         #expect(service.state == .listening)
+    }
+
+    // MARK: - Conversation Mode: follow-live / manual G2 navigation
+
+    @Test("a new session always starts with followLive true")
+    func sessionStartsFollowingLive() async throws {
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: []),
+            translator: ScriptedLanguageTranslator(languageCodes: [:]),
+            defaults: freshDefaults()
+        )
+        await service.start()
+        #expect(service.followLive)
+    }
+
+    @Test("navigating G2 to a non-live page (index > 0) disables followLive")
+    func navigatingAwayDisablesFollowLive() async throws {
+        let spy = SpyGlassesTransport()
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(languageCodes: ["first phrase": "en", "second phrase": "en"], translation: "переклад"),
+            defaults: freshDefaults()
+        )
+        await service.start()
+        // Classification is now semantic, derived from
+        // `agentContextStore.session` — it needs an actual live turn
+        // (and, to land on a genuine HISTORY target rather than a
+        // no-op, a turn before it) to have anything to classify a
+        // non-zero index against, matching what real hardware would
+        // require too (nothing to swipe to otherwise).
+        await transcriber.emit("first phrase")
+        await transcriber.emit("second phrase")
+        try? await Task.sleep(for: .milliseconds(100))
+
+        await spy.simulateNavigation(.pageChanged(index: 1))
+        try? await Task.sleep(for: .milliseconds(100))
+
+        #expect(!service.followLive)
+    }
+
+    @Test("returning to page 0 re-enables followLive")
+    func returningToPageZeroReenablesFollowLive() async throws {
+        let spy = SpyGlassesTransport()
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(languageCodes: ["first phrase": "en", "second phrase": "en"], translation: "переклад"),
+            defaults: freshDefaults()
+        )
+        await service.start()
+        await transcriber.emit("first phrase")
+        await transcriber.emit("second phrase")
+        try? await Task.sleep(for: .milliseconds(100))
+
+        await spy.simulateNavigation(.pageChanged(index: 1))
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(!service.followLive)
+
+        await spy.simulateNavigation(.pageChanged(index: 0))
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(service.followLive)
+    }
+
+    @Test("a double-tap (returnToLiveRequested) re-enables followLive even from a deep page")
+    func doubleTapReenablesFollowLive() async throws {
+        let spy = SpyGlassesTransport()
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(languageCodes: ["first phrase": "en", "second phrase": "en"], translation: "переклад"),
+            defaults: freshDefaults()
+        )
+        await service.start()
+        await transcriber.emit("first phrase")
+        await transcriber.emit("second phrase")
+        try? await Task.sleep(for: .milliseconds(100))
+
+        await spy.simulateNavigation(.pageChanged(index: 3))
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(!service.followLive)
+
+        await spy.simulateNavigation(.returnToLiveRequested)
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(service.followLive)
+    }
+
+    /// The core Conversation Mode guarantee for DELIBERATE history
+    /// browsing: navigating onto the trailing look-back page (the
+    /// previous turn's context) must never stop listening or
+    /// translating — new turns keep arriving and keep being recorded in
+    /// history — they just aren't pushed to G2's display while the user
+    /// is deliberately reading something else. Contrast with
+    /// `newSpeechDuringReplyBrowsingReturnsToLive` below: THIS is
+    /// `.browsingHistory`, which new speech must NOT override.
+    @Test("browsing HISTORY (the trailing look-back page): new speech still translates and persists, but G2's display is not overwritten")
+    func newTurnsStillProcessWhileBrowsingHistory() async throws {
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(
+                languageCodes: ["first phrase": "en", "second phrase": "en", "third phrase": "en"],
+                translation: "переклад"
+            ),
+            agentContextStore: store,
+            defaults: freshDefaults()
+        )
+        await service.start()
+        await transcriber.emit("first phrase")
+        try? await Task.sleep(for: .milliseconds(30))
+        // The second turn's own display includes one page of look-back
+        // context for the first turn — page 1 of THIS page set is the
+        // genuine trailing HISTORY page, not a reply page.
+        await transcriber.emit("second phrase")
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(service.followLive)
+
+        await spy.simulateNavigation(.pageChanged(index: 1))
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(!service.followLive)
+        // Semantic, not positional: browsing history is anchored to the
+        // FIRST turn's own identity, not "whatever page 1 happened to
+        // be" — see `DisplayMode`'s own doc comment.
+        guard case .browsingHistory(let anchorTurnID) = service.displayMode else {
+            Issue.record("expected .browsingHistory, got \(service.displayMode)")
+            return
+        }
+        #expect(anchorTurnID == store.session.turns.first(where: { $0.originalText == "first phrase" })?.id)
+        let displayCountWhileAway = await spy.displayedPageSets.count
+
+        // A third turn arrives while the user is deliberately browsing
+        // history — must still translate and persist...
+        await transcriber.emit("third phrase")
+        try? await Task.sleep(for: .milliseconds(30))
+
+        #expect(store.session.turns.map(\.originalText) == ["first phrase", "second phrase", "third phrase"])
+        #expect(store.session.turns.last?.ukrainianTranslation == "переклад")
+        // ...but G2's display, which the user deliberately navigated to
+        // review, must not have been touched — unlike reply browsing.
+        #expect(await spy.displayedPageSets.count == displayCountWhileAway)
+        guard case .browsingHistory(let anchorTurnIDAfter) = service.displayMode else {
+            Issue.record("expected .browsingHistory to persist, got \(service.displayMode)")
+            return
+        }
+        #expect(anchorTurnIDAfter == anchorTurnID)
+    }
+
+    /// The core Conversation Mode guarantee for reply browsing: unlike
+    /// deliberate history browsing above, reply pages are temporary,
+    /// assistive UI for the turn that just finished — new speech must
+    /// IMMEDIATELY reclaim the live display, with no double-tap required.
+    @Test("browsing REPLY pages: new speech automatically reclaims the live display — no double-tap required")
+    func newSpeechDuringReplyBrowsingReturnsToLive() async throws {
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let transcriber = ManualContinuousTranscriber()
+        let generator = FakeSuggestedReplyGenerator(defaultReplies: [
+            SuggestedReply(originalLanguageText: "Sure", ukrainianText: "Так", ordering: 0),
+            SuggestedReply(originalLanguageText: "No thanks", ukrainianText: "Ні, дякую", ordering: 1),
+        ])
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(
+                languageCodes: ["first phrase": "en", "second phrase": "en"],
+                translation: "переклад"
+            ),
+            agentContextStore: store,
+            replyGenerator: generator,
+            defaults: freshDefaults()
+        )
+        await service.start()
+        await transcriber.emit("first phrase")
+        // Let both the translation and the two-reply generation settle
+        // — TWO reply pages means page 1 is a genuine reply page,
+        // distinct from page 0 (a single reply stays on page 0 alongside
+        // the header — see `GlassesPresentationLayer.pages(for:)`).
+        try? await Task.sleep(for: .milliseconds(80))
+        #expect(store.session.turns.first?.suggestedReplies.count == 2)
+
+        // Swipe onto reply page 1 — still part of turn 1's own page set,
+        // not history (there's no previous turn yet). Page 0 already
+        // shows `suggestedReplies[0]` merged with the live header (see
+        // `GlassesPresentationLayer.pages(for:)`); page 1 is the first
+        // page distinctly showing `suggestedReplies[1]`.
+        await spy.simulateNavigation(.pageChanged(index: 1))
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(!service.followLive)
+        // Semantic, not positional: this is turn 1's own reply index 1,
+        // not "whatever page 1 happened to be" — see `DisplayMode`'s own
+        // doc comment.
+        guard case .browsingReplies(let turnID, let replyIndex) = service.displayMode else {
+            Issue.record("expected .browsingReplies, got \(service.displayMode)")
+            return
+        }
+        #expect(turnID == store.session.turns.first?.id)
+        #expect(replyIndex == 1)
+        let displayCountWhileBrowsingReplies = await spy.displayedPageSets.count
+
+        // New speech starts — must IMMEDIATELY reclaim the live display.
+        await transcriber.emit("second phrase")
+        try? await Task.sleep(for: .milliseconds(30))
+
+        #expect(service.displayMode == .followLive)
+        #expect(store.session.turns.map(\.originalText) == ["first phrase", "second phrase"])
+        // The second turn's own translation WAS pushed to G2 — display
+        // count grew, unlike the history-browsing case above.
+        let finalCount = await spy.displayedPageSets.count
+        #expect(finalCount > displayCountWhileBrowsingReplies)
+        #expect(await spy.displayedPageSets.last?.first?.contains("second phrase") == true)
+    }
+
+    @Test("returning to live redisplays the freshest available content")
+    func returningToLiveRedisplaysFreshContent() async throws {
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт"),
+            agentContextStore: store,
+            defaults: freshDefaults()
+        )
+        await service.start()
+        await transcriber.emit("hello there")
+        try? await Task.sleep(for: .milliseconds(60))
+        let countAfterFirstTurn = await spy.displayedPageSets.count
+
+        await spy.simulateNavigation(.pageChanged(index: 1))
+        try? await Task.sleep(for: .milliseconds(30))
+
+        await spy.simulateNavigation(.returnToLiveRequested)
+        try? await Task.sleep(for: .milliseconds(30))
+
+        // Returning to live triggers a fresh redisplay, even with no new
+        // turn having arrived — this is the "catch up" behavior.
+        let finalCount = await spy.displayedPageSets.count
+        #expect(finalCount > countAfterFirstTurn)
+        #expect(await spy.displayedPageSets.last == ["hello there\n\nUA: привіт"])
+    }
+
+    // MARK: - Conversation Mode: audio source selection
+
+    @Test("audio source defaults to G2 mic")
+    func audioSourceDefaultsToG2Mic() {
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: []),
+            translator: ScriptedLanguageTranslator(languageCodes: [:]),
+            defaults: freshDefaults()
+        )
+        #expect(service.audioSource == .g2Mic)
+    }
+
+    @Test("starting a session applies the persisted audio source preference before enabling the mic")
+    func startAppliesAudioSourcePreference() async throws {
+        let spy = SpyGlassesTransport()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: []),
+            translator: ScriptedLanguageTranslator(languageCodes: [:]),
+            defaults: freshDefaults()
+        )
+        service.setAudioSource(.phoneMic)
+
+        await service.start()
+
+        #expect(await spy.audioSourceCalls.last == .phoneMic)
+    }
+
+    @Test("switching audio source mid-session propagates immediately, no restart required")
+    func switchingAudioSourceMidSessionPropagatesImmediately() async throws {
+        let spy = SpyGlassesTransport()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: []),
+            translator: ScriptedLanguageTranslator(languageCodes: [:]),
+            defaults: freshDefaults()
+        )
+        await service.start()
+        #expect(await spy.audioSourceCalls.last == .g2Mic)
+
+        service.setAudioSource(.phoneMic)
+        try? await Task.sleep(for: .milliseconds(30))
+
+        #expect(service.audioSource == .phoneMic)
+        #expect(await spy.audioSourceCalls.last == .phoneMic)
+    }
+
+    @Test("audio source selection survives across LiveTranslationService instances, simulating an app relaunch")
+    func audioSourcePersistsAcrossRelaunch() {
+        let defaults = freshDefaults()
+        let service1 = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: []),
+            translator: ScriptedLanguageTranslator(languageCodes: [:]),
+            defaults: defaults
+        )
+        service1.setAudioSource(.phoneMic)
+
+        let service2 = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: []),
+            translator: ScriptedLanguageTranslator(languageCodes: [:]),
+            defaults: defaults
+        )
+        #expect(service2.audioSource == .phoneMic)
+    }
+
+    // MARK: - Conversation Mode: Meeting Mode (reply priority)
+
+    @Test("conversation mode defaults to standard")
+    func conversationModeDefaultsToStandard() {
+        let service = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: []),
+            translator: ScriptedLanguageTranslator(languageCodes: [:]),
+            defaults: freshDefaults()
+        )
+        #expect(service.conversationMode == .standard)
+    }
+
+    @Test("in Standard mode, suggested replies auto-display on G2 exactly as before")
+    func standardModeAutoDisplaysReplies() async throws {
+        let generator = FakeSuggestedReplyGenerator(defaultReplies: [
+            SuggestedReply(originalLanguageText: "Sure", ukrainianText: "Так", ordering: 0),
+        ])
+        let spy = SpyGlassesTransport()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
+            translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
+            replyGenerator: generator,
+            defaults: freshDefaults()
+        )
+        await service.start()
+        try? await Task.sleep(for: .milliseconds(150))
+
+        #expect(await spy.displayedPageSets.count == 2) // translation, then +replies
+    }
+
+    /// Meeting Mode's core guarantee: replies are still generated and
+    /// recorded (Chat/history unaffected) but never auto-pushed to G2 —
+    /// the screen stays dedicated to the conversation transcript.
+    @Test("in Meeting mode, suggested replies are generated and recorded but never auto-displayed on G2")
+    func meetingModeSuppressesReplyAutoDisplay() async throws {
+        let generator = FakeSuggestedReplyGenerator(defaultReplies: [
+            SuggestedReply(originalLanguageText: "Sure", ukrainianText: "Так", ordering: 0),
+        ])
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
+            translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
+            agentContextStore: store,
+            replyGenerator: generator,
+            defaults: freshDefaults()
+        )
+        service.setConversationMode(.meeting)
+
+        await service.start()
+        try? await Task.sleep(for: .milliseconds(80))
+
+        // Only the translation was ever pushed to G2 — no second,
+        // reply-carrying display call.
+        #expect(await spy.displayedPageSets.count == 1)
+        // But the reply itself is still recorded, for Glasses Chat/history.
+        #expect(store.session.latestTurn?.suggestedReplies.map(\.originalLanguageText) == ["Sure"])
+    }
+
+    @Test("conversation mode selection survives across LiveTranslationService instances, simulating an app relaunch")
+    func conversationModePersistsAcrossRelaunch() {
+        let defaults = freshDefaults()
+        let service1 = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: []),
+            translator: ScriptedLanguageTranslator(languageCodes: [:]),
+            defaults: defaults
+        )
+        service1.setConversationMode(.meeting)
+
+        let service2 = LiveTranslationService(
+            glassesTransport: SpyGlassesTransport(),
+            transcriber: ScriptedContinuousTranscriber(finals: []),
+            translator: ScriptedLanguageTranslator(languageCodes: [:]),
+            defaults: defaults
+        )
+        #expect(service2.conversationMode == .meeting)
+    }
+
+    // MARK: - Conversation Mode: explicit returnToLive()
+
+    @Test("calling returnToLive() explicitly re-enables followLive and redisplays the freshest content, from the iPhone side")
+    func explicitReturnToLiveWorks() async throws {
+        let spy = SpyGlassesTransport()
+        let transcriber = ManualContinuousTranscriber()
+        let service = LiveTranslationService(
+            glassesTransport: spy,
+            transcriber: transcriber,
+            translator: ScriptedLanguageTranslator(languageCodes: ["hi there": "en", "hello there": "en"], translation: "привіт"),
+            defaults: freshDefaults()
+        )
+        await service.start()
+        // Two turns — classification is semantic, derived from
+        // `agentContextStore.session`, and needs a turn before the live
+        // one for a non-zero index to resolve to a genuine history
+        // target (see `navigatingAwayDisablesFollowLive`'s own comment).
+        await transcriber.emit("hi there")
+        await transcriber.emit("hello there")
+        try? await Task.sleep(for: .milliseconds(60))
+
+        await spy.simulateNavigation(.pageChanged(index: 2))
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(!service.followLive)
+
+        await service.returnToLive()
+
+        #expect(service.followLive)
+        #expect(await spy.displayedPageSets.last == [
+            "hello there\n\nUA: привіт",
+            "Previous:\nhi there\n\nUA: привіт",
+        ])
     }
 }
 

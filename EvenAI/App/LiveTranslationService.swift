@@ -148,6 +148,59 @@ final class LiveTranslationService {
         case withReplies(turnID: ConversationTurn.ID, replyCount: Int)
     }
 
+    /// What G2's display is currently doing, relative to the live
+    /// conversation — replaces a bare `followLive: Bool` because two very
+    /// different things used to collapse into one "not following live"
+    /// state. Deliberately SEMANTIC, not positional: each case carries
+    /// the actual conversation identity it refers to, never a raw G2
+    /// page index.
+    ///
+    /// - `.browsingReplies(turnID:replyIndex:)`: the user is cycling
+    ///   reply pages for the CURRENT/latest turn — temporary, assistive
+    ///   UI, not a deliberate look back through history. New speech must
+    ///   reclaim this automatically (see
+    ///   `reclaimLiveDisplayIfBrowsingReplies(reason:)`) — no double-tap
+    ///   should be required.
+    /// - `.browsingHistory(anchorTurnID:)`: the user swiped past the
+    ///   replies into the one bounded look-back window (the previous
+    ///   turn's context, keyed by that turn's own id — see
+    ///   `renderHistoryViewport(anchorTurnID:)`). This IS a deliberate
+    ///   look at history; new speech must NOT yank the display back — it
+    ///   keeps capturing/persisting/showing a "↓ LIVE" indicator until
+    ///   the user returns manually.
+    ///
+    /// ## The race this eliminates
+    ///
+    /// A prior revision inferred which of the two a raw `pageChanged
+    /// (index:)` event meant by comparing it against
+    /// `lastDisplayedHistoryPageIndex` — bookkeeping captured at the
+    /// moment a page set was last SENT. Under rapid speech, a turn's own
+    /// reply-generation stage can lose the "newest turn already
+    /// displayed" staleness race (by design — see `processTurn`'s doc
+    /// comment) and simply never run, so the trailing history page for
+    /// THAT specific send could be silently missing even though the
+    /// underlying conversation history (`agentContextStore.session
+    /// .turns`) already had everything needed to render it. A user
+    /// swiping toward history at exactly that instant would be
+    /// misclassified as `.browsingReplies`, purely because of what had
+    /// or hadn't finished RENDERING — not because of anything about
+    /// their actual intent.
+    ///
+    /// The fix: `applyPageIndexNavigation(_:)` never trusts "what got
+    /// sent." It reclassifies fresh, every time, directly from
+    /// `agentContextStore.session` — the logical, always-consistent
+    /// source of truth — at the exact moment the navigation event
+    /// arrives, and `renderHistoryViewport(anchorTurnID:)` then renders
+    /// the correct content on demand, regardless of whatever
+    /// (potentially stale/incomplete) content happened to already be on
+    /// that G2 page slot. Page generation follows `DisplayMode`; it is
+    /// never the other way around.
+    enum DisplayMode: Sendable, Equatable {
+        case followLive
+        case browsingHistory(anchorTurnID: ConversationTurn.ID)
+        case browsingReplies(turnID: ConversationTurn.ID, replyIndex: Int)
+    }
+
     private(set) var state: State = .idle {
         didSet {
             guard state != oldValue else { return }
@@ -199,6 +252,32 @@ final class LiveTranslationService {
     /// so persistence and the Auto-lock reset always happen together, never
     /// separately. Loaded from `defaults` at construction; see `init`.
     private(set) var sourceLanguageMode: SourceLanguageMode
+    /// Which physical microphone Live Translation captures from — see
+    /// `AudioSource`'s own doc comment. `private(set)`, changed only
+    /// through `setAudioSource(_:)`. Loaded from `defaults` at
+    /// construction, same pattern as `sourceLanguageMode`.
+    private(set) var audioSource: AudioSource
+    /// See `ConversationMode`'s own doc comment. `private(set)`, changed
+    /// only through `setConversationMode(_:)`. Loaded from `defaults` at
+    /// construction, same pattern as `sourceLanguageMode`/`audioSource`.
+    private(set) var conversationMode: ConversationMode
+    /// Conversation Mode: see `DisplayMode`'s own doc comment.
+    /// Listening/translation/history recording are NEVER gated on this —
+    /// only the act of actually pushing a new display update to G2 is
+    /// (see `displayPartial`/`processTurn`/`generateSuggestedReplies`'s
+    /// own "while not following live, skip the send" guards). Reset to
+    /// `.followLive` in `start()` — a new session always begins on the
+    /// live page. Updated from `GlassesNavigationEvent`s via
+    /// `navigationObserverTask`, and automatically reclaimed from
+    /// `.browsingReplies` (never `.browsingHistory`) the moment new
+    /// speech starts — see `reclaimLiveDisplayIfBrowsingReplies(reason:)`.
+    private(set) var displayMode: DisplayMode = .followLive
+    /// Back-compat convenience some call sites/tests read directly —
+    /// `true` iff `displayMode == .followLive`. Both `.browsingHistory`
+    /// and `.browsingReplies` mean "don't push a new display update right
+    /// now," which is all the three-way `displayPartial`/`processTurn`/
+    /// `generateSuggestedReplies` guards ever needed to know.
+    var followLive: Bool { displayMode == .followLive }
     /// Auto mode's session-scoped language lock — see
     /// `resolveSourceLanguage(for:)`'s doc comment for the full hysteresis
     /// behavior this drives. `nil` means "not yet locked this session";
@@ -238,6 +317,10 @@ final class LiveTranslationService {
 
     private var consumeTask: Task<Void, Never>?
     private var connectionObserverTask: Task<Void, Never>?
+    /// Subscribes to `glassesTransport.navigationEvents()` — drives
+    /// `followLive`. Started in `start()`, cancelled in `stop()`: G2
+    /// navigation is only meaningful while a session is actually live.
+    private var navigationObserverTask: Task<Void, Never>?
     /// One entry per in-flight per-turn pipeline task (translation →
     /// display) AND per-turn reply-generation task — tracked only so
     /// `stop()` can cancel every still-running piece of work, satisfying
@@ -325,6 +408,40 @@ final class LiveTranslationService {
     /// `observeConnection()` so a disconnect/reconnect cycle before the
     /// user has ever started Live Translation doesn't do anything.
     private var isEnabledIntent = false
+    /// Session-lifetime reliability counters — see
+    /// `ConversationSessionMetrics`'s own doc comment for why this is a
+    /// plain, directly-testable value type rather than loose private
+    /// vars: `DiagnosticTrace` only ever renders a snapshot of it
+    /// (`CONVERSATION_SESSION_METRICS`), tests read it directly via
+    /// `currentSessionMetrics()`. Reset in `start()`.
+    private(set) var sessionMetrics = ConversationSessionMetrics()
+    /// Wall-clock time `start()` last began listening — `duration=` in
+    /// `CONVERSATION_SESSION_METRICS`. `nil` before the first `start()`.
+    private var sessionStartedAt: Date?
+
+    // MARK: - Audio-path reliability instrumentation (Section 10/17 audit)
+    //
+    // The SDK hands over raw PCM `Data` with no per-chunk sequence number
+    // or embedded capture timestamp (confirmed by reading
+    // `MentraGlassesTransport`'s `didReceiveMicPcm` delegate callback —
+    // there is nothing else in the payload to key off of). That makes an
+    // EXACT dropped-chunk count structurally impossible to derive from
+    // this client alone; what `recordAudioChunk(_:)` writes into
+    // `sessionMetrics` is a SUSPECTED estimate, derived from client-
+    // observed wall-clock arrival gaps against a self-adapting expected-
+    // interval baseline. This is deliberately reported as "suspected,"
+    // never presented as exact. The two fields below are pure timing
+    // SCRATCH STATE used to derive those counters — not reportable
+    // metrics themselves, which is why they live here rather than in
+    // `ConversationSessionMetrics`.
+    private var audioFirstByteAt: Date?
+    private var lastAudioChunkAt: Date?
+    /// Exponential moving average of "normal" (non-anomalous) inter-
+    /// chunk gaps, in milliseconds — the adaptive baseline
+    /// `recordAudioChunk(_:)` compares each new gap against. `nil` until
+    /// the second chunk of the session arrives (nothing to compare the
+    /// first gap to).
+    private var audioExpectedIntervalMs: Double?
 
     private static let ukrainianLanguageCode = "uk"
     /// The primary supported source languages — everything requirement #1
@@ -366,6 +483,8 @@ final class LiveTranslationService {
     /// not SwiftData (this is a lightweight per-device UI preference, not
     /// synced/shared conversation data).
     private static let sourceLanguageModeDefaultsKey = "com.evenai.liveTranslation.sourceLanguageMode"
+    private static let audioSourceDefaultsKey = "com.evenai.liveTranslation.audioSource"
+    private static let conversationModeDefaultsKey = "com.evenai.liveTranslation.conversationMode"
 
     init(
         glassesTransport: GlassesTransport,
@@ -397,7 +516,50 @@ final class LiveTranslationService {
         } else {
             self.sourceLanguageMode = .auto
         }
+        if let saved = defaults.string(forKey: Self.audioSourceDefaultsKey),
+           let savedSource = AudioSource(rawValue: saved) {
+            self.audioSource = savedSource
+        } else {
+            self.audioSource = .g2Mic
+        }
+        if let saved = defaults.string(forKey: Self.conversationModeDefaultsKey),
+           let savedMode = ConversationMode(rawValue: saved) {
+            self.conversationMode = savedMode
+        } else {
+            self.conversationMode = .standard
+        }
         observeConnection()
+    }
+
+    /// The one way `conversationMode` ever changes — persists
+    /// immediately (survives app relaunch). Takes effect on the NEXT
+    /// reply (mid-turn is not retroactively affected — a reply already
+    /// displayed doesn't un-display itself), which is an acceptable,
+    /// simple semantic for a preset switch a user makes deliberately
+    /// between conversations, not mid-sentence.
+    func setConversationMode(_ mode: ConversationMode) {
+        guard mode != conversationMode else { return }
+        conversationMode = mode
+        defaults.set(mode.rawValue, forKey: Self.conversationModeDefaultsKey)
+        DiagnosticTrace.log("CONVERSATION_MODE_SELECTED", "mode=\(mode.rawValue)")
+    }
+
+    /// The one way `audioSource` ever changes — persists immediately
+    /// (survives app relaunch) and, if a session is already listening,
+    /// pushes the new preference to the transport right away so it takes
+    /// effect on the mic that's already active (no restart required —
+    /// matches the explicit-language-selection fix's own "must propagate
+    /// immediately" requirement).
+    func setAudioSource(_ source: AudioSource) {
+        guard source != audioSource else { return }
+        audioSource = source
+        defaults.set(source.rawValue, forKey: Self.audioSourceDefaultsKey)
+        // `MentraGlassesTransport.setPreferredAudioSource(_:)` itself
+        // applies this live if the mic is already on — safe/no-op
+        // otherwise (see its own doc comment).
+        Task { [glassesTransport] in
+            await glassesTransport.setPreferredAudioSource(source)
+        }
     }
 
     /// The one way `sourceLanguageMode` ever changes — persists the choice
@@ -473,12 +635,20 @@ final class LiveTranslationService {
         turnSequenceCounter = 0
         highestDisplayedTurnSequence = 0
         currentTurnDisplayState = .none
+        displayMode = .followLive
+        sessionMetrics = ConversationSessionMetrics()
+        sessionStartedAt = Date()
+        audioFirstByteAt = nil
+        lastAudioChunkAt = nil
+        audioExpectedIntervalMs = nil
         resetUtteranceState()
+        observeNavigation()
 
         do {
+            await glassesTransport.setPreferredAudioSource(audioSource)
             try await glassesTransport.setMicrophoneEnabled(true)
             let pcmUpdates = await glassesTransport.microphonePCMUpdates()
-            let updates = try await transcriber.startTranscribing(pcmUpdates: pcmUpdates)
+            let updates = try await transcriber.startTranscribing(pcmUpdates: instrumentedPCMStream(pcmUpdates))
             state = .listening
             consumeTask = Task { [weak self] in
                 await self?.consume(updates)
@@ -497,9 +667,12 @@ final class LiveTranslationService {
     /// the "never leave the microphone active" guarantee, called explicitly
     /// by the user or by a lost connection.
     func stop() async {
+        await logSessionMetrics()
         isEnabledIntent = false
         consumeTask?.cancel()
         consumeTask = nil
+        navigationObserverTask?.cancel()
+        navigationObserverTask = nil
         // Cancel every still-running per-turn pipeline/reply task — a
         // completion after this point must never call `displayPages`
         // again (the transport itself would likely reject it once
@@ -518,6 +691,135 @@ final class LiveTranslationService {
         }
     }
 
+    /// One concise, diagnostic-only summary line at the end of a session
+    /// — Section 3's "session health summary" ask. A no-op (logs nothing)
+    /// if the session never actually reached `.listening`, so a `stop()`
+    /// called on an already-idle/never-started service doesn't spam a
+    /// meaningless all-zero line. `finalTurnsPersisted` reuses
+    /// `agentContextStore.session.turns.count` directly rather than a
+    /// separate counter: a turn only ever stays in `session.turns` if its
+    /// translation actually succeeded (a failed/timed-out/cancelled
+    /// translation removes its draft turn — see `processTurn`'s catch
+    /// blocks), so the current count already IS "how many turns were
+    /// actually persisted this session."
+    private func logSessionMetrics() async {
+        guard state == .listening else { return }
+        let duration = sessionStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+        let metrics = await currentSessionMetrics()
+        DiagnosticTrace.log(
+            "CONVERSATION_SESSION_METRICS",
+            "duration=\(String(format: "%.1f", duration))s "
+                + "audioChunks=\(metrics.audioChunkCount) "
+                + "audioBytes=\(metrics.audioByteCount) "
+                + "audioGapCount=\(metrics.audioGapCount) "
+                + "maxAudioGapMs=\(metrics.audioMaxGapMs) "
+                + "audioSuspectedDroppedChunks=\(metrics.audioSuspectedDroppedChunks) "
+                + "sttReconnects=\(metrics.sttReconnectCount) "
+                + "finalTranscripts=\(metrics.finalTranscriptCount) "
+                + "finalTurnsPersisted=\(metrics.finalTurnsPersistedCount) "
+                + "translationFailures=\(metrics.translationFailureCount) "
+                + "displayFailures=\(metrics.displayFailureCount) "
+                + "avgFirstUsefulTranslationMs=\(metrics.avgFirstUsefulTranslationMs) "
+                + "medianFirstUsefulTranslationMs=\(metrics.medianFirstUsefulTranslationMs) "
+                + "sampleCount=\(metrics.firstUsefulTranslationSamplesMs.count) "
+                + "mode=\(sourceLanguageMode.rawValue) "
+                + "audioSource=\(audioSource.rawValue)"
+        )
+    }
+
+    /// A fresh snapshot of this session's reliability counters, right
+    /// now — Section 6 testability: tests call this directly rather than
+    /// needing to intercept `DiagnosticTrace`'s console output. Fills in
+    /// the two fields `sessionMetrics` alone can't hold on its own
+    /// (`sttReconnectCount`, an `async` property on the transcriber;
+    /// `finalTurnsPersistedCount`, read live from `agentContextStore` —
+    /// see `ConversationSessionMetrics`'s own doc comments for why).
+    func currentSessionMetrics() async -> ConversationSessionMetrics {
+        var snapshot = sessionMetrics
+        snapshot.sttReconnectCount = await transcriber.reconnectCount
+        snapshot.finalTurnsPersistedCount = agentContextStore.session.turns.count
+        return snapshot
+    }
+
+    /// Wraps the raw PCM stream from `glassesTransport
+    /// .microphonePCMUpdates()` with a passive side-channel that counts
+    /// and times chunks as they pass through, purely for
+    /// `CONVERSATION_SESSION_METRICS`/audio-reliability diagnostics
+    /// (Section 10/17's audio-path audit) — never drops, reorders,
+    /// delays, or otherwise touches a single byte on the way to
+    /// `transcriber.startTranscribing(pcmUpdates:)`. Never logs raw audio
+    /// content, only counts/sizes/timings.
+    private func instrumentedPCMStream(_ source: AsyncStream<Data>) -> AsyncStream<Data> {
+        AsyncStream { continuation in
+            let forwardingTask = Task { [weak self] in
+                for await chunk in source {
+                    await self?.recordAudioChunk(chunk)
+                    continuation.yield(chunk)
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in forwardingTask.cancel() }
+        }
+    }
+
+    /// One PCM chunk's worth of audio-reliability bookkeeping — see the
+    /// "Audio-path reliability instrumentation" properties' own doc
+    /// comments for the exact fields this updates, and for why a dropped/
+    /// suspected chunk count can only ever be an estimate given what the
+    /// SDK actually provides. The expected-interval baseline only folds
+    /// in "normal" (non-anomalous) gaps, specifically so a real dropout
+    /// can never drag the baseline up and hide itself from detection.
+    private func recordAudioChunk(_ data: Data) {
+        let now = Date()
+        sessionMetrics.audioChunkCount += 1
+        sessionMetrics.audioByteCount += data.count
+        if audioFirstByteAt == nil {
+            audioFirstByteAt = now
+            DiagnosticTrace.log("AUDIO_FIRST_BYTE_TS", "value=\(now.timeIntervalSince1970)")
+        }
+        defer { lastAudioChunkAt = now }
+        guard let last = lastAudioChunkAt else { return }
+        let gapMs = now.timeIntervalSince(last) * 1000
+        guard let expected = audioExpectedIntervalMs else {
+            audioExpectedIntervalMs = gapMs
+            return
+        }
+        let anomalyThresholdMs = max(expected * 3, 150)
+        guard gapMs > anomalyThresholdMs else {
+            audioExpectedIntervalMs = expected * 0.9 + gapMs * 0.1
+            return
+        }
+        sessionMetrics.audioGapCount += 1
+        sessionMetrics.audioMaxGapMs = max(sessionMetrics.audioMaxGapMs, Int(gapMs))
+        // How many expected-interval-sized chunks COULD have fit in this
+        // gap beyond the one chunk we actually got — a suspected-drop
+        // estimate, not an exact count (see this section's own doc
+        // comment).
+        let suspected = max(0, Int((gapMs / expected).rounded(.down)) - 1)
+        sessionMetrics.audioSuspectedDroppedChunks += suspected
+        DiagnosticTrace.log(
+            "AUDIO_GAP_DETECTED",
+            "gapMs=\(Int(gapMs)) expectedIntervalMs=\(Int(expected)) suspectedDroppedChunks=\(suspected)"
+        )
+    }
+
+    /// New speech (whether it first arrives as a growing partial, or —
+    /// for a transcriber that emits no partials — directly as a final)
+    /// must immediately reclaim the live display from reply-browsing:
+    /// replies are temporary, assistive UI for the turn that just
+    /// finished, not a deliberate look back through history, so they
+    /// must never be allowed to block the NEXT turn from showing up. A
+    /// deliberate look back through OLDER finalized turns
+    /// (`.browsingHistory`) is left completely alone — see `DisplayMode`'s
+    /// own doc comment for why the two need different treatment. A no-op
+    /// (and safe to call from multiple call sites) when not currently
+    /// `.browsingReplies`.
+    private func reclaimLiveDisplayIfBrowsingReplies(reason: String) {
+        guard case .browsingReplies = displayMode else { return }
+        displayMode = .followLive
+        DiagnosticTrace.log("DISPLAY_MODE_CHANGED", "mode=followLive reason=\(reason)")
+    }
+
     private func observeConnection() {
         connectionObserverTask = Task { [weak self] in
             guard let self else { return }
@@ -532,6 +834,185 @@ final class LiveTranslationService {
                 }
             }
         }
+    }
+
+    /// Conversation Mode: tracks G2 touchpad navigation to drive
+    /// `followLive` — see `GlassesNavigationEvent`/`followLive`'s own doc
+    /// comments. Started fresh in `start()` (matching `observeConnection()`'s
+    /// own per-session-start pattern would be redundant re-subscribing on
+    /// every `start()` call across the object's lifetime, but that's
+    /// harmless — `navigationEvents()` is a plain broadcast stream, not a
+    /// single-shot resource), cancelled in `stop()`.
+    private func observeNavigation() {
+        navigationObserverTask = Task { [weak self] in
+            guard let self else { return }
+            let events = await self.glassesTransport.navigationEvents()
+            for await event in events {
+                await self.handleNavigation(event)
+            }
+        }
+    }
+
+    private func handleNavigation(_ event: GlassesNavigationEvent) async {
+        switch event {
+        case .pageChanged(let index):
+            await applyPageIndexNavigation(index)
+        case .returnToLiveRequested:
+            await returnToLive(reason: "returnToLiveRequested")
+        }
+    }
+
+    /// Translates a raw G2 page index into a semantic `DisplayMode`
+    /// transition — see `DisplayMode`'s own doc comment for the exact
+    /// rapid-speech race this design eliminates versus a prior revision
+    /// that inferred intent from what had actually been RENDERED.
+    ///
+    /// Page 0 is always `.followLive`, by convention — every page set
+    /// this class ever sends puts live content there. Any other index is
+    /// classified using ONLY `agentContextStore.session` — the logical,
+    /// always-consistent source of truth — read FRESH at the exact
+    /// moment this runs, never a cached record of what a past
+    /// `displayPages(...)` call happened to include: the live/anchor
+    /// turn is `agentContextStore.session.latestTurn`; if `index` falls
+    /// within that turn's CURRENT reply count (which only ever grows,
+    /// never shrinks, within one turn's lifecycle — capped at 3, see
+    /// `generateSuggestedReplies`), it's a reply page for that specific
+    /// turn+index; anything beyond that is history, anchored to the turn
+    /// immediately before it. Entering `.browsingHistory` immediately
+    /// renders the correct viewport on demand
+    /// (`renderHistoryViewport(anchorTurnID:)`) rather than trusting
+    /// whatever (possibly stale or entirely missing) content that G2
+    /// page slot already happened to hold.
+    private func applyPageIndexNavigation(_ index: Int) async {
+        guard index != 0 else {
+            guard displayMode != .followLive else { return }
+            displayMode = .followLive
+            DiagnosticTrace.log("DISPLAY_MODE_CHANGED", "mode=followLive reason=pageChanged index=0")
+            await redisplayLiveContent()
+            return
+        }
+        guard let liveTurn = agentContextStore.session.latestTurn else { return }
+        // `GlassesPresentationLayer.pages(for:)` produces exactly one
+        // page PER reply — page `k` is the header plus
+        // `suggestedReplies[k]` (page 0 always shows `suggestedReplies[0]`
+        // merged with the live header when a reply exists, which is
+        // still `.followLive` by the page-0 convention above — it only
+        // becomes a genuinely browsable, DISTINCT `.browsingReplies` page
+        // starting at index 1, showing `suggestedReplies[index]`). So an
+        // index strictly less than the current reply count is a reply
+        // page; anything at or beyond it is history.
+        let replyCount = liveTurn.suggestedReplies.count
+        if index < replyCount {
+            let newMode = DisplayMode.browsingReplies(turnID: liveTurn.id, replyIndex: index)
+            guard newMode != displayMode else { return }
+            displayMode = newMode
+            DiagnosticTrace.log(
+                "DISPLAY_MODE_CHANGED",
+                "mode=browsingReplies turnID=\(liveTurn.id) replyIndex=\(index) reason=pageChanged index=\(index)"
+            )
+            // No re-render: G2 already navigated itself to a reply page
+            // that was genuinely sent — this only updates what THIS
+            // class understands that page to mean.
+            return
+        }
+        guard let anchor = previousTurn(before: liveTurn.id) else {
+            // Nothing exists before the live turn yet — there is no
+            // history to browse to. Hardware shouldn't be able to
+            // produce this index in that case (nothing was ever sent
+            // there to swipe onto), but staying put is the safe,
+            // defensive response if it somehow does.
+            return
+        }
+        let newMode = DisplayMode.browsingHistory(anchorTurnID: anchor.id)
+        if newMode != displayMode {
+            displayMode = newMode
+            DiagnosticTrace.log(
+                "DISPLAY_MODE_CHANGED",
+                "mode=browsingHistory anchorTurnID=\(anchor.id) reason=pageChanged index=\(index)"
+            )
+        }
+        // Always re-render on entry/re-entry, even if `newMode ==
+        // displayMode` already (e.g. two swipes landing on different
+        // raw indices that both resolve to the same anchor) — this is
+        // exactly what "do not wait for a special history page to be
+        // appended; render the best available historical viewport"
+        // means: never trust what's already on screen, always push the
+        // logically-correct content the instant history is requested.
+        await renderHistoryViewport(anchorTurnID: anchor.id)
+    }
+
+    /// Renders a single dedicated page for `anchorTurnID`'s content,
+    /// straight from `agentContextStore.session` — the on-demand
+    /// counterpart to `redisplayLiveContent()`, used the moment
+    /// `.browsingHistory` is entered/re-entered. Deliberately
+    /// independent of whatever page set the LIVE turn most recently
+    /// sent: this always looks up `anchorTurnID` fresh and builds its
+    /// page directly, so it can never be blocked by — or racing against
+    /// — the live turn's own translation/reply pipeline. A no-op if the
+    /// anchor turn has no usable translation yet (matches
+    /// `GlassesPresentationLayer`'s existing "no translation, no page"
+    /// rule elsewhere).
+    private func renderHistoryViewport(anchorTurnID: ConversationTurn.ID) async {
+        guard let anchor = agentContextStore.session.turns.first(where: { $0.id == anchorTurnID }) else { return }
+        guard let page = GlassesPresentationLayer.historyViewportPage(for: anchor) else { return }
+        do {
+            try await glassesTransport.displayPages([page])
+            DiagnosticTrace.log("REAL_TURN_TRACE", "HISTORY_VIEWPORT_RENDERED anchorTurnID=\(anchorTurnID)")
+        } catch {
+            sessionMetrics.displayFailureCount += 1
+            DiagnosticTrace.log("LIVE_TRACE", "renderHistoryViewport failed: \(error)")
+        }
+    }
+
+    /// Jumps G2's display straight back to the live turn and re-enables
+    /// `followLive` — the shared implementation behind both G2's own
+    /// double-tap gesture (`GlassesNavigationEvent.returnToLiveRequested`)
+    /// and an equivalent "↓ LIVE" control the iPhone-side UI can offer
+    /// (`LiveTranslationView`). Safe to call even when already following
+    /// live (redisplays the freshest content regardless — a harmless,
+    /// idempotent refresh).
+    func returnToLive() async {
+        await returnToLive(reason: "manualReturnToLive")
+    }
+
+    private func returnToLive(reason: String) async {
+        DiagnosticTrace.log("DISPLAY_MODE_CHANGED", "mode=followLive reason=\(reason)")
+        displayMode = .followLive
+        await redisplayLiveContent()
+    }
+
+    /// Rebuilds and resends the freshest available content for G2's live
+    /// page — called whenever `followLive` transitions back to `true`
+    /// (the user returned to the live page, by swiping back to it or by
+    /// double-tapping), since any turns that arrived while they were away
+    /// were recorded in history but deliberately never pushed to the
+    /// display (see the "while not following live, skip the send" guards
+    /// in `displayPartial`/`processTurn`/`generateSuggestedReplies`). A
+    /// no-op if nothing has ever been translated yet this session.
+    private func redisplayLiveContent() async {
+        guard let latestTurn = agentContextStore.session.latestTurn else { return }
+        let previousTurn = agentContextStore.session.turns.dropLast().last
+        let pages = GlassesPresentationLayer.conversationPages(for: latestTurn, previousTurn: previousTurn)
+        guard !pages.isEmpty else { return }
+        do {
+            try await glassesTransport.displayPages(pages)
+            DiagnosticTrace.log("REAL_TURN_TRACE", "REDISPLAY_LIVE_CONTENT turnID=\(latestTurn.id) pageCount=\(pages.count)")
+        } catch {
+            sessionMetrics.displayFailureCount += 1
+            DiagnosticTrace.log("LIVE_TRACE", "redisplayLiveContent failed: \(error)")
+        }
+    }
+
+    /// The turn immediately preceding `turnID` in true chronological
+    /// (spoken/appended) order, if any — the "one bounded page of look-
+    /// back context" `GlassesPresentationLayer.conversationPages(for:previousTurn:)`
+    /// uses. Looked up by id/index rather than assuming `turnID` is
+    /// `session.turns.last` — under real concurrency a newer turn may
+    /// already have been appended by the time this runs.
+    private func previousTurn(before turnID: ConversationTurn.ID) -> ConversationTurn? {
+        let turns = agentContextStore.session.turns
+        guard let index = turns.firstIndex(where: { $0.id == turnID }), index > 0 else { return nil }
+        return turns[index - 1]
     }
 
     private func consume(_ updates: AsyncThrowingStream<TranscriptionUpdate, Error>) async {
@@ -631,6 +1112,12 @@ final class LiveTranslationService {
         }
         DiagnosticTrace.log("SHORT_UTTERANCE_TRACE", "DEDUPE_PASSED text=\"\(text)\"")
         lastFinalReceived = (text, now)
+        // Belt-and-suspenders for a transcriber that emits `.final(_:)`
+        // with no preceding `.partial(_:)` (`handlePartial(_:)`'s own
+        // hook covers the normal streaming case) — genuinely new,
+        // non-duplicate speech must reclaim the live display from reply-
+        // browsing here too.
+        reclaimLiveDisplayIfBrowsingReplies(reason: "newSpeechFinal")
 
         guard let languageCode = await resolveSourceLanguage(for: text) else {
             DiagnosticTrace.log("SHORT_UTTERANCE_TRACE", "REJECTED reason=languageUndetectable text=\"\(text)\"")
@@ -662,6 +1149,8 @@ final class LiveTranslationService {
         )
         DiagnosticTrace.log("TURN_RECEIVED", "id=\(turn.id) text=\"\(text.prefix(60))\" language=\(languageCode)")
         DiagnosticTrace.log("FINAL_TRANSCRIPT_RECEIVED", "turnID=\(turn.id) text=\"\(text.prefix(60))\"")
+        sessionMetrics.finalTranscriptCount += 1
+        DiagnosticTrace.log("FINAL_TRANSCRIPT_COUNT", "value=\(sessionMetrics.finalTranscriptCount)")
         DiagnosticTrace.log("LATENCY_TRACE", "STT_FINAL id=\(turn.id) timestamp=\(turnStartTime.timeIntervalSince1970)")
         DiagnosticTrace.log("LATENCY_TRACE", "FINAL_TRANSCRIPT_TS id=\(turn.id) value=\(turnStartTime.timeIntervalSince1970)")
         DiagnosticTrace.log("REAL_TURN_TRACE", "TURN_CREATED id=\(turn.id) originalText=\"\(text.prefix(60))\"")
@@ -745,8 +1234,17 @@ final class LiveTranslationService {
 
         let now = Date()
         if utteranceID == nil {
+            // New speech starting: if the user was browsing reply pages
+            // for the previous turn, reclaim the live display right now
+            // — see this method's own reasoning in
+            // `reclaimLiveDisplayIfBrowsingReplies(reason:)`'s doc
+            // comment. A deliberate look back through history
+            // (`.browsingHistory`) is untouched.
+            reclaimLiveDisplayIfBrowsingReplies(reason: "newSpeechPartial")
             let newUtteranceID = UUID()
             utteranceID = newUtteranceID
+            sessionMetrics.utteranceCount += 1
+            DiagnosticTrace.log("UTTERANCE_COUNT", "value=\(sessionMetrics.utteranceCount)")
             turnSequenceCounter += 1
             utteranceSequence = turnSequenceCounter
             utteranceLanguageCode = resolveLanguageForNewUtterance()
@@ -917,11 +1415,22 @@ final class LiveTranslationService {
             return
         }
         highestDisplayedTurnSequence = utteranceSequence
+        // Conversation Mode: the user has manually navigated G2 away
+        // from the live page to review history — never yank it back or
+        // overwrite what they're reading with a provisional update.
+        // History/state bookkeeping above is untouched; only the actual
+        // send to G2 is skipped. `redisplayLiveContent()` catches the
+        // display up once they return.
+        guard followLive else {
+            DiagnosticTrace.log("FOLLOW_LIVE_DISPLAY_SKIPPED", "stage=partial utteranceID=\(utteranceID.uuidString)")
+            return
+        }
         let page = GlassesPresentationLayer.streamingPage(source: source, translation: translation)
         do {
             try await glassesTransport.displayPages([page])
             currentTurnDisplayState = .streaming(utteranceID: utteranceID)
         } catch {
+            sessionMetrics.displayFailureCount += 1
             DiagnosticTrace.log("LIVE_TRACE", "displayPages (partial) failed: \(error)")
         }
     }
@@ -971,6 +1480,7 @@ final class LiveTranslationService {
             DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=translationCancelled")
             return
         } catch is TranslationTimeoutError {
+            sessionMetrics.translationFailureCount += 1
             DiagnosticTrace.log("TRANSLATION_TASK_TIMEOUT", "id=\(turnID)")
             DiagnosticTrace.log("LIVE_TRACE", "translation timed out for \"\(text.prefix(60))\"")
             DiagnosticTrace.log("UPSTREAM_TRACE", "TRANSLATION_ERROR timeout")
@@ -989,6 +1499,7 @@ final class LiveTranslationService {
             // has no other visibility anywhere in this class — `state`
             // stays `.listening` either way, since one failed phrase
             // shouldn't interrupt an otherwise-healthy session.
+            sessionMetrics.translationFailureCount += 1
             DiagnosticTrace.log("LIVE_TRACE", "translation failed for \"\(text.prefix(60))\": \(error)")
             DiagnosticTrace.log("UPSTREAM_TRACE", "TRANSLATION_ERROR \(error)")
             DiagnosticTrace.log("POST_STT_TRACE", "TRANSLATION_ERROR type=\(type(of: error)) message=\(error)")
@@ -1081,17 +1592,28 @@ final class LiveTranslationService {
         turnTasks.append(replyTask)
 
         DiagnosticTrace.log("UPSTREAM_TRACE", "DISPLAY_CALLBACK text=\"\(displayText.prefix(60))\"")
-        // Header-only pages — `translatedTurn.suggestedReplies` is still
-        // empty at this point, so `GlassesPresentationLayer.pages(for:)`
-        // naturally produces just the Source+Ukrainian header (see that
-        // type's doc comment for the unified page format this now shares
-        // with the reply-stage display call below).
-        let translationPages = GlassesPresentationLayer.pages(for: translatedTurn)
+        // Header-only pages, plus one bounded page of look-back context
+        // (the turn immediately before this one, if any) — see
+        // `GlassesPresentationLayer.conversationPages(for:previousTurn:)`'s
+        // doc comment for the conversation-timeline design this is part
+        // of. `translatedTurn.suggestedReplies` is still empty at this
+        // point, so page 0 is just the Source+Ukrainian header.
+        let translationPages = GlassesPresentationLayer.conversationPages(
+            for: translatedTurn,
+            previousTurn: previousTurn(before: turnID)
+        )
         DiagnosticTrace.log("REAL_TURN_TRACE", "PAGES stage=translationOnly turnID=\(turnID) count=\(translationPages.count)")
         DiagnosticTrace.log("POST_STT_TRACE", "PRESENTATION_PAGES_CREATED count=\(translationPages.count)")
         DiagnosticTrace.log("DISPLAY_START", "id=\(turnID)")
         let displayCallStart = Date()
         DiagnosticTrace.log("LATENCY_TRACE", "DISPLAY_CALL_START id=\(turnID)")
+        // Conversation Mode: never overwrite what the user is manually
+        // reviewing — see `displayPartial`'s identical guard.
+        guard followLive else {
+            DiagnosticTrace.log("FOLLOW_LIVE_DISPLAY_SKIPPED", "stage=translationOnly turnID=\(turnID)")
+            DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=followLiveDisabled")
+            return
+        }
         do {
             DiagnosticTrace.log("REAL_TURN_TRACE", "DISPLAY_REQUEST stage=translationOnly turnID=\(turnID)")
             DiagnosticTrace.log("POST_STT_TRACE", "DISPLAY_REQUEST turnID=\(turnID)")
@@ -1118,13 +1640,13 @@ final class LiveTranslationService {
                 "LATENCY_TRACE",
                 "TRANSLATION_DISPLAY_LATENCY_MS id=\(turnID) value=\(Int(now.timeIntervalSince(displayCallStart) * 1000))"
             )
-            DiagnosticTrace.log(
-                "LATENCY_TRACE",
-                "END_TO_END_TRANSLATION_MS id=\(turnID) value=\(Int(now.timeIntervalSince(turnStartTime) * 1000))"
-            )
+            let endToEndMs = Int(now.timeIntervalSince(turnStartTime) * 1000)
+            DiagnosticTrace.log("LATENCY_TRACE", "END_TO_END_TRANSLATION_MS id=\(turnID) value=\(endToEndMs)")
+            sessionMetrics.recordFirstUsefulTranslationSample(endToEndMs)
         } catch {
             // Same reasoning as the translation catch above — displaying
             // this has no other visibility.
+            sessionMetrics.displayFailureCount += 1
             DiagnosticTrace.log("LIVE_TRACE", "displayPages failed for \"\(displayText.prefix(60))\": \(error)")
             DiagnosticTrace.log("REAL_TURN_TRACE", "DISPLAY_REQUEST failed stage=translationOnly turnID=\(turnID) error=\(error)")
         }
@@ -1352,10 +1874,32 @@ final class LiveTranslationService {
             DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=noRepliesToShow")
             return
         }
-        let replyPages = GlassesPresentationLayer.pages(for: updatedTurn)
+        let replyPages = GlassesPresentationLayer.conversationPages(
+            for: updatedTurn,
+            previousTurn: previousTurn(before: turnID)
+        )
         DiagnosticTrace.log("REAL_TURN_TRACE", "PAGES stage=withReplies turnID=\(turnID) count=\(replyPages.count)")
         DiagnosticTrace.log("SUGGESTED_REPLIES_PAGES_CREATED", "id=\(turnID) count=\(replyPages.count)")
         let replyDisplayStart = Date()
+        // Meeting Mode: replies are lower priority — generated and
+        // recorded (already done above) exactly as in Standard mode, but
+        // never auto-displayed on G2, keeping the screen dedicated to
+        // the conversation transcript. Fully visible in Glasses Chat on
+        // the phone either way.
+        guard conversationMode != .meeting else {
+            DiagnosticTrace.log("MEETING_MODE_REPLY_DISPLAY_SUPPRESSED", "turnID=\(turnID)")
+            DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=meetingModeRepliesSuppressed")
+            return
+        }
+        // Conversation Mode: never overwrite what the user is manually
+        // reviewing. The reply is still recorded in history above
+        // (`agentContextStore.updateTurn(updatedTurn)`) — only the G2
+        // send is skipped.
+        guard followLive else {
+            DiagnosticTrace.log("FOLLOW_LIVE_DISPLAY_SKIPPED", "stage=withReplies turnID=\(turnID)")
+            DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=followLiveDisabled")
+            return
+        }
         do {
             DiagnosticTrace.log("REAL_TURN_TRACE", "DISPLAY_REQUEST stage=withReplies turnID=\(turnID)")
             DiagnosticTrace.log("SUGGESTED_REPLIES_DISPLAY_REQUEST", "turnID=\(turnID)")
@@ -1377,6 +1921,7 @@ final class LiveTranslationService {
                 "TOTAL_REPLIES_LATENCY_MS id=\(turnID) value=\(Int(now.timeIntervalSince(turnStartTime) * 1000))"
             )
         } catch {
+            sessionMetrics.displayFailureCount += 1
             DiagnosticTrace.log("LIVE_TRACE", "displayPages (suggested replies) failed: \(error)")
             DiagnosticTrace.log("REAL_TURN_TRACE", "DISPLAY_REQUEST failed stage=withReplies turnID=\(turnID) error=\(error)")
             DiagnosticTrace.log("SUGGESTED_REPLIES_DISPLAY_ERROR", "turnID=\(turnID) error=\(error)")

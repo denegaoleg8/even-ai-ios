@@ -52,6 +52,13 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
 
     /// Subscribers to raw G2 microphone PCM — see `microphonePCMUpdates()`.
     private var pcmContinuations: [UUID: AsyncStream<Data>.Continuation] = [:]
+    /// Subscribers to G2 touchpad navigation events — see
+    /// `navigationEvents()`/`GlassesNavigationEvent`.
+    private var navigationContinuations: [UUID: AsyncStream<GlassesNavigationEvent>.Continuation] = [:]
+    /// Which mic `setMicrophoneEnabled(true)` uses — see
+    /// `setPreferredAudioSource(_:)`/`AudioSource`'s own doc comment for
+    /// how this maps onto `MentraBluetoothSDK.setMicState(useGlassesMic:)`.
+    private var preferredAudioSource: AudioSource = .g2Mic
 
     /// Mirrors `GlassesSpeechTranscriber`'s hardcoded format assumption —
     /// see `micPcmSampleRate` and its `AVAudioFormat(commonFormat: .pcmFormatInt16, channels: 1, ...)`.
@@ -381,7 +388,7 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
         guard enabled else {
             microphoneIntentEnabled = false
             if isSDKStarted {
-                sdk.setMicState(enabled: false, useGlassesMic: true)
+                sdk.setMicState(enabled: false, useGlassesMic: preferredAudioSource == .g2Mic)
             }
             return
         }
@@ -389,8 +396,47 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
             throw GlassesTransportError.notConnected
         }
         microphoneIntentEnabled = true
-        sdk.setMicState(enabled: true, useGlassesMic: true, sendTranscript: false, sendLc3Data: false)
+        DiagnosticTrace.log("AUDIO_SOURCE_ACTIVE", "source=\(preferredAudioSource.rawValue)")
+        sdk.setMicState(
+            enabled: true,
+            useGlassesMic: preferredAudioSource == .g2Mic,
+            sendTranscript: false,
+            sendLc3Data: false
+        )
         try? await Task.sleep(for: Self.micArmSettleDelay)
+    }
+
+    /// See `AudioSource`'s and the protocol requirement's own doc
+    /// comments — confirmed against the vendored SDK that
+    /// `useGlassesMic: false` routes through its own internal `PhoneMic`
+    /// (`AVAudioEngine`-based capture, converted to the same PCM shape),
+    /// dispatched through the exact same `didReceiveMicPcm` bridge event
+    /// G2's own mic uses, so nothing downstream of
+    /// `microphonePCMUpdates()` needs to know or care which source is
+    /// active.
+    func setPreferredAudioSource(_ source: AudioSource) async {
+        preferredAudioSource = source
+        DiagnosticTrace.log("AUDIO_SOURCE_SELECTED", "source=\(source.rawValue)")
+        // Apply immediately if the mic is already on — matches the
+        // explicit-language-selection fix's own "must take effect without
+        // a restart" bar, and mirrors `setMicState`'s own re-arm pattern
+        // (re-issuing the same enable command while already enabled is a
+        // safe, idempotent off→on toggle per the vendored SDK).
+        guard microphoneIntentEnabled, isSDKStarted, sdk.glasses.connected else { return }
+        DiagnosticTrace.log("AUDIO_SOURCE_ACTIVE", "source=\(source.rawValue)")
+        sdk.setMicState(enabled: true, useGlassesMic: source == .g2Mic, sendTranscript: false, sendLc3Data: false)
+    }
+
+    func navigationEvents() async -> AsyncStream<GlassesNavigationEvent> {
+        AsyncStream { continuation in
+            let id = UUID()
+            navigationContinuations[id] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.navigationContinuations.removeValue(forKey: id)
+                }
+            }
+        }
     }
 
     /// Maps a raw `BluetoothSdkError` code to a clean, actionable message.
@@ -421,6 +467,12 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
     private func broadcast(_ state: GlassesTransportState) {
         for continuation in stateContinuations.values {
             continuation.yield(state)
+        }
+    }
+
+    private func broadcastNavigation(_ event: GlassesNavigationEvent) {
+        for continuation in navigationContinuations.values {
+            continuation.yield(event)
         }
     }
 }
@@ -498,6 +550,20 @@ extension MentraGlassesTransport: MentraBluetoothSDKDelegate {
             let pageNumber = pagination.currentIndex + 1
             DiagnosticTrace.log("G2_DISPLAY_TRACE", "PAGE_\(pageNumber)_SENT (swipe) text=\"\(nextPage.prefix(60))\"")
             redisplay(nextPage, reason: "swipe")
+            broadcastNavigation(.pageChanged(index: pagination.currentIndex))
+            return
+        }
+
+        // Conversation-mode "return to live" gesture — G2's one distinct,
+        // unambiguous "take me back" touch event (confirmed against the
+        // vendored SDK: `.doubleClick` → `"double_tap"`, never produced
+        // by a swipe or the exit-class events below). Purely an upward
+        // signal to `LiveTranslationService` (via `navigationEvents()`)
+        // — this transport doesn't know what "live" means; it only
+        // reports that the gesture happened.
+        if touch.gestureName == "double_tap" {
+            DiagnosticTrace.log("G2_DISPLAY_TRACE", "RETURN_TO_LIVE_REQUESTED (double_tap)")
+            broadcastNavigation(.returnToLiveRequested)
             return
         }
 

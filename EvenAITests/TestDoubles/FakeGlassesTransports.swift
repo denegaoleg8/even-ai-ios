@@ -82,12 +82,67 @@ actor SpyGlassesTransport: GlassesTransport {
         displayedPageSets.append(pages)
     }
 
+    private var pcmContinuations: [UUID: AsyncStream<Data>.Continuation] = [:]
     func microphonePCMUpdates() async -> AsyncStream<Data> {
-        AsyncStream { _ in }
+        AsyncStream { continuation in
+            let id = UUID()
+            pcmContinuations[id] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removePCMContinuation(id) }
+            }
+        }
+    }
+
+    private func removePCMContinuation(_ id: UUID) {
+        pcmContinuations.removeValue(forKey: id)
+    }
+
+    /// Test hook: simulate one raw PCM chunk arriving from G2/phone mic
+    /// after a subscriber has already started observing
+    /// `microphonePCMUpdates()` — used to exercise
+    /// `LiveTranslationService`'s audio-reliability instrumentation
+    /// (chunk/gap counting) under controlled, deterministic timing.
+    func simulatePCMChunk(_ data: Data = Data(repeating: 0, count: 320)) {
+        for continuation in pcmContinuations.values {
+            continuation.yield(data)
+        }
     }
 
     func setMicrophoneEnabled(_ enabled: Bool) async throws {
         microphoneEnabledCalls.append(enabled)
+    }
+
+    /// Every `setPreferredAudioSource(_:)` call, in order — used by
+    /// `LiveTranslationServiceTests` to verify audio-source selection
+    /// propagates immediately, including mid-session.
+    private(set) var audioSourceCalls: [AudioSource] = []
+    func setPreferredAudioSource(_ source: AudioSource) async {
+        audioSourceCalls.append(source)
+    }
+
+    private var navigationContinuations: [UUID: AsyncStream<GlassesNavigationEvent>.Continuation] = [:]
+    func navigationEvents() async -> AsyncStream<GlassesNavigationEvent> {
+        AsyncStream { continuation in
+            let id = UUID()
+            navigationContinuations[id] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeNavigationContinuation(id) }
+            }
+        }
+    }
+
+    private func removeNavigationContinuation(_ id: UUID) {
+        navigationContinuations.removeValue(forKey: id)
+    }
+
+    /// Test hook: simulate a G2 touchpad navigation event (a swipe
+    /// landing on a given page index, or a double-tap "return to live"
+    /// request) after a subscriber has already started observing
+    /// `navigationEvents()`.
+    func simulateNavigation(_ event: GlassesNavigationEvent) {
+        for continuation in navigationContinuations.values {
+            continuation.yield(event)
+        }
     }
 }
 

@@ -20,7 +20,7 @@ import Foundation
 @MainActor
 @Suite("LiveTranslationService + OpenAIRealtimeTranscriber (production wiring)")
 struct LiveTranslationServiceOpenAIRealtimeTranscriberTests {
-    private static let propagationDelay: Duration = .milliseconds(30)
+    private static let propagationDelay: Duration = .milliseconds(100)
 
     private func makeService(
         factory: FakeRealtimeTranscriptionSocketFactory,
@@ -60,10 +60,13 @@ struct LiveTranslationServiceOpenAIRealtimeTranscriberTests {
 
         #expect(store.session.turns.map(\.originalText) == ["Good morning", "Guten Tag", "Dzień dobry"])
         #expect(store.session.turns.map(\.detectedLanguage) == ["en", "de", "pl"])
+        // Each turn after the first now also carries one bounded page of
+        // look-back context (the immediately preceding turn) — see
+        // GlassesPresentationLayer.conversationPages(for:previousTurn:).
         #expect(await spy.displayedPageSets == [
             ["Good morning\n\nUA: переклад"],
-            ["Guten Tag\n\nUA: переклад"],
-            ["Dzień dobry\n\nUA: переклад"],
+            ["Guten Tag\n\nUA: переклад", "Previous:\nGood morning\n\nUA: переклад"],
+            ["Dzień dobry\n\nUA: переклад", "Previous:\nGuten Tag\n\nUA: переклад"],
         ])
     }
 

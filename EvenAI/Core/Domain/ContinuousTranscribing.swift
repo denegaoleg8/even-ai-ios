@@ -22,13 +22,16 @@ enum TranscriptionUpdate: Sendable, Equatable {
 }
 
 /// Abstraction over continuous, foreground speech transcription sourced
-/// from G2's own microphone PCM stream (`GlassesTransport.microphonePCMUpdates()`)
-/// — G2's own microphone, relayed over BLE, is the only audio source
-/// anywhere in this app; there is no phone-microphone path.
-/// `GlassesSpeechTranscriber` is the concrete implementation (Apple's
-/// `Speech` framework, fed manually constructed `AVAudioPCMBuffer`s — no
-/// `AVAudioEngine` mic tap, since the audio doesn't come from the phone's
-/// own hardware).
+/// from a PCM stream (`GlassesTransport.microphonePCMUpdates()`) — either
+/// G2's own microphone relayed over BLE, or (once `AudioSource.phoneMic`
+/// is selected) the phone's own mic, captured by the SDK's own
+/// `PhoneMic`/`AVAudioEngine` internals and delivered through the exact
+/// same delegate callback; this protocol itself has no audio-source
+/// concept of its own either way. `GlassesSpeechTranscriber` is the
+/// concrete implementation (Apple's `Speech` framework, fed manually
+/// constructed `AVAudioPCMBuffer`s — no `AVAudioEngine` mic tap of its
+/// own, since the audio arrives already captured, from whichever source
+/// was selected).
 ///
 /// `SFSpeechRecognizer`'s practical on-device session-duration limit is
 /// handled internally too: sessions are restarted transparently mid-stream
@@ -46,4 +49,20 @@ protocol ContinuousTranscribing: Sendable {
     /// Stops the current session and tears down any in-flight recognition
     /// state. Safe to call even if not currently transcribing.
     func stopTranscribing() async
+
+    /// Lifetime count of automatic reconnect attempts made by this
+    /// transcriber instance — `CONVERSATION_SESSION_METRICS`'s
+    /// `sttReconnects` field (Section 2/3 audio-reliability
+    /// instrumentation). Defaults to `0` via the extension below; only
+    /// `OpenAIRealtimeTranscriber` (the one implementation that owns a
+    /// real, reconnectable socket) has anything to report.
+    /// `ScriptedContinuousTranscriber`/`GlassesSpeechTranscriber` (no
+    /// reconnect concept) need no changes to conform.
+    var reconnectCount: Int { get async }
+}
+
+extension ContinuousTranscribing {
+    var reconnectCount: Int {
+        get async { 0 }
+    }
 }

@@ -92,6 +92,60 @@ enum GlassesPresentationLayer {
         }
     }
 
+    /// The G2 conversation timeline (major redesign pass, Conversation
+    /// Mode) — `pages(for:)`'s output (current turn + its replies, page
+    /// 0 always "live"), with ONE bounded page of look-back context
+    /// appended at the very end if `previousTurn` has a translation.
+    /// Deliberately just one prior turn, not an arbitrary-depth scroll:
+    /// G2 is a fixed 576×288 canvas with no native scroll surface — the
+    /// product's own instruction is "render a WINDOW of it," not attempt
+    /// infinite history on-device. Appended AFTER replies (not before),
+    /// so "page 0 = live" stays a simple, unconditional invariant
+    /// `LiveTranslationService`'s follow-live tracking depends on
+    /// (`GlassesNavigationEvent.pageChanged(index: 0)` always means "back
+    /// on the live turn," regardless of how many reply pages exist for
+    /// it) — swiping past all replies is what reaches history context,
+    /// mirroring Even's own "Teleprompt" reference UX (auto-forward
+    /// content, manual swipe for anything else).
+    static func conversationPages(
+        for currentTurn: ConversationTurn,
+        previousTurn: ConversationTurn?,
+        maxCharactersPerPage: Int = GlassesTextPaginator.defaultMaxCharactersPerPage
+    ) -> [String] {
+        var result = pages(for: currentTurn, maxCharactersPerPage: maxCharactersPerPage)
+        guard !result.isEmpty else { return result } // no translation yet — no page at all, same as pages(for:)
+        if let previousTurn, let contextPage = historyViewportPage(for: previousTurn, maxCharactersPerPage: maxCharactersPerPage) {
+            result.append(contextPage)
+        }
+        return result
+    }
+
+    /// A single dedicated page for one turn's history-viewport content —
+    /// used both by `conversationPages(for:previousTurn:)` (to append the
+    /// live turn's trailing look-back page) AND, on demand, directly by
+    /// `LiveTranslationService.renderHistoryViewport(anchorTurnID:)` when
+    /// `.browsingHistory` is entered/re-entered — so history always
+    /// renders identically regardless of which of those two call sites
+    /// produced it. `nil` if `turn` has no usable translation (Ukrainian
+    /// speech, a failed/removed turn — shouldn't happen since only
+    /// committed, translated turns ever reach `agentContextStore`, but
+    /// defensive regardless).
+    static func historyViewportPage(for turn: ConversationTurn, maxCharactersPerPage: Int = GlassesTextPaginator.defaultMaxCharactersPerPage) -> String? {
+        guard let translation = turn.ukrainianTranslation?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !translation.isEmpty
+        else {
+            return nil
+        }
+        let page = "Previous:\n" + conversationHeader(originalText: turn.originalText, translation: translation)
+        guard page.count > maxCharactersPerPage else { return page }
+        // Rare overflow — degrade to a hard truncation rather than
+        // multi-page-splitting a page whose whole point is being ONE
+        // compact look-back summary; unlike the live turn's own header,
+        // this isn't the primary content, so losing its tail to fit one
+        // page is an acceptable, rare degradation.
+        return String(page.prefix(maxCharactersPerPage))
+    }
+
     /// A single, unpaginated page for a still-in-progress (partial) or
     /// just-finalized utterance being streamed to G2 in place — major
     /// performance pass ("translation should begin appearing as close to

@@ -15,7 +15,7 @@ import Foundation
 @MainActor
 @Suite("LiveTranslationService + G2 display (GlassesPresentationLayer)")
 struct LiveTranslationServiceG2DisplayTests {
-    private static let propagationDelay: Duration = .milliseconds(30)
+    private static let propagationDelay: Duration = .milliseconds(100)
 
     private static func reply(_ original: String, _ ukrainian: String, ordering: Int) -> SuggestedReply {
         SuggestedReply(originalLanguageText: original, ukrainianText: ukrainian, ordering: ordering)
@@ -321,7 +321,9 @@ struct LiveTranslationServiceG2DisplayTests {
         #expect(store.session.turns.map(\.originalText) == ["Guten Tag", "Wie geht es dir"])
         let calls = await spy.displayedPageSets
         #expect(calls.count == 3) // A translated, A+replies, B translated
-        #expect(calls.last == [Self.header("Wie geht es dir", "переклад")])
+        // B also carries one page of look-back context (A) — see
+        // GlassesPresentationLayer.conversationPages(for:previousTurn:).
+        #expect(calls.last == [Self.header("Wie geht es dir", "переклад"), "Previous:\nGuten Tag\n\nUA: переклад"])
         #expect(service.currentTurnDisplayState == .translated(turnID: store.session.turns.last!.id))
     }
 
@@ -359,9 +361,11 @@ struct LiveTranslationServiceG2DisplayTests {
 
         let calls = await spy.displayedPageSets
         #expect(calls.count == 3)
-        // Turn B's header-only page must be exactly the header — no trace
-        // of turn A's "Old reply" content.
-        #expect(calls.last == [Self.header("second phrase", "переклад")])
+        // Turn B's page set must be exactly the header + one page of
+        // look-back context for turn A — no trace of turn A's "Old
+        // reply" content, which belonged only to A's own (superseded)
+        // reply-stage display.
+        #expect(calls.last == [Self.header("second phrase", "переклад"), "Previous:\nfirst phrase\n\nUA: переклад"])
         #expect(!calls.last!.contains { $0.contains("Old reply") })
     }
 

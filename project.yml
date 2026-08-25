@@ -81,20 +81,23 @@ targets:
         UIBackgroundModes:
           - bluetooth-central
           - audio
-        # Live Translation (the only Voice feature — phone-mic dictation
-        # was removed): G2's own microphone, relayed over BLE, is the
-        # actual audio source — GlassesSpeechTranscriber never opens the
-        # phone's own mic hardware. NSMicrophoneUsageDescription is kept
-        # rather than removed even so: GlassesSpeechTranscriber activates
-        # a real AVAudioSession(.record) purely to hold the `audio`
+        # Live Translation's default audio source is still G2's own
+        # microphone, relayed over BLE — GlassesSpeechTranscriber itself
+        # never opens the phone's mic hardware for that path.
+        # NSMicrophoneUsageDescription was kept even for that default path
+        # since GlassesSpeechTranscriber activates a real
+        # AVAudioSession(.record) purely to hold the `audio`
         # background-execution grant (see UIBackgroundModes above), and
-        # whether that bare category activation alone triggers iOS's
-        # microphone-permission gate (as opposed to only an actual
-        # AVAudioEngine/AVCaptureDevice mic tap, which never happens here)
-        # isn't fully certain — keeping the key is the safe side of that
-        # uncertainty, since a genuinely-required key that's missing is a
-        # hard crash, not a graceful failure.
-        NSMicrophoneUsageDescription: "Even AI may use audio session access to power Live Translation with your Even G2 glasses."
+        # whether bare category activation alone triggers iOS's
+        # microphone-permission gate wasn't fully certain.
+        #
+        # As of Conversation Mode's "Audio Source: G2 Mic | Phone Mic"
+        # option (see AudioSource.swift), the phone-mic path is no longer
+        # hypothetical: selecting Phone Mic routes through the Mentra SDK's
+        # own PhoneMic (AVAudioEngine-based) capture, a genuine mic tap —
+        # so this string must read correctly for that real case too, not
+        # just the background-session-grant case above.
+        NSMicrophoneUsageDescription: "Even AI uses your microphone to power Live Translation — either relayed from your Even G2 glasses, or directly from your phone when Phone Mic is selected as the audio source."
         NSSpeechRecognitionUsageDescription: "Even AI uses on-device speech recognition to detect foreign-language phrases spoken near your Even G2 glasses and translate them to Ukrainian."
         EVEN_AI_API_BASE_URL: "$(EVEN_AI_API_BASE_URL)"
         ITSAppUsesNonExemptEncryption: false

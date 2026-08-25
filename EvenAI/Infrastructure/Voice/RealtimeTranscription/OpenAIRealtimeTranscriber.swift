@@ -55,6 +55,23 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
     /// working again (`.sessionStarted`/`.finalTranscript`), so a later,
     /// independent drop still gets its own single retry.
     private var hasReconnectedSinceLastSuccess = false
+    /// Lifetime count of reconnect attempts this instance has made —
+    /// `STT_RECONNECT_COUNT` (Conversation Mode audio-reliability
+    /// instrumentation). Never reset between sessions (this instance is
+    /// constructed once, in `EvenAIApp`) — a rising count across a long
+    /// meeting is itself a useful reliability signal.
+    private(set) var reconnectCount = 0
+    /// Audio-reliability instrumentation (Section 2/3): whether
+    /// `STT_FIRST_PARTIAL_TS`/`STT_FIRST_FINAL_TS` have already logged
+    /// for the CURRENT `startTranscribing(pcmUpdates:)` session — reset
+    /// there, so each new session gets its own first-partial/first-final
+    /// timestamp rather than only ever logging once per process
+    /// lifetime. Deliberately NOT reset on a mid-session reconnect
+    /// (`handleUnexpectedClose`'s own retry path) — "first partial/final
+    /// of this Live Translation session," not "of this specific socket
+    /// connection."
+    private var hasLoggedFirstPartialThisSession = false
+    private var hasLoggedFirstFinalThisSession = false
 
     init(makeSocket: @escaping () async -> RealtimeTranscriptionSocket) {
         self.makeSocket = makeSocket
@@ -68,6 +85,8 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
         stopInternal()
         isActive = true
         hasReconnectedSinceLastSuccess = false
+        hasLoggedFirstPartialThisSession = false
+        hasLoggedFirstFinalThisSession = false
 
         // TEMPORARY diagnostics for the Milestone 8b physical-device
         // failure ("Live Translation stopped unexpectedly") — remove
@@ -79,6 +98,7 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
         do {
             let eventStream = try await newSocket.connect()
             DiagnosticTrace.log("8B_TRACE", "WS_CONNECTED backend socket connected")
+            DiagnosticTrace.log("STT_SOCKET_CONNECTED_TS", "value=\(Date().timeIntervalSince1970)")
             return try buildStream(from: eventStream, pcmUpdates: pcmUpdates, socket: newSocket)
         } catch {
             DiagnosticTrace.log("8B_TRACE", "ERROR connect() threw before any stream existed: \(error)")
@@ -95,14 +115,34 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
             self.continuation = continuation
 
             var hasLoggedFirstPCM = false
+            // Created exactly ONCE per `startTranscribing(pcmUpdates:)`
+            // call (never recreated by `handleUnexpectedClose`'s
+            // reconnect path — `pcmUpdates` is a single-consumer
+            // `AsyncStream`, and running a second `for await` over it
+            // concurrently would silently split its elements between two
+            // competing consumers, not deliver every chunk to both). It
+            // stays alive across an unlimited number of reconnects by
+            // routing every chunk through `self.socket` — read FRESH on
+            // every iteration, never the `newSocket` parameter captured
+            // here — since `socket` is reassigned to the new connection
+            // the moment a reconnect succeeds (both in
+            // `startTranscribing` and in `handleUnexpectedClose`). Fixes
+            // a real bug found auditing reconnect behavior: routing to
+            // the captured `newSocket` instead meant every PCM chunk
+            // kept being silently sent (`try?`) to the ORIGINAL, by-then
+            // -closed socket after any reconnect — the new connection's
+            // event stream could still work, but the backend would never
+            // receive another byte of audio to transcribe from it.
             pcmConsumerTask = Task { [weak self] in
                 for await data in pcmUpdates {
                     guard let self, self.isActive else { break }
                     if !hasLoggedFirstPCM {
                         hasLoggedFirstPCM = true
                         DiagnosticTrace.log("8B_TRACE", "FIRST_PCM forwarding first PCM chunk, bytes=\(data.count)")
+                        DiagnosticTrace.log("STT_FIRST_AUDIO_SENT_TS", "value=\(Date().timeIntervalSince1970)")
                     }
-                    try? await newSocket.sendPCM(data)
+                    guard let currentSocket = self.socket else { continue }
+                    try? await currentSocket.sendPCM(data)
                 }
             }
 
@@ -143,6 +183,10 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
                     // comment for why surfacing this is what actually makes
                     // "translation appears near-real-time" possible.
                     DiagnosticTrace.log("LATENCY_TRACE", "AUDIO_TO_PARTIAL_TS value=\(Date().timeIntervalSince1970)")
+                    if !hasLoggedFirstPartialThisSession {
+                        hasLoggedFirstPartialThisSession = true
+                        DiagnosticTrace.log("STT_FIRST_PARTIAL_TS", "value=\(Date().timeIntervalSince1970)")
+                    }
                     continuation?.yield(.partial(text))
                 case .finalTranscript(let text):
                     hasReconnectedSinceLastSuccess = false
@@ -150,6 +194,10 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
                     // root-caused. See DiagnosticTrace.swift.
                     DiagnosticTrace.log("UPSTREAM_TRACE", "STT_FINAL text=\"\(text.prefix(60))\"")
                     DiagnosticTrace.log("8B_TRACE", "FINAL_CALLBACK yielding final transcript, length=\(text.count)")
+                    if !hasLoggedFirstFinalThisSession {
+                        hasLoggedFirstFinalThisSession = true
+                        DiagnosticTrace.log("STT_FIRST_FINAL_TS", "value=\(Date().timeIntervalSince1970)")
+                    }
                     continuation?.yield(.final(text))
                 case .languageInfo(let languages):
                     lastKnownLanguages = languages
@@ -191,13 +239,16 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
             return
         }
         hasReconnectedSinceLastSuccess = true
+        reconnectCount += 1
         DiagnosticTrace.log("8B_TRACE", "reconnect attempt starting (previous error=\(String(describing: error)))")
+        DiagnosticTrace.log("STT_RECONNECT_COUNT", "value=\(reconnectCount)")
 
         let newSocket = await makeSocket()
         socket = newSocket
         do {
             let eventStream = try await newSocket.connect()
             DiagnosticTrace.log("8B_TRACE", "WS_CONNECTED (reconnect) backend socket connected")
+            DiagnosticTrace.log("STT_SOCKET_CONNECTED_TS", "value=\(Date().timeIntervalSince1970)")
             eventConsumerTask = Task { [weak self] in
                 await self?.consume(eventStream, from: newSocket)
             }
