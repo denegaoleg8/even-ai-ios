@@ -18,6 +18,16 @@ import Observation
 final class AuthState {
     private(set) var currentUser: User?
     private(set) var isRestoringSession = true
+    /// True only when `restoreSession()`/`retrySession()` genuinely
+    /// failed — BOTH the refresh and anonymous-device recovery tiers
+    /// were exhausted, not merely "hasn't resolved yet" (that's what
+    /// `isRestoringSession` already covers). Section J's self-heal
+    /// audit: this is what lets Settings show a real "Retry Session"
+    /// affordance instead of leaving the user with no explanation for
+    /// why nothing works. Cleared the moment recovery succeeds again,
+    /// whether via an explicit `retrySession()` call or a later reactive
+    /// recovery elsewhere in the app (see `observeSessionChanges()`).
+    private(set) var sessionRecoveryFailed = false
     /// Set by `signIn` when the device already had its own local
     /// (anonymous) account with chats — see `AuthResult.mergeAvailableFrom`.
     /// Deliberately *not* cleared just because the merge screen was
@@ -59,7 +69,32 @@ final class AuthState {
     func restoreSession() async {
         isRestoringSession = true
         defer { isRestoringSession = false }
-        currentUser = try? await authService.restoreSession()
+        do {
+            currentUser = try await authService.restoreSession()
+            sessionRecoveryFailed = false
+        } catch {
+            // Both recovery tiers were exhausted — a genuine failure,
+            // not merely "hasn't resolved yet." `currentUser` stays
+            // whatever it already was (`nil` on a first launch) — the
+            // app must remain usable; this only surfaces the failure so
+            // Settings can offer a real "Retry Session" affordance
+            // instead of the previous silent `try?` leaving no trace
+            // anywhere that recovery ever actually failed.
+            sessionRecoveryFailed = true
+        }
+    }
+
+    /// Explicit, user-initiated retry (Settings' "Retry Session"
+    /// button) — see `AuthServicing.retrySession()`'s own doc comment
+    /// for why this bypasses the cooldown a recently-failed automatic
+    /// recovery leaves in place elsewhere in the app.
+    func retrySession() async {
+        do {
+            currentUser = try await authService.retrySession()
+            sessionRecoveryFailed = false
+        } catch {
+            sessionRecoveryFailed = true
+        }
     }
 
     func signUp(email: String, password: String, displayName: String?) async throws {
@@ -134,6 +169,13 @@ final class AuthState {
                 // for) means the cache no longer matches who's signed in.
                 let identityChanged = self.currentUser?.id != user.id
                 self.currentUser = user
+                // A session that just resolved via this stream is, by
+                // definition, no longer failed — this is what makes a
+                // LATER, reactive recovery (e.g. Chat's own 401 path
+                // succeeding after a transient blip) clear a stale
+                // "Retry Session" affordance in Settings without the
+                // user needing to tap it themselves.
+                self.sessionRecoveryFailed = false
                 if identityChanged {
                     await invalidateChatCache()
                 }

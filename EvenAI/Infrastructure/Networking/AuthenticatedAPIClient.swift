@@ -45,17 +45,60 @@ actor AuthenticatedAPIClient {
     private var accessToken: String?
     private var recoveryTask: Task<User, Error>?
     private var sessionChangeContinuation: AsyncStream<User>.Continuation?
+    /// The one authoritative session state — see `SessionState`'s own
+    /// doc comment. Updated at every transition inside
+    /// `performRecovery()`/`ensureSession()`, alongside the matching
+    /// `SESSION_STATE_PUBLISHED` trace.
+    private var sessionState: SessionState = .unknown
+    /// The most recent recovery FAILURE and when it happened — the
+    /// cooldown state that makes `recoverSession()` stop hammering the
+    /// backend when it's already told this device "no" moments ago.
+    /// Real evidence this matters: `AuthenticatedAPIClient.performOnce`'s
+    /// reactive 401→recover path is UNCONDITIONAL — every single
+    /// authenticated REST call this app makes (Chat's `fetchChats`,
+    /// `fetchChat`, `fetchMessages`, ...) independently triggers its own
+    /// `recoverSession()` attempt the moment it sees a 401, with no
+    /// memory of "we already tried this and the backend said no" a
+    /// second ago. Without this cooldown, a single genuinely-exhausted
+    /// `/auth/device` rate-limit window (20 requests/15 minutes,
+    /// enforced server-side — see `even-ai-assistant-asr`'s
+    /// `authRateLimit`) gets hit again by literally every dependent
+    /// screen's own load attempt, each burning another attempt against
+    /// the same limit and extending how long the device stays locked
+    /// out — which is exactly the physical-device symptom under
+    /// investigation ("Your session couldn't be verified" for Live
+    /// Translation, Chat simply never loading). This is NOT a retry
+    /// mechanism — it suppresses REDUNDANT ones. `recoveryFailureCooldown`
+    /// is intentionally short: long enough to stop the immediate,
+    /// automatic pile-on from every independent consumer's own reactive
+    /// 401 handling, short enough that a user who waits even a few
+    /// seconds and retries deliberately (or `retrySessionRecovery()`,
+    /// which bypasses this explicitly) is never meaningfully blocked.
+    private var lastRecoveryFailure: (error: Error, at: ContinuousClock.Instant)?
+    private let recoveryFailureCooldown: Duration
+    private let clock: ContinuousClock
 
     init(
         baseURL: URL = BackendConfiguration.baseURL,
         session: URLSession = .shared,
         tokenStore: AuthTokenStoring = KeychainAuthTokenStore(),
-        deviceIdentityStore: DeviceIdentityStoring = KeychainDeviceIdentityStore()
+        deviceIdentityStore: DeviceIdentityStoring = KeychainDeviceIdentityStore(),
+        recoveryFailureCooldown: Duration = .seconds(5)
     ) {
         self.baseURL = baseURL
         self.session = session
         self.tokenStore = tokenStore
         self.deviceIdentityStore = deviceIdentityStore
+        self.recoveryFailureCooldown = recoveryFailureCooldown
+        self.clock = ContinuousClock()
+    }
+
+    /// A snapshot of the one authoritative session state, right now —
+    /// what Chat/Live Translation/Settings read to answer "is there a
+    /// usable credential" without triggering any network activity of
+    /// their own.
+    func currentSessionState() -> SessionState {
+        sessionState
     }
 
     // MARK: - Token state
@@ -69,11 +112,14 @@ actor AuthenticatedAPIClient {
     func installSession(accessToken: String, refreshToken: String) {
         self.accessToken = accessToken
         tokenStore.save(refreshToken: refreshToken)
+        publish(.ready(.authenticated))
     }
 
     /// Clears both the in-memory access token and the persisted refresh
-    /// token — used by sign-out, and internally by a refresh that itself
-    /// fails, so neither survives to be reused.
+    /// token — used by sign-out, and internally by `performRefresh(refreshToken:)`
+    /// ONLY when the backend has explicitly said the refresh token is
+    /// invalid (see that method's own doc comment for why every OTHER
+    /// failure kind deliberately does NOT reach here).
     func clearSession() {
         accessToken = nil
         tokenStore.clear()
@@ -113,13 +159,44 @@ actor AuthenticatedAPIClient {
     /// device's anonymous account. Single-flight: concurrent callers
     /// (whether from an explicit launch-time restore or several requests
     /// independently hitting a 401 at once) share exactly one recovery
-    /// attempt, not N. Throws only if *both* tiers fail — typically means
-    /// no network at all.
+    /// attempt, not N — this is true by construction (actor isolation:
+    /// `recoveryTask` can only be read/written serially, so no two
+    /// callers can ever both observe it `nil` and each start their own
+    /// task). Throws only if *both* tiers fail.
+    ///
+    /// ALSO cooldown-protected against REPEATED failed attempts arriving
+    /// close together — see `lastRecoveryFailure`'s own doc comment for
+    /// the exact physical-device symptom this fixes. Bypassed only by
+    /// `retrySessionRecovery()`, an explicit user-initiated action.
     @discardableResult
     func recoverSession() async throws -> User {
         if let existing = recoveryTask {
+            DiagnosticTrace.log("SESSION_SINGLE_FLIGHT_JOINED", "")
             return try await existing.value
         }
+        if let lastFailure = lastRecoveryFailure, clock.now - lastFailure.at < recoveryFailureCooldown {
+            DiagnosticTrace.log("SESSION_RECOVERY_COOLDOWN_ACTIVE", "suppressing a redundant attempt — reusing the recent failure")
+            throw lastFailure.error
+        }
+        return try await startRecovery()
+    }
+
+    /// Explicit, user-initiated retry (Section J's "Retry Session"
+    /// affordance) — the ONE way to bypass `recoverSession()`'s cooldown.
+    /// Safe against an infinite loop by construction: this is only ever
+    /// invoked by a real human tapping a button, never by this class's
+    /// own code, so nothing here can call it repeatedly on its own.
+    @discardableResult
+    func retrySessionRecovery() async throws -> User {
+        lastRecoveryFailure = nil
+        if let existing = recoveryTask {
+            DiagnosticTrace.log("SESSION_SINGLE_FLIGHT_JOINED", "")
+            return try await existing.value
+        }
+        return try await startRecovery()
+    }
+
+    private func startRecovery() async throws -> User {
         let task = Task { try await performRecovery() }
         recoveryTask = task
         defer { recoveryTask = nil }
@@ -144,15 +221,16 @@ actor AuthenticatedAPIClient {
     /// one and only caller of this method briefly did — churns the ONE
     /// session Live Translation and Chat share far more than necessary,
     /// and risks cascading into `/auth/device`'s rate limit if a refresh
-    /// attempt ever comes back invalid for any reason (that failure path
-    /// clears the stored session and falls back to a full device
-    /// re-authentication). This only ever recovers when there is
-    /// genuinely NO credential attached yet — the exact "missing
-    /// Authorization header" case a WebSocket connect needs to guard
-    /// against, without manufacturing new load on every reconnect that
-    /// already has a perfectly good token.
+    /// attempt ever comes back invalid for any reason. This only ever
+    /// recovers when there is genuinely NO credential attached yet — the
+    /// exact "missing Authorization header" case a WebSocket connect
+    /// needs to guard against, without manufacturing new load on every
+    /// reconnect that already has a perfectly good token.
     func ensureSession() async throws {
-        guard accessToken == nil else { return }
+        guard accessToken == nil else {
+            DiagnosticTrace.log("SESSION_ACCESS_TOKEN_VALID", "")
+            return
+        }
         _ = try await recoverSession()
     }
 
@@ -304,6 +382,7 @@ actor AuthenticatedAPIClient {
                 // an expired one. `recoverOn401` is what lets `login`
                 // opt out instead, since a 401 there always means wrong
                 // credentials regardless of whether a token was sent.
+                DiagnosticTrace.log("SESSION_ACCESS_TOKEN_EXPIRED", "path=\(path)")
                 _ = try await recoverSession()
                 let retryRequest = try await makeRequest(path: path, method: method, body: body)
                 let (retryData, retryResponse) = try await session.data(for: retryRequest)
@@ -330,50 +409,168 @@ actor AuthenticatedAPIClient {
         }
     }
 
-    // MARK: - Recovery (single-flight, two-tiered)
+    // MARK: - Recovery (single-flight, two-tiered, cooldown-protected)
+    //
+    // The deterministic launch/recovery flow (Section E of the session-
+    // lifecycle audit this rewrite comes from):
+    //   1. Load persisted session — `tokenStore.currentRefreshToken()`.
+    //   2. A valid IN-MEMORY access token short-circuits entirely — see
+    //      `ensureSession()`; this whole section only ever runs when one
+    //      is genuinely absent.
+    //   3. Else, if a refresh token exists → attempt refresh.
+    //   4. Else (or if refresh was DEFINITIVELY invalid) → anonymous
+    //      device-auth recovery.
+    //   5. The resulting credential is persisted atomically inside
+    //      `performRefresh`/`performDeviceAuth` themselves (in-memory
+    //      `accessToken` write + `tokenStore.save` happen together, with
+    //      no `await` between them — nothing can observe a half-written
+    //      state).
+    //   6. `sessionState` is published at every transition (below).
+    //   7. Every consumer (Chat, Live Translation) goes through
+    //      `recoverSession()`/`ensureSession()`, never its own bespoke
+    //      recovery — this method is the ONE place that runs.
 
     private func performRecovery() async throws -> User {
-        let user: User
-        if tokenStore.currentRefreshToken() != nil, let refreshed = try? await performRefresh() {
-            user = refreshed
-        } else {
-            // The one previously-silent transition this whole mechanism
-            // exists to catch (see the class doc comment and
-            // `sessionChanges()`): a signed-in session just became an
-            // anonymous one, possibly mid-request, with no explicit
-            // sign-out ever called. Never log the account id or any
-            // token — just that it happened.
-            AppLogger.auth.notice("Session recovery fell back to an anonymous device session (missing, expired, or revoked refresh token)")
-            user = try await performDeviceAuth()
+        DiagnosticTrace.log(
+            "SESSION_STATE_LOADED",
+            "hasRefreshToken=\(tokenStore.currentRefreshToken() != nil)"
+        )
+        publish(.recovering)
+
+        if let refreshToken = tokenStore.currentRefreshToken() {
+            DiagnosticTrace.log("SESSION_REFRESH_STARTED", "")
+            do {
+                let user = try await performRefresh(refreshToken: refreshToken)
+                DiagnosticTrace.log("SESSION_REFRESH_SUCCEEDED", "")
+                succeed(user, as: .authenticated)
+                return user
+            } catch RefreshFailure.permanentlyInvalid(let underlying) {
+                DiagnosticTrace.log("SESSION_REFRESH_FAILED", "reason=invalidCredential")
+                // Self-heal: the backend explicitly told us this
+                // refresh token will never work again — this is the
+                // ONLY condition that clears it (see `performRefresh`'s
+                // own doc comment for why every other failure kind must
+                // NOT reach here). Falls through to anonymous recovery
+                // below, matching the deterministic flow's step 4.
+                clearSession()
+                _ = underlying
+            } catch {
+                // A TRANSIENT refresh failure (backend 5xx, offline,
+                // malformed response) — the refresh token itself was
+                // never judged invalid, so it must NOT be cleared, and
+                // this must NOT fall through to anonymous recovery
+                // (which would silently demote a signed-in user to
+                // anonymous over a mere network hiccup, and could ALSO
+                // hit `/auth/device`'s rate limit for no reason). Fail
+                // outright, preserving the credential for the next
+                // attempt — exactly the fix for the real bug found
+                // auditing this: the old code cleared the refresh token
+                // on ANY non-2xx response from `/auth/refresh`.
+                let reason = Self.classifyRecoveryFailure(error)
+                DiagnosticTrace.log("SESSION_REFRESH_FAILED", "reason=\(reason.underlyingDescription)")
+                fail(error, reason: reason)
+                throw error
+            }
         }
-        sessionChangeContinuation?.yield(user)
-        return user
+
+        // The one previously-silent transition this whole mechanism
+        // exists to catch (see the class doc comment and
+        // `sessionChanges()`): a signed-in session just became an
+        // anonymous one, possibly mid-request, with no explicit
+        // sign-out ever called. Never log the account id or any
+        // token — just that it happened.
+        AppLogger.auth.notice("Session recovery fell back to an anonymous device session (missing, expired, or revoked refresh token)")
+        DiagnosticTrace.log("SESSION_ANONYMOUS_RECOVERY_STARTED", "")
+        do {
+            let user = try await performDeviceAuth()
+            DiagnosticTrace.log("SESSION_ANONYMOUS_RECOVERY_SUCCEEDED", "")
+            succeed(user, as: .anonymous)
+            return user
+        } catch {
+            let reason = Self.classifyRecoveryFailure(error)
+            DiagnosticTrace.log("SESSION_ANONYMOUS_RECOVERY_FAILED", "reason=\(reason.underlyingDescription)")
+            fail(error, reason: reason)
+            throw error
+        }
     }
 
-    private func performRefresh() async throws -> User {
-        guard let refreshToken = tokenStore.currentRefreshToken() else {
-            throw AuthenticatedAPIClientError.notAuthenticated
-        }
+    private func succeed(_ user: User, as type: SessionCredentialType) {
+        publish(.ready(type))
+        DiagnosticTrace.log("SESSION_CREDENTIAL_AVAILABLE", "type=\(type.rawValue)")
+        lastRecoveryFailure = nil
+        sessionChangeContinuation?.yield(user)
+    }
 
+    private func fail(_ error: Error, reason: SessionRecoveryFailureReason) {
+        publish(.failed(reason))
+        DiagnosticTrace.log("SESSION_CREDENTIAL_MISSING", "")
+        lastRecoveryFailure = (error, clock.now)
+    }
+
+    private func publish(_ state: SessionState) {
+        sessionState = state
+        DiagnosticTrace.log("SESSION_STATE_PUBLISHED", "state=\(state)")
+    }
+
+    /// The real classifier behind `LiveTranslationStartError
+    /// .classifyTranscriberStartFailure(_:)`'s own `AuthenticatedAPIClientError`
+    /// handling, reused here so `SessionRecoveryFailureReason` and that
+    /// type's classification never drift apart. A 429 (rate-limited) is
+    /// deliberately NEVER `.invalidCredential`-adjacent — a backend
+    /// telling this device to slow down says nothing about whether the
+    /// credential itself is valid.
+    private static func classifyRecoveryFailure(_ error: Error) -> SessionRecoveryFailureReason {
+        guard let apiError = error as? AuthenticatedAPIClientError else { return .unknown }
+        switch apiError {
+        case .offline:
+            return .offline
+        case .http(let status, let code):
+            if status == 429 || code == "RATE_LIMITED" { return .rateLimited }
+            return status >= 500 ? .backendUnavailable : .invalidCredential
+        case .notAuthenticated, .sessionExpired:
+            return .invalidCredential
+        case .invalidResponse, .underlying:
+            return .backendUnavailable
+        }
+    }
+
+    private enum RefreshFailure: Error {
+        case permanentlyInvalid(underlying: Error)
+    }
+
+    /// Distinguishes a DEFINITIVE "this refresh token will never work
+    /// again" response (a 401, the backend's own `INVALID_REFRESH_TOKEN`
+    /// contract — see `even-ai-assistant-asr`'s `/auth/refresh` handler)
+    /// from every other failure kind (5xx, offline, malformed response),
+    /// which must be treated as transient — see `performRecovery()`'s
+    /// own doc comment for why conflating the two was a real bug.
+    private func performRefresh(refreshToken: String) async throws -> User {
         var request = URLRequest(url: baseURL.appending(path: "auth/refresh"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder.evenAI.encode(["refreshToken": refreshToken])
 
-        let (data, response) = try await session.data(for: request)
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch let urlError as URLError {
+            throw Self.classify(urlError)
+        }
         guard let http = response as? HTTPURLResponse else {
             throw AuthenticatedAPIClientError.invalidResponse
         }
         guard (200..<300).contains(http.statusCode) else {
-            // The refresh token itself is no longer usable — expired or
-            // revoked server-side. Clear it locally too, so nothing keeps
-            // retrying a token that will never work again; the anonymous
-            // fallback in performRecovery takes over from here.
-            clearSession()
-            throw AuthenticatedAPIClientError.sessionExpired
+            if http.statusCode == 401 {
+                throw RefreshFailure.permanentlyInvalid(underlying: AuthenticatedAPIClientError.sessionExpired)
+            }
+            let code = try? JSONDecoder().decode(APIErrorPayloadDTO.self, from: data).error.code
+            throw AuthenticatedAPIClientError.http(status: http.statusCode, code: code)
         }
 
         let decoded = try JSONDecoder.evenAI.decode(RefreshResponseDTO.self, from: data)
+        // Atomic from any external observer's perspective: both writes
+        // happen with no `await` between them, and this whole method
+        // runs on the actor, so nothing can read a half-updated state.
         accessToken = decoded.accessToken
         tokenStore.save(refreshToken: decoded.refreshToken)
         return decoded.account.toDomain()
@@ -392,7 +589,12 @@ actor AuthenticatedAPIClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder.evenAI.encode(payload)
 
-        let (data, response) = try await session.data(for: request)
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch let urlError as URLError {
+            throw Self.classify(urlError)
+        }
         try Self.validate(response, data: data)
 
         let decoded = try JSONDecoder.evenAI.decode(DeviceAuthResponseDTO.self, from: data)

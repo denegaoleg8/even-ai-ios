@@ -42,10 +42,42 @@ final class ChatViewModel {
             chatTitle = chat.title
             messages = try await chatService.fetchMessages(chatID: chatID)
             loadFailed = false
+            // Reaching here means whatever credential this request used
+            // (recovered proactively by `AuthenticatedAPIClient
+            // .performOnce`'s reactive 401 path if needed) was accepted
+            // by the backend — the same shared session Live Translation
+            // authenticates through. `type=` isn't independently known
+            // at this layer (`ChatViewModel` only holds `ChatServicing`,
+            // never `AuthenticatedAPIClient` directly — see this
+            // constructor's own doc comment on why that boundary is
+            // deliberate), so this reports the fact of success without
+            // over-reaching into a layer this type shouldn't depend on.
+            DiagnosticTrace.log("CHAT_AUTH_READY", "chatID=\(chatID)")
             DiagnosticTrace.log("CHAT_LOAD_SUCCESS", "chatID=\(chatID) messageCount=\(messages.count)")
         } catch {
             loadFailed = true
+            if let apiError = error as? AuthenticatedAPIClientError, Self.isAuthFailure(apiError) {
+                DiagnosticTrace.log("CHAT_AUTH_FAILED", "chatID=\(chatID) reason=\(apiError)")
+            }
             DiagnosticTrace.log("CHAT_LOAD_FAILED", "chatID=\(chatID) errorType=\(type(of: error)) errorMessage=\(error)")
+        }
+    }
+
+    /// Whether `error` reflects a genuine session/credential problem —
+    /// as opposed to an ordinary network hiccup or a backend error that
+    /// has nothing to do with authentication — matching
+    /// `AuthenticatedAPIClient.classifyRecoveryFailure(_:)`'s own
+    /// distinction (kept independently here since that method is
+    /// private to a different type; both classify the exact same
+    /// underlying `AuthenticatedAPIClientError` cases).
+    private static func isAuthFailure(_ error: AuthenticatedAPIClientError) -> Bool {
+        switch error {
+        case .notAuthenticated, .sessionExpired:
+            return true
+        case .http(let status, _):
+            return status == 401
+        case .offline, .invalidResponse, .underlying:
+            return false
         }
     }
 

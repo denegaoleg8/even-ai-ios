@@ -146,6 +146,23 @@ struct SettingsView: View {
                 }
                 .accessibilityIdentifier("settings.signInButton")
 
+                // Section J self-heal affordance: shown only once
+                // session recovery has genuinely failed (both the
+                // refresh and anonymous-device tiers exhausted — see
+                // `AuthState.sessionRecoveryFailed`'s own doc comment),
+                // never merely "not signed in yet." A real human tap is
+                // exactly the deliberate retry `AuthenticatedAPIClient
+                // .retrySessionRecovery()` is designed to let through
+                // even during its automatic-retry cooldown.
+                if authState.sessionRecoveryFailed {
+                    Button {
+                        Task { await authState.retrySession() }
+                    } label: {
+                        Label("Retry Session", systemImage: "arrow.clockwise")
+                    }
+                    .accessibilityIdentifier("settings.retrySessionButton")
+                }
+
                 deviceIDRow
             }
         } header: {

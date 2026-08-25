@@ -26,6 +26,20 @@ struct NetworkAuthService: AuthServicing {
         }
     }
 
+    /// Overrides the protocol's default (`restoreSession()`) to call
+    /// through to `AuthenticatedAPIClient.retrySessionRecovery()` instead
+    /// of `recoverSession()` — the one call that bypasses the cooldown a
+    /// recent failed recovery leaves in place, since this is only ever
+    /// reached via a deliberate human tap (see both methods' own doc
+    /// comments).
+    func retrySession() async throws -> User {
+        do {
+            return try await apiClient.retrySessionRecovery()
+        } catch {
+            throw Self.mapError(error)
+        }
+    }
+
     func signUp(email: String, password: String, displayName: String?) async throws -> User {
         var payload: [String: String] = ["email": email, "password": password]
         if let displayName { payload["displayName"] = displayName }

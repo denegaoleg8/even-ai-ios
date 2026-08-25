@@ -58,8 +58,13 @@ final class URLSessionRealtimeTranscriptionSocket: RealtimeTranscriptionSocket, 
         do {
             try await apiClient.ensureSession()
             DiagnosticTrace.log("LIVE_START_AUTH_RECOVERY_OK", "path=\(Self.path)")
+            let state = await apiClient.currentSessionState()
+            if case .ready(let type) = state {
+                DiagnosticTrace.log("STT_AUTH_READY", "type=\(type.rawValue)")
+            }
         } catch {
             DiagnosticTrace.log("LIVE_START_AUTH_RECOVERY_FAILED", "errorType=\(type(of: error)) errorMessage=\(error)")
+            DiagnosticTrace.log("STT_AUTH_FAILED", "reason=\(error)")
             throw error
         }
         var request = await apiClient.makeWebSocketRequest(path: Self.path)

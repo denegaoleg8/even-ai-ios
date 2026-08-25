@@ -23,6 +23,18 @@ protocol AuthServicing: Sendable {
     /// app must remain usable.
     func restoreSession() async throws -> User
 
+    /// Explicit, user-initiated retry after `restoreSession()` (or a
+    /// later reactive recovery) genuinely failed — Section J's "Retry
+    /// Session" affordance. Bypasses whatever cooldown the underlying
+    /// implementation uses to avoid hammering the backend with
+    /// automatic, uncoordinated retries (see `AuthenticatedAPIClient
+    /// .retrySessionRecovery()`), since a real human tapping a button is
+    /// exactly the deliberate, rate-limited-by-human-interaction retry
+    /// that cooldown is meant to still allow through. Defaults to
+    /// `restoreSession()` for any implementation with nothing special to
+    /// bypass (see the protocol extension below).
+    func retrySession() async throws -> User
+
     /// Claims the caller's current (anonymous) account with real
     /// credentials. Same account id before and after — nothing to
     /// migrate.
@@ -54,4 +66,10 @@ protocol AuthServicing: Sendable {
     /// needing a restart (see `AuthenticatedAPIClient.sessionChanges()`,
     /// which `NetworkAuthService` delegates straight to).
     func sessionChanges() async -> AsyncStream<User>
+}
+
+extension AuthServicing {
+    func retrySession() async throws -> User {
+        try await restoreSession()
+    }
 }

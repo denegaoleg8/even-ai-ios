@@ -88,7 +88,17 @@ enum LiveTranslationStartError: Error, Equatable {
                 return .backendUnavailable(underlying: apiError.localizedDescription)
             case .notAuthenticated, .sessionExpired:
                 return .authenticationFailed(underlying: apiError.localizedDescription)
-            case .http(let status, _):
+            case .http(let status, let code):
+                // A 429 (rate-limited) is never a credential problem —
+                // the backend telling this device "slow down" says
+                // nothing about whether the credential itself is valid.
+                // Reported as backendUnavailable, matching
+                // `SessionRecoveryFailureReason.rateLimited`'s own
+                // classification in `AuthenticatedAPIClient
+                // .classifyRecoveryFailure(_:)`, which this mirrors.
+                if status == 429 || code == "RATE_LIMITED" {
+                    return .backendUnavailable(underlying: apiError.localizedDescription)
+                }
                 return status >= 500
                     ? .backendUnavailable(underlying: apiError.localizedDescription)
                     : .authenticationFailed(underlying: apiError.localizedDescription)
