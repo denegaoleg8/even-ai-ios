@@ -23,7 +23,30 @@ final class URLSessionRealtimeTranscriptionSocket: RealtimeTranscriptionSocket, 
         self.urlSession = urlSession
     }
 
+    /// Root cause of the physical-device "Live Translation stopped
+    /// unexpectedly" failure (traced to `NSURLErrorDomain -1011` — a
+    /// non-101 WS handshake response — which the backend's own
+    /// `wsServer.js` produces as a raw, bodiless `401 Unauthorized`
+    /// whenever the upgrade request arrives with no `Authorization`
+    /// header at all): NOTHING in this call path used to ever call
+    /// `apiClient.recoverSession()` before attaching credentials,
+    /// despite `AuthenticatedAPIClient.makeWebSocketRequest`'s own doc
+    /// comment already promising a caller would do exactly that. Every
+    /// other authenticated call in this app gets "recover once, then
+    /// attach a valid token" for free from `AuthenticatedAPIClient
+    /// .performOnce`'s reactive 401→recover→retry path; a WebSocket
+    /// upgrade can't be retried in place the way a REST request's 401
+    /// can (a dropped/rejected WS reconnects as a whole new connection),
+    /// so the equivalent guarantee has to be proactive, here, on every
+    /// single connection attempt — the very first one AND every
+    /// reconnect (each of `OpenAIRealtimeTranscriber`'s bounded retry
+    /// attempts constructs a fresh `URLSessionRealtimeTranscriptionSocket`
+    /// and calls `connect()` on it again). `recoverSession()` itself is
+    /// what actually attaches a token whether the account is an
+    /// anonymous device session or a real signed-in one — this call site
+    /// doesn't need to (and shouldn't) know or care which.
     func connect() async throws -> AsyncThrowingStream<RealtimeTranscriptionEvent, Error> {
+        _ = try await apiClient.recoverSession()
         var request = await apiClient.makeWebSocketRequest(path: Self.path)
         request.url = Self.webSocketURL(from: request.url) ?? request.url
 
@@ -32,12 +55,24 @@ final class URLSessionRealtimeTranscriptionSocket: RealtimeTranscriptionSocket, 
         // Never logs the token itself, only whether one is present —
         // this directly tests whether `AuthenticatedAPIClient.accessToken`
         // was actually populated (e.g. by RootView's launch-time
-        // restoreSession()) by the moment Live Translation starts.
+        // restoreSession(), or — as of this fix — by the
+        // `recoverSession()` call directly above) by the moment Live
+        // Translation starts.
         let hasAuthHeader = request.value(forHTTPHeaderField: "Authorization") != nil
         DiagnosticTrace.log("8B_TRACE", "AUTH url=\(request.url?.absoluteString ?? "nil") hasAuthorizationHeader=\(hasAuthHeader)")
 
         let newTask = urlSession.webSocketTask(with: request)
         task = newTask
+        // Starts the task connecting asynchronously — this does NOT
+        // prove the WebSocket upgrade actually succeeded (a 401, or any
+        // other non-101 response, surfaces later, as `pump(_:into:)`'s
+        // own `task.receive()` throwing on its very first call — see
+        // that method's doc comment for the trace that actually confirms
+        // a genuine handshake, `WS_HANDSHAKE_CONFIRMED`). Logging
+        // "connected" from here, before that confirmation exists, is
+        // exactly what made a doomed-to-fail connection look identical
+        // to a healthy one in the physical-device trace that led to this
+        // fix.
         newTask.resume()
 
         return AsyncThrowingStream { continuation in
@@ -69,10 +104,25 @@ final class URLSessionRealtimeTranscriptionSocket: RealtimeTranscriptionSocket, 
         _ task: URLSessionWebSocketTask,
         into continuation: AsyncThrowingStream<RealtimeTranscriptionEvent, Error>.Continuation
     ) async {
+        // `task.receive()` succeeding for the first time is the earliest
+        // point this class can honestly say the WebSocket upgrade
+        // actually completed — `URLSessionWebSocketTask` gives no other
+        // async-friendly signal that fires exactly on a successful
+        // handshake (see `connect()`'s own doc comment for why logging
+        // this any earlier, e.g. right after `resume()`, was the bug).
+        // If the handshake failed (a 401, or anything else that isn't a
+        // 101 Switching Protocols response), THIS first `receive()` call
+        // throws instead, landing in the `catch` below with this flag
+        // still `false` — genuinely confirming the negative case too.
+        var hasConfirmedHandshake = false
         while !Task.isCancelled {
             let message: URLSessionWebSocketTask.Message
             do {
                 message = try await task.receive()
+                if !hasConfirmedHandshake {
+                    hasConfirmedHandshake = true
+                    DiagnosticTrace.log("WS_HANDSHAKE_CONFIRMED", "the WebSocket upgrade actually completed")
+                }
             } catch {
                 // TEMPORARY — remove once root-caused. `closeCode`/
                 // `closeReason` are only populated once the task has
@@ -81,7 +131,7 @@ final class URLSessionRealtimeTranscriptionSocket: RealtimeTranscriptionSocket, 
                 let nsError = error as NSError
                 DiagnosticTrace.log(
                     "8B_TRACE",
-                    "WS_CLOSED code=\(task.closeCode.rawValue) reason=\(task.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? "nil") error domain=\(nsError.domain) code=\(nsError.code) description=\(nsError.localizedDescription)"
+                    "WS_CLOSED handshakeConfirmed=\(hasConfirmedHandshake) code=\(task.closeCode.rawValue) reason=\(task.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? "nil") error domain=\(nsError.domain) code=\(nsError.code) description=\(nsError.localizedDescription)"
                 )
                 continuation.finish(throwing: error)
                 return

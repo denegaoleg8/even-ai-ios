@@ -114,9 +114,21 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
         let newSocket = await makeSocket()
         socket = newSocket
         do {
+            // `connect()` returning here proves only that the WS task
+            // was resumed (and, as of this fix, that a session was
+            // successfully recovered/attached) — NOT that the WebSocket
+            // upgrade itself succeeded. See
+            // `URLSessionRealtimeTranscriptionSocket.connect()`'s own
+            // doc comment: the genuine confirmation is
+            // `WS_HANDSHAKE_CONFIRMED`, logged separately, once
+            // `pump(_:into:)`'s first `receive()` call actually
+            // succeeds. Logging this checkpoint as "WS_CONNECTED" was
+            // the exact misleading trace that made a doomed-to-fail
+            // (401) connection attempt look identical to a healthy one
+            // in the physical-device trace that led to this fix.
             let eventStream = try await newSocket.connect()
-            DiagnosticTrace.log("8B_TRACE", "WS_CONNECTED backend socket connected")
-            DiagnosticTrace.log("STT_SOCKET_CONNECTED_TS", "value=\(Date().timeIntervalSince1970)")
+            DiagnosticTrace.log("8B_TRACE", "SOCKET_TASK_RESUMED handshake not yet confirmed — see WS_HANDSHAKE_CONFIRMED")
+            DiagnosticTrace.log("STT_SOCKET_TASK_RESUMED_TS", "value=\(Date().timeIntervalSince1970)")
             return try buildStream(from: eventStream, pcmUpdates: pcmUpdates, socket: newSocket)
         } catch {
             DiagnosticTrace.log("8B_TRACE", "ERROR connect() threw before any stream existed: \(error)")
@@ -277,10 +289,17 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
             let newSocket = await makeSocket()
             socket = newSocket
             do {
+                // Same caveat as the initial connection (see
+                // `startTranscribing`'s own comment): this only proves
+                // the reconnect attempt's task was resumed, not that its
+                // handshake succeeded — genuine confirmation is
+                // `WS_HANDSHAKE_CONFIRMED`, logged separately once this
+                // new socket's own `pump(_:into:)` actually receives
+                // something.
                 let eventStream = try await newSocket.connect()
-                DiagnosticTrace.log("8B_TRACE", "WS_CONNECTED (reconnect) backend socket connected")
-                DiagnosticTrace.log("STT_SOCKET_CONNECTED_TS", "value=\(Date().timeIntervalSince1970)")
-                DiagnosticTrace.log("STT_RECONNECT_SUCCEEDED", "attempt=\(attemptNumber)")
+                DiagnosticTrace.log("8B_TRACE", "SOCKET_TASK_RESUMED (reconnect) handshake not yet confirmed")
+                DiagnosticTrace.log("STT_SOCKET_TASK_RESUMED_TS", "value=\(Date().timeIntervalSince1970)")
+                DiagnosticTrace.log("STT_RECONNECT_ATTEMPT_RESUMED", "attempt=\(attemptNumber)")
                 eventConsumerTask = Task { [weak self] in
                     await self?.consume(eventStream, from: newSocket)
                 }
