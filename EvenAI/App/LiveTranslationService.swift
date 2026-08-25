@@ -408,6 +408,12 @@ final class LiveTranslationService {
     /// `observeConnection()` so a disconnect/reconnect cycle before the
     /// user has ever started Live Translation doesn't do anything.
     private var isEnabledIntent = false
+    /// G2's most recently observed connection state — updated by
+    /// `observeConnection()`'s subscription UNCONDITIONALLY (started at
+    /// construction time, in `init`, independent of `isEnabledIntent`),
+    /// so it's always current, never a stale snapshot, when `start()`
+    /// reads it for `LIVE_START_G2_STATE`.
+    private var lastKnownGlassesConnectionState: GlassesTransportState = .disconnected
     /// Session-lifetime reliability counters — see
     /// `ConversationSessionMetrics`'s own doc comment for why this is a
     /// plain, directly-testable value type rather than loose private
@@ -626,6 +632,7 @@ final class LiveTranslationService {
     /// `.listening` (no-op).
     func start() async {
         guard state != .listening else { return }
+        DiagnosticTrace.log("LIVE_START_REQUESTED", "audioSource=\(audioSource.rawValue) conversationMode=\(conversationMode.rawValue)")
         isEnabledIntent = true
         lastRecognizedPhrase = nil
         // "Reset the Auto language lock when a new Live Translation
@@ -644,19 +651,39 @@ final class LiveTranslationService {
         resetUtteranceState()
         observeNavigation()
 
+        // `ready` mirrors `connected` here — this protocol exposes
+        // connection state as a stream of `GlassesTransportState`, with
+        // no separate, richer "ready" concept beneath it; reporting a
+        // fabricated distinction would be worse than reporting the one
+        // real signal available twice, honestly labeled.
+        let isG2Connected = lastKnownGlassesConnectionState == .connected
+        DiagnosticTrace.log("LIVE_START_G2_STATE", "connected=\(isG2Connected) ready=\(isG2Connected) rawState=\(lastKnownGlassesConnectionState)")
+
+        DiagnosticTrace.log("LIVE_START_AUDIO_SOURCE", "source=\(audioSource.rawValue)")
+        await glassesTransport.setPreferredAudioSource(audioSource)
+        DiagnosticTrace.log("LIVE_START_MIC_ENABLE_BEGIN", "audioSource=\(audioSource.rawValue)")
         do {
-            await glassesTransport.setPreferredAudioSource(audioSource)
             try await glassesTransport.setMicrophoneEnabled(true)
+            DiagnosticTrace.log("LIVE_START_MIC_ENABLE_OK", "audioSource=\(audioSource.rawValue)")
         } catch {
-            DiagnosticTrace.log("AUDIO_SOURCE_FAILED", "audioSource=\(audioSource.rawValue) error=\(error)")
-            state = .error("Couldn't start Live Translation. Check your G2 connection and try again.")
-            await terminateSession(reason: "audioSourceFailed", fatal: true, source: "start", error: error)
+            DiagnosticTrace.log("LIVE_START_MIC_ENABLE_FAILED", "audioSource=\(audioSource.rawValue) errorType=\(type(of: error)) errorMessage=\(error)")
+            // The audio-source SELECTION (not the underlying transport)
+            // is what determines whether this is genuinely a G2 problem
+            // or a phone-microphone one — `setMicrophoneEnabled`'s own
+            // failure doesn't distinguish the two on its own.
+            let classified: LiveTranslationStartError = audioSource == .g2Mic
+                ? .glassesUnavailable(underlying: "\(error)")
+                : .microphoneUnavailable(underlying: "\(error)")
+            DiagnosticTrace.log("LIVE_START_FAILED", "stage=\(classified.stage) errorType=\(type(of: error)) errorMessage=\(error)")
+            state = .error(classified.userFacingMessage)
+            await terminateSession(reason: "startFailed(\(classified.stage))", fatal: true, source: "start", error: error)
             return
         }
         do {
             let pcmUpdates = await glassesTransport.microphonePCMUpdates()
             let updates = try await transcriber.startTranscribing(pcmUpdates: instrumentedPCMStream(pcmUpdates))
             state = .listening
+            DiagnosticTrace.log("LIVE_START_SESSION_STARTED", "audioSource=\(audioSource.rawValue)")
             consumeTask = Task { [weak self] in
                 await self?.consume(updates)
             }
@@ -664,8 +691,10 @@ final class LiveTranslationService {
             // TEMPORARY — Milestone 8b physical-device diagnosis. Remove
             // once root-caused. See DiagnosticTrace.swift.
             DiagnosticTrace.log("8B_TRACE", "STOP reason=transcriber.startTranscribing() threw synchronously: \(error)")
-            state = .error("Couldn't start Live Translation. Check your G2 connection and try again.")
-            await terminateSession(reason: "transcriberStartFailed", fatal: true, source: "start", error: error)
+            let classified = LiveTranslationStartError.classifyTranscriberStartFailure(error)
+            DiagnosticTrace.log("LIVE_START_FAILED", "stage=\(classified.stage) errorType=\(type(of: error)) errorMessage=\(error)")
+            state = .error(classified.userFacingMessage)
+            await terminateSession(reason: "startFailed(\(classified.stage))", fatal: true, source: "start", error: error)
         }
     }
 
@@ -878,6 +907,13 @@ final class LiveTranslationService {
             guard let self else { return }
             let updates = await self.glassesTransport.connectionStateUpdates()
             for await connectionState in updates {
+                // Tracked UNCONDITIONALLY — not gated on `isEnabledIntent`
+                // — so `LIVE_START_G2_STATE` always reflects G2's true,
+                // current connection state at the moment of a `start()`
+                // attempt, never a stale snapshot left over from before
+                // this subscription's very first update, or from a prior
+                // session's last-known state.
+                self.lastKnownGlassesConnectionState = connectionState
                 guard self.isEnabledIntent else { continue }
                 switch connectionState {
                 case .disconnected, .failed(_):
@@ -1069,8 +1105,28 @@ final class LiveTranslationService {
     }
 
     private func consume(_ updates: AsyncThrowingStream<TranscriptionUpdate, Error>) async {
+        // Tracks whether at least one update was ever genuinely received
+        // this session — the closest thing to "confirmed handshake" this
+        // class can observe (see the catch block below): `state` itself
+        // becomes `.listening` optimistically, the moment `transcriber
+        // .startTranscribing(pcmUpdates:)` RETURNS (before the real STT
+        // handshake is necessarily confirmed — `OpenAIRealtimeTranscriber
+        // .startTranscribing`/`URLSessionRealtimeTranscriptionSocket
+        // .connect()` return as soon as the connection task is resumed,
+        // not once it's confirmed live), so a handshake failure that
+        // happens moments later, asynchronously, would otherwise surface
+        // ONLY as the generic "stopped unexpectedly" message — exactly
+        // the same misleading-classification bug `LiveTranslationStartError`
+        // exists to fix, just arriving a few hundred milliseconds later
+        // than the synchronous `start()`-time failures it already
+        // covers. If the very first thing this loop ever sees is a
+        // thrown error — no update, partial or final, ever arrived —
+        // that's still fundamentally a STARTUP failure from the user's
+        // perspective, and gets the same truthful classification.
+        var hasReceivedAnyUpdateThisSession = false
         do {
             for try await update in updates {
+                hasReceivedAnyUpdateThisSession = true
                 // Proves the loop is still pulling from `updates` — this is
                 // the ONE place in the whole pipeline where "continuous
                 // listening" is either true or it isn't: if this line
@@ -1142,10 +1198,22 @@ final class LiveTranslationService {
             // this actually throws, that budget is already exhausted,
             // so this really is a fatal, unrecoverable STT failure, not
             // a single blip.
-            DiagnosticTrace.log("TRANSCRIBER_STREAM_ERROR", "error=\(error)")
-            DiagnosticTrace.log("8B_TRACE", "STOP reason=finals stream threw, surfacing as 'stopped unexpectedly': \(error)")
-            state = .error("Live Translation stopped unexpectedly. Try again.")
-            await terminateSession(reason: "sttStreamFailed", fatal: true, source: "consume", error: error)
+            DiagnosticTrace.log("TRANSCRIBER_STREAM_ERROR", "error=\(error) everReceivedAnUpdate=\(hasReceivedAnyUpdateThisSession)")
+            if hasReceivedAnyUpdateThisSession {
+                DiagnosticTrace.log("8B_TRACE", "STOP reason=finals stream threw, surfacing as 'stopped unexpectedly': \(error)")
+                state = .error("Live Translation stopped unexpectedly. Try again.")
+                await terminateSession(reason: "sttStreamFailed", fatal: true, source: "consume", error: error)
+            } else {
+                // The handshake was never genuinely confirmed — this is a
+                // STARTUP failure that simply surfaced a little later
+                // than `start()`'s own synchronous catch blocks, so it
+                // gets the exact same truthful classification they do,
+                // not the generic "stopped unexpectedly" message.
+                let classified = LiveTranslationStartError.classifyTranscriberStartFailure(error)
+                DiagnosticTrace.log("LIVE_START_FAILED", "stage=\(classified.stage) errorType=\(type(of: error)) errorMessage=\(error)")
+                state = .error(classified.userFacingMessage)
+                await terminateSession(reason: "startFailed(\(classified.stage),handshakeNeverConfirmed)", fatal: true, source: "consume", error: error)
+            }
         }
     }
 

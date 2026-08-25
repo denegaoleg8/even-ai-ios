@@ -28,25 +28,40 @@ final class URLSessionRealtimeTranscriptionSocket: RealtimeTranscriptionSocket, 
     /// non-101 WS handshake response — which the backend's own
     /// `wsServer.js` produces as a raw, bodiless `401 Unauthorized`
     /// whenever the upgrade request arrives with no `Authorization`
-    /// header at all): NOTHING in this call path used to ever call
-    /// `apiClient.recoverSession()` before attaching credentials,
-    /// despite `AuthenticatedAPIClient.makeWebSocketRequest`'s own doc
-    /// comment already promising a caller would do exactly that. Every
-    /// other authenticated call in this app gets "recover once, then
-    /// attach a valid token" for free from `AuthenticatedAPIClient
+    /// header at all): NOTHING in this call path used to ever ensure a
+    /// session existed before attaching credentials, despite
+    /// `AuthenticatedAPIClient.makeWebSocketRequest`'s own doc comment
+    /// already promising a caller would do exactly that. Every other
+    /// authenticated call in this app gets "recover once, then attach a
+    /// valid token" for free from `AuthenticatedAPIClient
     /// .performOnce`'s reactive 401→recover→retry path; a WebSocket
     /// upgrade can't be retried in place the way a REST request's 401
-    /// can (a dropped/rejected WS reconnects as a whole new connection),
-    /// so the equivalent guarantee has to be proactive, here, on every
-    /// single connection attempt — the very first one AND every
+    /// can, so the equivalent guarantee has to be proactive, here, on
+    /// every single connection attempt — the very first one AND every
     /// reconnect (each of `OpenAIRealtimeTranscriber`'s bounded retry
     /// attempts constructs a fresh `URLSessionRealtimeTranscriptionSocket`
-    /// and calls `connect()` on it again). `recoverSession()` itself is
-    /// what actually attaches a token whether the account is an
-    /// anonymous device session or a real signed-in one — this call site
-    /// doesn't need to (and shouldn't) know or care which.
+    /// and calls `connect()` on it again).
+    ///
+    /// Uses `ensureSession()`, not the always-recovers `recoverSession()`
+    /// this method briefly called: a second, follow-up physical-device
+    /// regression (Live Translation immediately reporting a false "check
+    /// your G2 connection" failure, AND normal Chat failing to open)
+    /// traced back to calling the always-network-round-trip
+    /// `recoverSession()` unconditionally on every one of the bounded
+    /// reconnect attempts — `/auth/refresh` rotates the refresh token on
+    /// every call, so repeated unconditional recovery churned the ONE
+    /// session Live Translation and Chat share, far more than the
+    /// original bug (a genuinely missing credential) ever required a fix
+    /// for. See `ensureSession()`'s own doc comment.
     func connect() async throws -> AsyncThrowingStream<RealtimeTranscriptionEvent, Error> {
-        _ = try await apiClient.recoverSession()
+        DiagnosticTrace.log("LIVE_START_AUTH_RECOVERY_BEGIN", "path=\(Self.path)")
+        do {
+            try await apiClient.ensureSession()
+            DiagnosticTrace.log("LIVE_START_AUTH_RECOVERY_OK", "path=\(Self.path)")
+        } catch {
+            DiagnosticTrace.log("LIVE_START_AUTH_RECOVERY_FAILED", "errorType=\(type(of: error)) errorMessage=\(error)")
+            throw error
+        }
         var request = await apiClient.makeWebSocketRequest(path: Self.path)
         request.url = Self.webSocketURL(from: request.url) ?? request.url
 
@@ -55,12 +70,13 @@ final class URLSessionRealtimeTranscriptionSocket: RealtimeTranscriptionSocket, 
         // Never logs the token itself, only whether one is present —
         // this directly tests whether `AuthenticatedAPIClient.accessToken`
         // was actually populated (e.g. by RootView's launch-time
-        // restoreSession(), or — as of this fix — by the
-        // `recoverSession()` call directly above) by the moment Live
+        // restoreSession(), or — as of the earlier fix — by the
+        // `ensureSession()` call directly above) by the moment Live
         // Translation starts.
         let hasAuthHeader = request.value(forHTTPHeaderField: "Authorization") != nil
         DiagnosticTrace.log("8B_TRACE", "AUTH url=\(request.url?.absoluteString ?? "nil") hasAuthorizationHeader=\(hasAuthHeader)")
 
+        DiagnosticTrace.log("LIVE_START_SOCKET_CREATE", "url=\(request.url?.absoluteString ?? "nil")")
         let newTask = urlSession.webSocketTask(with: request)
         task = newTask
         // Starts the task connecting asynchronously — this does NOT
@@ -122,6 +138,7 @@ final class URLSessionRealtimeTranscriptionSocket: RealtimeTranscriptionSocket, 
                 if !hasConfirmedHandshake {
                     hasConfirmedHandshake = true
                     DiagnosticTrace.log("WS_HANDSHAKE_CONFIRMED", "the WebSocket upgrade actually completed")
+                    DiagnosticTrace.log("LIVE_START_SOCKET_HANDSHAKE_OK", "")
                 }
             } catch {
                 // TEMPORARY — remove once root-caused. `closeCode`/
@@ -133,6 +150,15 @@ final class URLSessionRealtimeTranscriptionSocket: RealtimeTranscriptionSocket, 
                     "8B_TRACE",
                     "WS_CLOSED handshakeConfirmed=\(hasConfirmedHandshake) code=\(task.closeCode.rawValue) reason=\(task.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? "nil") error domain=\(nsError.domain) code=\(nsError.code) description=\(nsError.localizedDescription)"
                 )
+                if !hasConfirmedHandshake {
+                    // This is a startup-time failure specifically (the
+                    // handshake never succeeded even once) — a MID-
+                    // session drop after a confirmed handshake is a
+                    // separate, already-covered reconnect concern (see
+                    // `OpenAIRealtimeTranscriber`'s bounded retry loop),
+                    // not a `LIVE_START_*` stage.
+                    DiagnosticTrace.log("LIVE_START_SOCKET_HANDSHAKE_FAILED", "errorType=\(type(of: error)) errorMessage=\(error)")
+                }
                 continuation.finish(throwing: error)
                 return
             }

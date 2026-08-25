@@ -34,6 +34,7 @@ final class ChatViewModel {
     }
 
     func load() async {
+        DiagnosticTrace.log("CHAT_LOAD_START", "chatID=\(chatID)")
         isLoading = true
         defer { isLoading = false }
         do {
@@ -41,8 +42,10 @@ final class ChatViewModel {
             chatTitle = chat.title
             messages = try await chatService.fetchMessages(chatID: chatID)
             loadFailed = false
+            DiagnosticTrace.log("CHAT_LOAD_SUCCESS", "chatID=\(chatID) messageCount=\(messages.count)")
         } catch {
             loadFailed = true
+            DiagnosticTrace.log("CHAT_LOAD_FAILED", "chatID=\(chatID) errorType=\(type(of: error)) errorMessage=\(error)")
         }
     }
 

@@ -8,6 +8,13 @@ struct ChatListView: View {
     @State private var chatPendingRename: Chat?
     @State private var renameText: String = ""
     @State private var isOpeningGlassesChat = false
+    /// The last chat id whose selection was already explicitly traced —
+    /// set by `openGlassesChat()` BEFORE it assigns `appState
+    /// .selectedChatID`, so the generic `.onChange` below (which exists
+    /// to trace ordinary chat-row taps, the one selection path with no
+    /// dedicated action closure to hook into) never double-logs the same
+    /// selection with the wrong route type.
+    @State private var lastRouteTracedChatID: Chat.ID?
 
     init(chatService: ChatServicing) {
         _viewModel = State(initialValue: ChatListViewModel(chatService: chatService))
@@ -73,6 +80,18 @@ struct ChatListView: View {
             guard !authState.isRestoringSession else { return }
             await viewModel.loadChats()
         }
+        // Traces ordinary chat-row selection — the one route into normal
+        // AI Chat with no dedicated action closure of its own to hook
+        // into (`List(selection:)` drives `appState.selectedChatID`
+        // directly). `openGlassesChat()` pre-marks `lastRouteTracedChatID`
+        // before it assigns the SAME property, so this never re-logs
+        // that specific selection as the wrong route type.
+        .onChange(of: appState.selectedChatID) { _, newValue in
+            guard let newValue, newValue != lastRouteTracedChatID else { return }
+            lastRouteTracedChatID = newValue
+            DiagnosticTrace.log("CHAT_OPEN_REQUESTED", "source=chatRow")
+            DiagnosticTrace.log("CHAT_ROUTE_SELECTED", "type=ai chatID=\(newValue)")
+        }
     }
 
     /// "Glasses Chat" — a small, minimal UI addition (per the product
@@ -106,11 +125,29 @@ struct ChatListView: View {
     }
 
     private func openGlassesChat() async {
+        DiagnosticTrace.log("CHAT_OPEN_REQUESTED", "source=glassesRow")
         isOpeningGlassesChat = true
         defer { isOpeningGlassesChat = false }
-        guard let chat = try? await glassesChatProvider.findOrCreateGlassesChat() else { return }
-        appState.selectedChatID = chat.id
-        await viewModel.loadChats()
+        do {
+            let chat = try await glassesChatProvider.findOrCreateGlassesChat()
+            // Pre-mark BEFORE assigning `selectedChatID` — see this
+            // property's own doc comment for why, and
+            // `GlassesChatProvider`'s own doc comment for why a stale/
+            // 404 persisted id self-heals right here, transparently,
+            // rather than ever blocking this route (a broken Glasses
+            // Chat id must never prevent normal AI Chat from opening —
+            // that guarantee holds structurally: this method is the ONLY
+            // caller of `findOrCreateGlassesChat()` from this view, and
+            // its own failure path below never touches `appState
+            // .selectedChatID` at all, so a normal chat already open, or
+            // about to be opened, is entirely unaffected).
+            lastRouteTracedChatID = chat.id
+            DiagnosticTrace.log("CHAT_ROUTE_SELECTED", "type=glasses chatID=\(chat.id)")
+            appState.selectedChatID = chat.id
+            await viewModel.loadChats()
+        } catch {
+            DiagnosticTrace.log("CHAT_NAVIGATION_ABORTED", "reason=glassesChatResolveFailed errorType=\(type(of: error)) errorMessage=\(error)")
+        }
     }
 
     @ViewBuilder

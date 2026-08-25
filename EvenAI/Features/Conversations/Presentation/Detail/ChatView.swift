@@ -25,6 +25,7 @@ struct ChatView: View {
     private static let nearBottomThreshold: CGFloat = 120
 
     init(chatID: Chat.ID, chatService: ChatServicing, glassesTransport: GlassesTransport) {
+        DiagnosticTrace.log("CHAT_VIEW_INIT", "chatID=\(chatID)")
         self.chatID = chatID
         _viewModel = State(
             initialValue: ChatViewModel(chatID: chatID, chatService: chatService, glassesTransport: glassesTransport)

@@ -126,6 +126,36 @@ actor AuthenticatedAPIClient {
         return try await task.value
     }
 
+    /// A cheaper, more conservative sibling of `recoverSession()` for
+    /// callers that only need to guarantee *some* credential is attached
+    /// before proceeding — never call this from a REST path, which
+    /// already gets the right behavior for free from `performOnce`'s
+    /// reactive 401→recover→retry (that path's `recoverOn401` is what
+    /// correctly re-recovers an EXPIRED token; this method deliberately
+    /// does not attempt that).
+    ///
+    /// A no-op — no network call at all — whenever `accessToken` is
+    /// already set. This distinction matters: `/auth/refresh` ROTATES
+    /// the refresh token on every single call (the old one is revoked
+    /// server-side the instant a new one is issued — see
+    /// `even-ai-assistant-asr`'s `/auth/refresh` handler), so calling
+    /// `recoverSession()` unconditionally on every WebSocket connection
+    /// AND every one of its bounded reconnect attempts — as this class's
+    /// one and only caller of this method briefly did — churns the ONE
+    /// session Live Translation and Chat share far more than necessary,
+    /// and risks cascading into `/auth/device`'s rate limit if a refresh
+    /// attempt ever comes back invalid for any reason (that failure path
+    /// clears the stored session and falls back to a full device
+    /// re-authentication). This only ever recovers when there is
+    /// genuinely NO credential attached yet — the exact "missing
+    /// Authorization header" case a WebSocket connect needs to guard
+    /// against, without manufacturing new load on every reconnect that
+    /// already has a perfectly good token.
+    func ensureSession() async throws {
+        guard accessToken == nil else { return }
+        _ = try await recoverSession()
+    }
+
     // MARK: - REST
 
     func get(_ path: String) async throws -> Data {

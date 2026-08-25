@@ -86,3 +86,53 @@ actor ManualContinuousTranscriber: ContinuousTranscribing {
         continuation = nil
     }
 }
+
+/// `startTranscribing(pcmUpdates:)` throws the given error SYNCHRONOUSLY,
+/// before ever returning a stream — models a `transcriber
+/// .startTranscribing` call that fails outright (e.g. session recovery
+/// failing inside `URLSessionRealtimeTranscriptionSocket.connect()`,
+/// which `OpenAIRealtimeTranscriber.startTranscribing` propagates the
+/// same way). Used to verify `LiveTranslationService.start()`'s
+/// `LiveTranslationStartError` classification for auth/backend/STT
+/// failures, which a script-based fake (no way to inject an arbitrary
+/// thrown error type) can't exercise.
+actor ThrowingStartContinuousTranscriber: ContinuousTranscribing {
+    private let error: Error
+
+    init(error: Error) {
+        self.error = error
+    }
+
+    func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<TranscriptionUpdate, Error> {
+        throw error
+    }
+
+    func stopTranscribing() async {}
+}
+
+/// `startTranscribing(pcmUpdates:)` itself SUCCEEDS (returns a stream
+/// normally, exactly like a real handshake that hasn't failed YET), but
+/// that stream's very first iteration throws the given error — no
+/// update, partial or final, is ever yielded first. Models a WebSocket
+/// handshake that fails ASYNCHRONOUSLY, moments after `connect()` already
+/// returned (see `URLSessionRealtimeTranscriptionSocket.connect()`'s own
+/// doc comment on why that return doesn't prove the handshake succeeded)
+/// — the scenario `LiveTranslationService.consume(_:)`'s own
+/// `hasReceivedAnyUpdateThisSession` reclassification exists to still
+/// report truthfully, not as the generic "stopped unexpectedly".
+actor HandshakeFailingContinuousTranscriber: ContinuousTranscribing {
+    private let error: Error
+
+    init(error: Error) {
+        self.error = error
+    }
+
+    func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<TranscriptionUpdate, Error> {
+        let capturedError = error
+        return AsyncThrowingStream { continuation in
+            continuation.finish(throwing: capturedError)
+        }
+    }
+
+    func stopTranscribing() async {}
+}
