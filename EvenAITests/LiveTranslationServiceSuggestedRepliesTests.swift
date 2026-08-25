@@ -10,7 +10,7 @@ import Foundation
 @MainActor
 @Suite("LiveTranslationService + SuggestedReplyGenerating")
 struct LiveTranslationServiceSuggestedRepliesTests {
-    private static let propagationDelay: Duration = .milliseconds(120)
+    private static let propagationDelay: Duration = .milliseconds(220)
 
     private static func reply(_ original: String, _ ukrainian: String, ordering: Int) -> SuggestedReply {
         SuggestedReply(originalLanguageText: original, ukrainianText: ukrainian, ordering: ordering)

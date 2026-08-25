@@ -46,15 +46,27 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
     /// this layer regardless of what's available here.
     private(set) var lastKnownLanguages: [String]?
 
-    /// One reconnect attempt per dropped connection — mirrors the
-    /// backend's own single-retry policy in `session.js` exactly (see
-    /// that file's `handlers.onClose`), so a transient blip on either hop
-    /// (iOS<->backend here, backend<->OpenAI there) is absorbed the same
-    /// way without either side needing to know about the other's policy.
-    /// Reset back to `false` the moment a connection actually starts
-    /// working again (`.sessionStarted`/`.finalTranscript`), so a later,
-    /// independent drop still gets its own single retry.
-    private var hasReconnectedSinceLastSuccess = false
+    /// Bounded reconnect with backoff (Conversation Mode hardening
+    /// follow-up — physical-device "Live Translation stopped
+    /// unexpectedly" investigation): a single dropped connection used to
+    /// get exactly ONE retry attempt before giving up and ending the
+    /// whole Live Translation session — a real BLE/cellular/backend
+    /// hiccup only has to happen twice in a row (very plausible on a
+    /// three-hop chain: G2↔phone BLE, phone↔backend WebSocket,
+    /// backend↔OpenAI) to kill an otherwise-healthy session. Now bounded
+    /// to `maxConsecutiveReconnectAttempts` attempts with increasing
+    /// backoff between them (first retry immediate, then growing) —
+    /// generous enough to ride out a real transient blip, still bounded
+    /// so a genuinely dead connection surfaces in finite time rather
+    /// than retrying forever. Overridable only by tests (see `init`),
+    /// which need a much smaller bound/near-zero backoff to stay fast.
+    private let maxConsecutiveReconnectAttempts: Int
+    private let reconnectBackoffSchedule: [Duration]
+    /// How many reconnect attempts have been made since the last
+    /// successful event (`.sessionStarted`/`.finalTranscript`) — reset
+    /// to `0` the moment a connection actually starts working again, so
+    /// a later, independent drop gets its own full bounded budget.
+    private var consecutiveReconnectAttempts = 0
     /// Lifetime count of reconnect attempts this instance has made —
     /// `STT_RECONNECT_COUNT` (Conversation Mode audio-reliability
     /// instrumentation). Never reset between sessions (this instance is
@@ -73,8 +85,14 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
     private var hasLoggedFirstPartialThisSession = false
     private var hasLoggedFirstFinalThisSession = false
 
-    init(makeSocket: @escaping () async -> RealtimeTranscriptionSocket) {
+    init(
+        makeSocket: @escaping () async -> RealtimeTranscriptionSocket,
+        maxConsecutiveReconnectAttempts: Int = 5,
+        reconnectBackoffSchedule: [Duration] = [.zero, .milliseconds(500), .seconds(1), .seconds(2), .seconds(4)]
+    ) {
         self.makeSocket = makeSocket
+        self.maxConsecutiveReconnectAttempts = maxConsecutiveReconnectAttempts
+        self.reconnectBackoffSchedule = reconnectBackoffSchedule
     }
 
     convenience init(apiClient: AuthenticatedAPIClient) {
@@ -84,7 +102,7 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
     func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<TranscriptionUpdate, Error> {
         stopInternal()
         isActive = true
-        hasReconnectedSinceLastSuccess = false
+        consecutiveReconnectAttempts = 0
         hasLoggedFirstPartialThisSession = false
         hasLoggedFirstFinalThisSession = false
 
@@ -176,7 +194,7 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
                 }
                 switch event {
                 case .sessionStarted:
-                    hasReconnectedSinceLastSuccess = false
+                    consecutiveReconnectAttempts = 0
                 case .partialTranscript(let text):
                     // Streaming-translation path (major performance pass):
                     // previously discarded — see TranscriptionUpdate's doc
@@ -189,7 +207,7 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
                     }
                     continuation?.yield(.partial(text))
                 case .finalTranscript(let text):
-                    hasReconnectedSinceLastSuccess = false
+                    consecutiveReconnectAttempts = 0
                     // TEMPORARY — upstream-path diagnostic. Remove once
                     // root-caused. See DiagnosticTrace.swift.
                     DiagnosticTrace.log("UPSTREAM_TRACE", "STT_FINAL text=\"\(text.prefix(60))\"")
@@ -210,53 +228,76 @@ final class OpenAIRealtimeTranscriber: ContinuousTranscribing, @unchecked Sendab
                     continue
                 case .closed(let reason):
                     DiagnosticTrace.log("8B_TRACE", "WS_CLOSED reason=\(reason ?? "nil")")
+                    DiagnosticTrace.log("STT_SOCKET_CLOSED", "reason=\(reason ?? "nil") explicit=true")
                     await handleUnexpectedClose(previousSocket: currentSocket, error: nil)
                     return
                 }
             }
             guard isActive else { return }
             DiagnosticTrace.log("8B_TRACE", "WS_CLOSED event stream ended with no explicit .closed event")
+            DiagnosticTrace.log("STT_SOCKET_CLOSED", "reason=streamEndedWithNoExplicitClose explicit=false")
             await handleUnexpectedClose(previousSocket: currentSocket, error: nil)
         } catch {
             guard isActive else { return }
             DiagnosticTrace.log("8B_TRACE", "ERROR event stream threw: \(error)")
+            DiagnosticTrace.log("STT_SOCKET_CLOSED", "reason=eventStreamThrew error=\(error) explicit=false")
             await handleUnexpectedClose(previousSocket: currentSocket, error: error)
         }
     }
 
     /// The connection ended without `stopTranscribing()` having been
-    /// called — reconnect once; give up (and surface the failure to
-    /// `startTranscribing`'s caller) if a reconnect was already attempted
-    /// since the last successful event.
+    /// called — reconnect with bounded retries and backoff (see
+    /// `maxConsecutiveReconnectAttempts`/`reconnectBackoffSchedule`'s own
+    /// doc comments); give up (and surface the failure to
+    /// `startTranscribing`'s caller) only once every attempt in the
+    /// budget has failed. A loop, not recursion, so an exhausted budget
+    /// can never grow the call stack.
     private func handleUnexpectedClose(previousSocket: RealtimeTranscriptionSocket, error: Error?) async {
         guard isActive else { return }
         await previousSocket.close()
 
-        guard !hasReconnectedSinceLastSuccess else {
-            DiagnosticTrace.log("8B_TRACE", "STOP reason=second consecutive disconnect, giving up: \(String(describing: error))")
-            continuation?.finish(throwing: error ?? RealtimeTranscriptionSocketError.notConnected)
-            stopInternal()
-            return
-        }
-        hasReconnectedSinceLastSuccess = true
-        reconnectCount += 1
-        DiagnosticTrace.log("8B_TRACE", "reconnect attempt starting (previous error=\(String(describing: error)))")
-        DiagnosticTrace.log("STT_RECONNECT_COUNT", "value=\(reconnectCount)")
+        var lastError = error
+        while consecutiveReconnectAttempts < maxConsecutiveReconnectAttempts {
+            guard isActive else { return }
+            let attemptNumber = consecutiveReconnectAttempts + 1
+            consecutiveReconnectAttempts = attemptNumber
+            reconnectCount += 1
+            let backoff = reconnectBackoffSchedule[min(attemptNumber - 1, reconnectBackoffSchedule.count - 1)]
+            DiagnosticTrace.log(
+                "STT_RECONNECT_STARTED",
+                "attempt=\(attemptNumber)/\(maxConsecutiveReconnectAttempts) backoff=\(backoff) previousError=\(String(describing: lastError))"
+            )
+            DiagnosticTrace.log("STT_RECONNECT_COUNT", "value=\(reconnectCount)")
 
-        let newSocket = await makeSocket()
-        socket = newSocket
-        do {
-            let eventStream = try await newSocket.connect()
-            DiagnosticTrace.log("8B_TRACE", "WS_CONNECTED (reconnect) backend socket connected")
-            DiagnosticTrace.log("STT_SOCKET_CONNECTED_TS", "value=\(Date().timeIntervalSince1970)")
-            eventConsumerTask = Task { [weak self] in
-                await self?.consume(eventStream, from: newSocket)
+            if backoff > .zero {
+                try? await Task.sleep(for: backoff)
+                guard isActive else { return }
             }
-        } catch {
-            DiagnosticTrace.log("8B_TRACE", "STOP reason=reconnect's own connect() threw: \(error)")
-            continuation?.finish(throwing: error)
-            stopInternal()
+
+            let newSocket = await makeSocket()
+            socket = newSocket
+            do {
+                let eventStream = try await newSocket.connect()
+                DiagnosticTrace.log("8B_TRACE", "WS_CONNECTED (reconnect) backend socket connected")
+                DiagnosticTrace.log("STT_SOCKET_CONNECTED_TS", "value=\(Date().timeIntervalSince1970)")
+                DiagnosticTrace.log("STT_RECONNECT_SUCCEEDED", "attempt=\(attemptNumber)")
+                eventConsumerTask = Task { [weak self] in
+                    await self?.consume(eventStream, from: newSocket)
+                }
+                return
+            } catch {
+                DiagnosticTrace.log("8B_TRACE", "reconnect attempt \(attemptNumber) connect() threw: \(error)")
+                await newSocket.close()
+                lastError = error
+            }
         }
+
+        DiagnosticTrace.log(
+            "STT_RECONNECT_EXHAUSTED",
+            "attempts=\(consecutiveReconnectAttempts) lastError=\(String(describing: lastError))"
+        )
+        continuation?.finish(throwing: lastError ?? RealtimeTranscriptionSocketError.notConnected)
+        stopInternal()
     }
 
     private func stopInternal() {

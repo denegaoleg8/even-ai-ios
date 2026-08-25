@@ -146,6 +146,37 @@ actor SpyGlassesTransport: GlassesTransport {
     }
 }
 
+/// Always throws from `displayPages(_:)` — everything else (mic,
+/// connection) behaves exactly like `SpyGlassesTransport`. Proves a G2
+/// display failure alone can never terminate the session:
+/// `SpyGlassesTransport`'s own `displayPages` always succeeds, so it
+/// can't model this on its own.
+actor DisplayFailingGlassesTransport: GlassesTransport {
+    private(set) var displayAttemptCount = 0
+    private(set) var microphoneEnabledCalls: [Bool] = []
+
+    func connectionStateUpdates() async -> AsyncStream<GlassesTransportState> {
+        AsyncStream { $0.yield(.connected) }
+    }
+
+    func connect() async throws {}
+    func disconnect() async {}
+    func sendText(_ text: String) async throws {}
+
+    func displayPages(_ pages: [String]) async throws {
+        displayAttemptCount += 1
+        throw GlassesTransportError.notConnected
+    }
+
+    func microphonePCMUpdates() async -> AsyncStream<Data> {
+        AsyncStream { _ in }
+    }
+
+    func setMicrophoneEnabled(_ enabled: Bool) async throws {
+        microphoneEnabledCalls.append(enabled)
+    }
+}
+
 /// Like `SpyGlassesTransport`, but its connection state can be changed
 /// after the fact via `simulateConnectionChange(_:)` — used by
 /// `LiveTranslationServiceTests` to verify the service stops itself when

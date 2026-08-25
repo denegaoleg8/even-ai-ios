@@ -21,7 +21,7 @@ struct LiveTranslationServiceTests {
     // one twice — the signature of a scheduling margin issue, not a
     // logic bug). Test-only constant; does not reflect or affect any
     // production timing.
-    private static let propagationDelay: Duration = .milliseconds(150)
+    private static let propagationDelay: Duration = .milliseconds(250)
 
     @Test("a foreign-language final phrase is translated and sent to the glasses")
     func foreignPhraseIsTranslatedAndSent() async throws {

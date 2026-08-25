@@ -27,11 +27,17 @@ struct LiveTranslationServiceOpenAIRealtimeTranscriberTests {
         spy: SpyGlassesTransport,
         store: AgentContextStore,
         languageCodes: [String: String?],
-        translation: String = "переклад"
+        translation: String = "переклад",
+        maxConsecutiveReconnectAttempts: Int = 5,
+        reconnectBackoffSchedule: [Duration] = [.zero, .milliseconds(20), .milliseconds(20), .milliseconds(20), .milliseconds(20)]
     ) -> LiveTranslationService {
         LiveTranslationService(
             glassesTransport: spy,
-            transcriber: OpenAIRealtimeTranscriber(makeSocket: { await factory.makeSocket() }),
+            transcriber: OpenAIRealtimeTranscriber(
+                makeSocket: { await factory.makeSocket() },
+                maxConsecutiveReconnectAttempts: maxConsecutiveReconnectAttempts,
+                reconnectBackoffSchedule: reconnectBackoffSchedule
+            ),
             translator: ScriptedLanguageTranslator(languageCodes: languageCodes, translation: translation),
             agentContextStore: store
         )
@@ -172,35 +178,79 @@ struct LiveTranslationServiceOpenAIRealtimeTranscriberTests {
         #expect(store.session.turns.map(\.originalText) == ["Guten Tag"])
     }
 
-    @Test("a second consecutive disconnect ends the live session cleanly — no retry storm")
-    func secondConsecutiveDisconnectEndsSessionCleanly() async throws {
+    /// The bounded reconnect budget (Conversation Mode hardening
+    /// follow-up — physical-device "Live Translation stopped
+    /// unexpectedly" investigation) means a session survives MORE than
+    /// one consecutive drop now — this test uses a small, explicit
+    /// budget (2 attempts) so exhausting it stays fast and precise: a
+    /// budget of N attempts needs N+1 total drops to exhaust (each
+    /// attempt reconnects successfully before being dropped again).
+    @Test("once the bounded reconnect budget is fully exhausted, the live session ends cleanly — no retry storm")
+    func exhaustedReconnectBudgetEndsSessionCleanly() async throws {
         let factory = FakeRealtimeTranscriptionSocketFactory()
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
         let service = makeService(
             factory: factory, spy: spy, store: store,
-            languageCodes: [:]
+            languageCodes: [:],
+            maxConsecutiveReconnectAttempts: 2,
+            reconnectBackoffSchedule: [.zero, .zero]
         )
 
         await service.start()
         try? await Task.sleep(for: Self.propagationDelay)
-        let firstSocket = await factory.createdSockets[0]
 
-        await firstSocket.emit(.closed(reason: "first drop"))
+        await (await factory.createdSockets[0]).emit(.closed(reason: "drop 1"))
         try? await Task.sleep(for: Self.propagationDelay)
-        let secondSocket = await factory.createdSockets[1]
-
-        await secondSocket.emit(.closed(reason: "second drop"))
+        await (await factory.createdSockets[1]).emit(.closed(reason: "drop 2"))
+        try? await Task.sleep(for: Self.propagationDelay)
+        await (await factory.createdSockets[2]).emit(.closed(reason: "drop 3"))
         try? await Task.sleep(for: Self.propagationDelay)
 
         // Ends cleanly (LiveTranslationService's existing "stream errored"
-        // path: state -> .error, stop() disables the mic) — no third
-        // connection ever attempted, i.e. no retry storm.
-        #expect(await factory.createdSockets.count == 2)
+        // path: state -> .error, terminateSession disables the mic) —
+        // no fourth connection ever attempted once the budget of 2
+        // reconnect attempts is exhausted, i.e. no retry storm.
+        #expect(await factory.createdSockets.count == 3)
         guard case .error = service.state else {
             Issue.record("expected .error, got \(service.state)")
             return
         }
         #expect(await spy.microphoneEnabledCalls == [true, false])
+    }
+
+    /// The core regression guard for the physical-device symptom: two
+    /// consecutive drops — very plausible on a real G2-BLE↔phone↔
+    /// backend↔OpenAI chain — must NOT end the session under the new
+    /// bounded-with-backoff policy (the OLD single-retry policy would
+    /// already have failed this).
+    @Test("two consecutive drops survive within the reconnect budget — the session never sees 'stopped unexpectedly' for just two blips")
+    func twoConsecutiveDropsSurviveWithinBudget() async throws {
+        let factory = FakeRealtimeTranscriptionSocketFactory()
+        let spy = SpyGlassesTransport()
+        let store = AgentContextStore()
+        let service = makeService(
+            factory: factory, spy: spy, store: store,
+            languageCodes: ["recovered phrase": "en"],
+            maxConsecutiveReconnectAttempts: 5,
+            reconnectBackoffSchedule: [.zero, .zero, .zero, .zero, .zero]
+        )
+
+        await service.start()
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        await (await factory.createdSockets[0]).emit(.closed(reason: "drop 1"))
+        try? await Task.sleep(for: Self.propagationDelay)
+        await (await factory.createdSockets[1]).emit(.closed(reason: "drop 2"))
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(service.state == .listening) // still alive after 2 drops
+        #expect(await factory.createdSockets.count == 3)
+
+        await (await factory.createdSockets[2]).emit(.finalTranscript("recovered phrase"))
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(store.session.turns.map(\.originalText) == ["recovered phrase"])
+        #expect(service.state == .listening)
     }
 }

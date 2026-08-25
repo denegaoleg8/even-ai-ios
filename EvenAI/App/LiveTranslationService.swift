@@ -647,6 +647,13 @@ final class LiveTranslationService {
         do {
             await glassesTransport.setPreferredAudioSource(audioSource)
             try await glassesTransport.setMicrophoneEnabled(true)
+        } catch {
+            DiagnosticTrace.log("AUDIO_SOURCE_FAILED", "audioSource=\(audioSource.rawValue) error=\(error)")
+            state = .error("Couldn't start Live Translation. Check your G2 connection and try again.")
+            await terminateSession(reason: "audioSourceFailed", fatal: true, source: "start", error: error)
+            return
+        }
+        do {
             let pcmUpdates = await glassesTransport.microphonePCMUpdates()
             let updates = try await transcriber.startTranscribing(pcmUpdates: instrumentedPCMStream(pcmUpdates))
             state = .listening
@@ -658,17 +665,63 @@ final class LiveTranslationService {
             // once root-caused. See DiagnosticTrace.swift.
             DiagnosticTrace.log("8B_TRACE", "STOP reason=transcriber.startTranscribing() threw synchronously: \(error)")
             state = .error("Couldn't start Live Translation. Check your G2 connection and try again.")
-            await stop()
+            await terminateSession(reason: "transcriberStartFailed", fatal: true, source: "start", error: error)
         }
     }
 
-    /// Stops transcription and disables the G2 microphone. Safe to call
-    /// from any state, including if `start()` never succeeded — this is
-    /// the "never leave the microphone active" guarantee, called explicitly
-    /// by the user or by a lost connection.
+    /// Stops transcription and disables the G2 microphone — the ONE
+    /// explicit, user/UI-initiated way to end a Live Translation session.
+    /// Safe to call from any state, including if `start()` never
+    /// succeeded. Never sets `.error` — an explicit stop is not a
+    /// failure. See `terminateSession(reason:fatal:source:error:)` for
+    /// the shared teardown every ending path (this one included) funnels
+    /// through exactly once.
     func stop() async {
+        DiagnosticTrace.log("SESSION_STOP_REQUESTED", "source=explicit")
+        await terminateSession(reason: "userRequested", fatal: false, source: "explicitStop", error: nil)
+    }
+
+    /// The ONE teardown path every way a Live Translation session can
+    /// end funnels through — explicit user stop, G2 disconnect, a
+    /// start()-time failure, or an unrecoverable STT stream failure —
+    /// so `LIVE_SESSION_TERMINATED` is always logged exactly once, with
+    /// the one true reason, never duplicated and never silently skipped.
+    ///
+    /// `fatal` is purely a LOGGING/diagnostic distinction here — it does
+    /// NOT gate whether teardown happens (teardown is unconditional and
+    /// identical either way). The caller is responsible for setting
+    /// `state = .error(...)` BEFORE calling this, for any path where
+    /// that's appropriate; this function's own `if state == .listening
+    /// { state = .idle }` is a no-op once `state` is already `.error`,
+    /// exactly mirroring the previous single `stop()`'s own established
+    /// "only clears a .listening state" comment.
+    ///
+    /// Deliberately never called for a translation/display/reply/
+    /// provisional-partial failure — those are isolated per-turn
+    /// failures with their own local catch blocks (see `processTurn`/
+    /// `generateSuggestedReplies`/`settleStreamingChunk`/`displayPartial`),
+    /// none of which touch `state` or call this function; only a
+    /// genuinely fatal audio/STT/session-level failure reaches here.
+    private func terminateSession(reason: String, fatal: Bool, source: String, error: Error?) async {
+        let wasListening = state == .listening
+        let reconnects = await transcriber.reconnectCount
+        DiagnosticTrace.log(
+            "LIVE_SESSION_TERMINATED",
+            "reason=\(reason) "
+                + "fatal=\(fatal) "
+                + "source=\(source) "
+                + "errorType=\(error.map { String(describing: type(of: $0)) } ?? "nil") "
+                + "errorMessage=\(error.map { "\($0)" } ?? "nil") "
+                + "sttConnected=\(wasListening) "
+                + "audioSource=\(audioSource.rawValue) "
+                + "conversationMode=\(conversationMode.rawValue) "
+                + "lastTurnID=\(agentContextStore.session.latestTurn?.id.uuidString ?? "nil") "
+                + "finalTranscriptCount=\(sessionMetrics.finalTranscriptCount) "
+                + "sttReconnectCount=\(reconnects)"
+        )
         await logSessionMetrics()
         isEnabledIntent = false
+        DiagnosticTrace.log("SESSION_CANCEL_REQUESTED", "reason=\(reason)")
         consumeTask?.cancel()
         consumeTask = nil
         navigationObserverTask?.cancel()
@@ -684,8 +737,8 @@ final class LiveTranslationService {
         await transcriber.stopTranscribing()
         try? await glassesTransport.setMicrophoneEnabled(false)
         // Only clears a `.listening` state — an `.error` set immediately
-        // before this call (the `start()` failure path) must stay visible
-        // to the user, not be silently overwritten back to `.idle`.
+        // before this call (a fatal-path caller) must stay visible to
+        // the user, not be silently overwritten back to `.idle`.
         if state == .listening {
             state = .idle
         }
@@ -828,7 +881,7 @@ final class LiveTranslationService {
                 guard self.isEnabledIntent else { continue }
                 switch connectionState {
                 case .disconnected, .failed(_):
-                    await self.stop()
+                    await self.terminateSession(reason: "glassesDisconnected", fatal: true, source: "connectionObserver", error: nil)
                 case .connected, .connecting, .scanning:
                     break
                 }
@@ -1050,16 +1103,49 @@ final class LiveTranslationService {
                     await prepareAndDispatch(final: text)
                 }
             }
-            if state == .listening { state = .idle }
+            // The stream ended without throwing. Ordinarily this means
+            // `terminateSession(...)` already asked
+            // `transcriber.stopTranscribing()` to end it cleanly
+            // (`isEnabledIntent` already `false` by the time that
+            // happens — see `terminateSession`'s own ordering) — the
+            // fully expected, benign case. `isEnabledIntent` still being
+            // `true` here means the stream ended entirely on its own,
+            // with no error AND no stop having been requested — worth
+            // making visible (a `ContinuousTranscribing` implementation
+            // is never supposed to do this unprompted), but deliberately
+            // NOT routed through `terminateSession(...)` again: the
+            // stream is already gone, so there is nothing left to cancel
+            // or tear down — a second full teardown here would just
+            // double-call `stopTranscribing()`/`setMicrophoneEnabled
+            // (false)` for no reason. A plain, clean transition to
+            // `.idle` (identical to the expected case) is the correct,
+            // non-duplicated response; the trace line is what makes the
+            // anomaly visible for diagnosis.
+            if Task.isCancelled {
+                DiagnosticTrace.log("TRANSCRIBER_TASK_CANCELLED", "state=\(state) isEnabledIntent=\(isEnabledIntent)")
+            } else {
+                DiagnosticTrace.log("TRANSCRIBER_STREAM_ENDED", "state=\(state) isEnabledIntent=\(isEnabledIntent)")
+            }
+            if state == .listening {
+                if isEnabledIntent {
+                    DiagnosticTrace.log("UNEXPECTED_SESSION_END", "reason=streamEndedWithoutErrorOrStopRequest")
+                }
+                state = .idle
+            }
         } catch {
-            // TEMPORARY — this is the exact catch producing the physical-
-            // device symptom ("Live Translation stopped unexpectedly. Try
-            // again.") — logging the real underlying error here is the
-            // whole point of this diagnostic pass. Remove once
-            // root-caused. See DiagnosticTrace.swift.
+            // This is the exact catch that used to unconditionally
+            // produce the physical-device symptom ("Live Translation
+            // stopped unexpectedly. Try again.") on the FIRST STT
+            // hiccup that couldn't be resolved within
+            // `OpenAIRealtimeTranscriber`'s (now bounded-with-backoff,
+            // previously single-attempt) reconnect budget — by the time
+            // this actually throws, that budget is already exhausted,
+            // so this really is a fatal, unrecoverable STT failure, not
+            // a single blip.
+            DiagnosticTrace.log("TRANSCRIBER_STREAM_ERROR", "error=\(error)")
             DiagnosticTrace.log("8B_TRACE", "STOP reason=finals stream threw, surfacing as 'stopped unexpectedly': \(error)")
             state = .error("Live Translation stopped unexpectedly. Try again.")
-            await stop()
+            await terminateSession(reason: "sttStreamFailed", fatal: true, source: "consume", error: error)
         }
     }
 

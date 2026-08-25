@@ -194,10 +194,63 @@ struct OpenAIRealtimeTranscriberTests {
         collectTask.cancel()
     }
 
-    @Test("a second consecutive unexpected close ends the stream with an error, without a third reconnect attempt")
-    func secondCloseEndsStream() async throws {
+    /// Bounded-reconnect regression test (physical-device "Live
+    /// Translation stopped unexpectedly" hardening pass): the OLD policy
+    /// gave up after exactly ONE reconnect attempt, so any two blips in a
+    /// row — very plausible on a real G2-BLE↔phone↔backend↔OpenAI chain
+    /// — ended the whole Live Translation session. The bounded budget
+    /// must survive MORE than one consecutive failure before giving up,
+    /// not just one.
+    @Test("bounded reconnect survives multiple consecutive drops within its budget, not just one")
+    func boundedReconnectSurvivesMultipleConsecutiveDrops() async throws {
         let factory = FakeRealtimeTranscriptionSocketFactory()
-        let transcriber = makeTranscriber(factory)
+        let transcriber = OpenAIRealtimeTranscriber(
+            makeSocket: { await factory.makeSocket() },
+            maxConsecutiveReconnectAttempts: 3,
+            reconnectBackoffSchedule: [.zero, .zero, .zero]
+        )
+        let (pcmStream, _) = AsyncStream<Data>.makeStream()
+
+        let finals = try await transcriber.startTranscribing(pcmUpdates: pcmStream)
+        var received: [String] = []
+        var threw = false
+        let collectTask = Task {
+            do {
+                for try await value in finals {
+                    if case .final(let text) = value { received.append(text) }
+                }
+            } catch {
+                threw = true
+            }
+        }
+
+        // Two drops in a row — the OLD "one retry then give up" policy
+        // would already have surfaced a fatal error by now.
+        await (await factory.createdSockets[0]).emit(.closed(reason: "drop 1"))
+        try? await Task.sleep(for: Self.propagationDelay)
+        await (await factory.createdSockets[1]).emit(.closed(reason: "drop 2"))
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(await factory.createdSockets.count == 3) // 2 reconnect attempts made, budget of 3 not yet exhausted
+        #expect(!threw) // still alive — never gave up after just 2 drops
+
+        // The third connection stays up and keeps working normally.
+        await (await factory.createdSockets[2]).emit(.finalTranscript("resumed"))
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(received == ["resumed"])
+        #expect(!threw)
+        collectTask.cancel()
+    }
+
+    @Test("the bounded reconnect budget still exhausts and ends the stream with an error once every attempt fails")
+    func boundedReconnectExhaustsAfterBudget() async throws {
+        let factory = FakeRealtimeTranscriptionSocketFactory()
+        let transcriber = OpenAIRealtimeTranscriber(
+            makeSocket: { await factory.makeSocket() },
+            maxConsecutiveReconnectAttempts: 2,
+            reconnectBackoffSchedule: [.zero, .zero]
+        )
         let (pcmStream, _) = AsyncStream<Data>.makeStream()
 
         let finals = try await transcriber.startTranscribing(pcmUpdates: pcmStream)
@@ -210,15 +263,21 @@ struct OpenAIRealtimeTranscriberTests {
             }
         }
 
-        let firstSocket = await factory.createdSockets[0]
-        await firstSocket.emit(.closed(reason: "first drop"))
+        // Three drops in a row: the original connection, plus BOTH
+        // attempts in the bounded budget of 2 (each attempt connects
+        // successfully before being dropped again — this is testing the
+        // budget being exhausted by repeated DROPS, not by repeated
+        // connect() failures; see `reconnectConnectFailureExhaustsBudget`
+        // for that distinct case) — the budget must exhaust on this
+        // third drop, not sooner and not later.
+        await (await factory.createdSockets[0]).emit(.closed(reason: "drop 1"))
+        try? await Task.sleep(for: Self.propagationDelay)
+        await (await factory.createdSockets[1]).emit(.closed(reason: "drop 2"))
+        try? await Task.sleep(for: Self.propagationDelay)
+        await (await factory.createdSockets[2]).emit(.closed(reason: "drop 3"))
         try? await Task.sleep(for: Self.propagationDelay)
 
-        let secondSocket = await factory.createdSockets[1]
-        await secondSocket.emit(.closed(reason: "second drop"))
-        try? await Task.sleep(for: Self.propagationDelay)
-
-        #expect(await factory.createdSockets.count == 2) // no third attempt
+        #expect(await factory.createdSockets.count == 3) // 2 reconnect attempts made, no third — budget was 2
         #expect(threw)
         collectTask.cancel()
     }
@@ -294,16 +353,74 @@ struct OpenAIRealtimeTranscriberTests {
         collectTask.cancel()
     }
 
-    @Test("a connect failure on reconnect surfaces as a thrown error, not a silent stall")
-    func reconnectConnectFailureSurfaces() async throws {
-        let firstSocket = FakeRealtimeTranscriptionSocket()
-        let secondSocket = FakeRealtimeTranscriptionSocket()
-        await secondSocket.failNextConnect(with: FakeError(message: "reconnect refused"))
+    @Test("a connect() failure on ONE reconnect attempt retries again within the bounded budget, not an immediate stall or give-up")
+    func reconnectConnectFailureRetriesWithinBudget() async throws {
         var callCount = 0
-        let transcriber = OpenAIRealtimeTranscriber(makeSocket: {
-            callCount += 1
-            return callCount == 1 ? firstSocket : secondSocket
-        })
+        var createdSockets: [FakeRealtimeTranscriptionSocket] = []
+        let transcriber = OpenAIRealtimeTranscriber(
+            makeSocket: {
+                callCount += 1
+                let socket = FakeRealtimeTranscriptionSocket()
+                if callCount == 2 {
+                    // Only the SECOND socket (the first reconnect
+                    // attempt) fails to connect — the third (second
+                    // attempt) succeeds normally.
+                    await socket.failNextConnect(with: FakeError(message: "reconnect refused"))
+                }
+                createdSockets.append(socket)
+                return socket
+            },
+            maxConsecutiveReconnectAttempts: 3,
+            reconnectBackoffSchedule: [.zero, .zero, .zero]
+        )
+        let (pcmStream, _) = AsyncStream<Data>.makeStream()
+
+        let finals = try await transcriber.startTranscribing(pcmUpdates: pcmStream)
+        var received: [String] = []
+        var threw = false
+        let collectTask = Task {
+            do {
+                for try await value in finals {
+                    if case .final(let text) = value { received.append(text) }
+                }
+            } catch {
+                threw = true
+            }
+        }
+
+        await createdSockets[0].emit(.closed(reason: "network blip"))
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(callCount == 3) // attempt 1's connect() failed; attempt 2 was tried next automatically
+        #expect(!threw) // never gave up after a single failed connect()
+
+        await createdSockets[2].emit(.finalTranscript("resumed"))
+        try? await Task.sleep(for: Self.propagationDelay)
+
+        #expect(received == ["resumed"])
+        collectTask.cancel()
+    }
+
+    @Test("if every reconnect attempt's connect() fails, the bounded budget still exhausts and surfaces the failure")
+    func reconnectConnectFailureExhaustsBudget() async throws {
+        var callCount = 0
+        var createdSockets: [FakeRealtimeTranscriptionSocket] = []
+        let transcriber = OpenAIRealtimeTranscriber(
+            makeSocket: {
+                callCount += 1
+                let socket = FakeRealtimeTranscriptionSocket()
+                if callCount > 1 {
+                    // Every reconnect attempt's own socket fails to
+                    // connect — only the ORIGINAL (first) connection
+                    // succeeds.
+                    await socket.failNextConnect(with: FakeError(message: "reconnect refused"))
+                }
+                createdSockets.append(socket)
+                return socket
+            },
+            maxConsecutiveReconnectAttempts: 2,
+            reconnectBackoffSchedule: [.zero, .zero]
+        )
         let (pcmStream, _) = AsyncStream<Data>.makeStream()
 
         let finals = try await transcriber.startTranscribing(pcmUpdates: pcmStream)
@@ -316,11 +433,10 @@ struct OpenAIRealtimeTranscriberTests {
             }
         }
 
-        await firstSocket.emit(.closed(reason: "network blip"))
+        await createdSockets[0].emit(.closed(reason: "network blip"))
         try? await Task.sleep(for: Self.propagationDelay)
 
-        #expect(callCount == 2) // the reconnect attempt did happen
-        #expect(threw) // ...and its own connect() failure surfaced, not stalled silently
+        #expect(threw) // both reconnect attempts' connect() calls failed — budget exhausted
         collectTask.cancel()
     }
 }
