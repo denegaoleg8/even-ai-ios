@@ -151,10 +151,20 @@ struct SettingsView: View {
                 // refresh and anonymous-device tiers exhausted — see
                 // `AuthState.sessionRecoveryFailed`'s own doc comment),
                 // never merely "not signed in yet." A real human tap is
-                // exactly the deliberate retry `AuthenticatedAPIClient
-                // .retrySessionRecovery()` is designed to let through
-                // even during its automatic-retry cooldown.
-                if authState.sessionRecoveryFailed {
+                // the deliberate retry `AuthenticatedAPIClient
+                // .retrySessionRecovery()` lets through even during its
+                // short automatic-retry cooldown — but NOT during a real
+                // backend rate-limit window (`rateLimitedRetryAfterSeconds`
+                // != nil), where the button instead shows itself
+                // disabled with the actual countdown, per the rate-limit
+                // hardening pass's own explicit requirement that even a
+                // deliberate tap must not bypass a genuine server-timed
+                // window.
+                if let seconds = authState.rateLimitedRetryAfterSeconds {
+                    Label("Retry in \(seconds)s", systemImage: "clock")
+                        .foregroundStyle(AppColor.textSecondary)
+                        .accessibilityIdentifier("settings.retrySessionButton.rateLimited")
+                } else if authState.sessionRecoveryFailed {
                     Button {
                         Task { await authState.retrySession() }
                     } label: {

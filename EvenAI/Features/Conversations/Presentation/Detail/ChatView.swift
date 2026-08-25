@@ -44,6 +44,19 @@ struct ChatView: View {
 
             if viewModel.isLoading && viewModel.messages.isEmpty {
                 LoadingView(label: "Loading messages...")
+            } else if viewModel.messages.isEmpty, let seconds = viewModel.rateLimitedRetryAfterSeconds {
+                // See ChatListView's identical branch for the full
+                // reasoning — the backend is reachable and working, just
+                // temporarily declining new anonymous sessions for a
+                // known, bounded time. Never "check your connection".
+                EmptyStateView(
+                    systemImage: "clock",
+                    title: "Session Temporarily Unavailable",
+                    subtitle: "Too many session attempts. Retry in \(seconds)s.",
+                    actionTitle: "Retry",
+                    action: { Task { await viewModel.load() } }
+                )
+                .accessibilityIdentifier("chat.rateLimitedState")
             } else if viewModel.messages.isEmpty && viewModel.loadFailed {
                 EmptyStateView(
                     systemImage: "wifi.slash",

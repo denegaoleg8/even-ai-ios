@@ -23,6 +23,15 @@ enum AuthError: Error, Sendable, LocalizedError, Equatable {
     case sessionRevoked
     case offline
     case serverUnavailable
+    /// The backend rate-limited a session-recovery attempt (`/auth/device`
+    /// — see `AuthenticatedAPIClientError.rateLimited`'s own doc
+    /// comment). `retryAfterSeconds` is the backend's own signal, never
+    /// invented client-side. Deliberately distinct from
+    /// `.serverUnavailable`: the backend IS reachable and working, it's
+    /// just declining this specific request kind for a known, bounded
+    /// time — a truthful, temporary-and-bounded message, not a generic
+    /// "something's down" one.
+    case rateLimited(retryAfterSeconds: Int)
     case unknown
 
     var errorDescription: String? {
@@ -37,6 +46,7 @@ enum AuthError: Error, Sendable, LocalizedError, Equatable {
         case .sessionRevoked: "You've been signed out."
         case .offline: "No internet connection."
         case .serverUnavailable: "Couldn't reach the server. Please try again."
+        case .rateLimited(let seconds): "Session temporarily unavailable. Try again in \(seconds)s."
         case .unknown: "Something went wrong. Please try again."
         }
     }

@@ -29,6 +29,16 @@ enum LiveTranslationStartError: Error, Equatable {
     /// Session recovery (device or signed-in) failed outright — no
     /// usable credential could be established at all.
     case authenticationFailed(underlying: String)
+    /// The backend explicitly rate-limited session recovery
+    /// (`/auth/device` → `429`/`RATE_LIMITED`) — see
+    /// `AuthenticatedAPIClientError.rateLimited`'s own doc comment.
+    /// Deliberately distinct from `.authenticationFailed`: the
+    /// credential itself was never judged invalid, the backend is just
+    /// temporarily declining new anonymous sessions from this device —
+    /// a truthful, bounded-in-time message, never "check your G2
+    /// connection" and never the misleadingly generic "your session
+    /// couldn't be verified" a 429 used to produce before this fix.
+    case rateLimited(retryAfterSeconds: Int)
     /// Reached the network layer but the backend itself is unreachable
     /// or erroring — offline, timeout, or a 5xx response.
     case backendUnavailable(underlying: String)
@@ -52,6 +62,8 @@ enum LiveTranslationStartError: Error, Equatable {
             "Couldn't start Live Translation. Check your microphone and try again."
         case .authenticationFailed:
             "Couldn't start Live Translation. Your session couldn't be verified — try again in a moment."
+        case .rateLimited(let seconds):
+            "Couldn't start Live Translation. Too many session attempts — try again in \(seconds)s."
         case .backendUnavailable:
             "Couldn't start Live Translation. Check your internet connection and try again."
         case .sttHandshakeFailed:
@@ -69,6 +81,7 @@ enum LiveTranslationStartError: Error, Equatable {
         case .glassesUnavailable: "glassesUnavailable"
         case .microphoneUnavailable: "microphoneUnavailable"
         case .authenticationFailed: "authenticationFailed"
+        case .rateLimited: "rateLimited"
         case .backendUnavailable: "backendUnavailable"
         case .sttHandshakeFailed: "sttHandshakeFailed"
         case .unknown: "unknown"
@@ -86,19 +99,11 @@ enum LiveTranslationStartError: Error, Equatable {
             switch apiError {
             case .offline:
                 return .backendUnavailable(underlying: apiError.localizedDescription)
+            case .rateLimited(let retryAfterSeconds):
+                return .rateLimited(retryAfterSeconds: retryAfterSeconds)
             case .notAuthenticated, .sessionExpired:
                 return .authenticationFailed(underlying: apiError.localizedDescription)
-            case .http(let status, let code):
-                // A 429 (rate-limited) is never a credential problem —
-                // the backend telling this device "slow down" says
-                // nothing about whether the credential itself is valid.
-                // Reported as backendUnavailable, matching
-                // `SessionRecoveryFailureReason.rateLimited`'s own
-                // classification in `AuthenticatedAPIClient
-                // .classifyRecoveryFailure(_:)`, which this mirrors.
-                if status == 429 || code == "RATE_LIMITED" {
-                    return .backendUnavailable(underlying: apiError.localizedDescription)
-                }
+            case .http(let status, _):
                 return status >= 500
                     ? .backendUnavailable(underlying: apiError.localizedDescription)
                     : .authenticationFailed(underlying: apiError.localizedDescription)

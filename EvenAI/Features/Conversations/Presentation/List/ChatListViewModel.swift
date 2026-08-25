@@ -10,6 +10,11 @@ final class ChatListViewModel {
     /// "no chats yet" apart from "couldn't reach the backend," which look
     /// identical if you only check `chats.isEmpty`.
     private(set) var loadFailed = false
+    /// Non-`nil` ONLY when `loadChats()`'s failure was specifically the
+    /// backend rate-limiting session recovery — see `ChatViewModel
+    /// .rateLimitedRetryAfterSeconds`'s own doc comment; same reasoning
+    /// applies here for the chat list.
+    private(set) var rateLimitedRetryAfterSeconds: Int?
     /// Guards against a rapid double-tap on "New Chat" dispatching two
     /// overlapping `createChat()` calls, which would otherwise both
     /// succeed and create two chats from one tap.
@@ -33,8 +38,14 @@ final class ChatListViewModel {
         do {
             chats = try await chatService.fetchChats()
             loadFailed = false
+            rateLimitedRetryAfterSeconds = nil
         } catch {
             loadFailed = true
+            if case .rateLimited(let seconds) = error as? AuthenticatedAPIClientError {
+                rateLimitedRetryAfterSeconds = seconds
+            } else {
+                rateLimitedRetryAfterSeconds = nil
+            }
         }
     }
 

@@ -157,6 +157,26 @@ struct ChatListView: View {
         Group {
             if viewModel.isLoading && viewModel.chats.isEmpty {
                 LoadingView(label: "Loading chats...")
+            } else if viewModel.chats.isEmpty, let seconds = viewModel.rateLimitedRetryAfterSeconds {
+                // Distinct from the generic "Can't Connect" state below:
+                // the backend IS reachable and working — it's just
+                // temporarily declining new anonymous sessions from this
+                // device for a known, bounded time (see
+                // `ChatListViewModel.rateLimitedRetryAfterSeconds`'s own
+                // doc comment). Never says "check your connection" for a
+                // problem that has nothing to do with connectivity.
+                // Retry is safe to tap freely — it just re-asks the
+                // SAME rate-limit-aware `AuthenticatedAPIClient`, which
+                // will only ever attempt the network again once the real
+                // backend window has actually passed.
+                EmptyStateView(
+                    systemImage: "clock",
+                    title: "Session Temporarily Unavailable",
+                    subtitle: "Too many session attempts. Retry in \(seconds)s.",
+                    actionTitle: "Retry",
+                    action: { Task { await viewModel.loadChats() } }
+                )
+                .accessibilityIdentifier("chatList.rateLimitedState")
             } else if viewModel.chats.isEmpty && viewModel.loadFailed {
                 EmptyStateView(
                     systemImage: "wifi.slash",

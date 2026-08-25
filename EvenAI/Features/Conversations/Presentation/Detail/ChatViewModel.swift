@@ -16,6 +16,16 @@ final class ChatViewModel {
     /// this conversation's history," which look identical if you only
     /// check `messages.isEmpty`.
     private(set) var loadFailed = false
+    /// Non-`nil` ONLY when `load()`'s failure was specifically the
+    /// backend rate-limiting session recovery (`/auth/device` → `429` —
+    /// see `AuthenticatedAPIClientError.rateLimited`'s own doc comment).
+    /// Lets the view show a truthful, non-alarming "Session temporarily
+    /// unavailable — retry in Xs" state instead of the generic "Can't
+    /// Connect" copy, which would wrongly suggest a network problem when
+    /// the backend is actually reachable and working — it's just
+    /// declining new anonymous sessions from this device for a known,
+    /// bounded time.
+    private(set) var rateLimitedRetryAfterSeconds: Int?
 
     private let chatService: ChatServicing
     private let messageSender: ChatMessageSending
@@ -42,6 +52,7 @@ final class ChatViewModel {
             chatTitle = chat.title
             messages = try await chatService.fetchMessages(chatID: chatID)
             loadFailed = false
+            rateLimitedRetryAfterSeconds = nil
             // Reaching here means whatever credential this request used
             // (recovered proactively by `AuthenticatedAPIClient
             // .performOnce`'s reactive 401 path if needed) was accepted
@@ -56,8 +67,16 @@ final class ChatViewModel {
             DiagnosticTrace.log("CHAT_LOAD_SUCCESS", "chatID=\(chatID) messageCount=\(messages.count)")
         } catch {
             loadFailed = true
-            if let apiError = error as? AuthenticatedAPIClientError, Self.isAuthFailure(apiError) {
-                DiagnosticTrace.log("CHAT_AUTH_FAILED", "chatID=\(chatID) reason=\(apiError)")
+            if let apiError = error as? AuthenticatedAPIClientError {
+                if case .rateLimited(let seconds) = apiError {
+                    rateLimitedRetryAfterSeconds = seconds
+                    DiagnosticTrace.log("CHAT_AUTH_FAILED", "chatID=\(chatID) reason=rateLimited retryAfterSeconds=\(seconds)")
+                } else {
+                    rateLimitedRetryAfterSeconds = nil
+                    if Self.isAuthFailure(apiError) {
+                        DiagnosticTrace.log("CHAT_AUTH_FAILED", "chatID=\(chatID) reason=\(apiError)")
+                    }
+                }
             }
             DiagnosticTrace.log("CHAT_LOAD_FAILED", "chatID=\(chatID) errorType=\(type(of: error)) errorMessage=\(error)")
         }
@@ -69,14 +88,17 @@ final class ChatViewModel {
     /// `AuthenticatedAPIClient.classifyRecoveryFailure(_:)`'s own
     /// distinction (kept independently here since that method is
     /// private to a different type; both classify the exact same
-    /// underlying `AuthenticatedAPIClientError` cases).
+    /// underlying `AuthenticatedAPIClientError` cases). `.rateLimited` is
+    /// handled separately by the caller (`rateLimitedRetryAfterSeconds`),
+    /// never routed through this — it's a distinct UI state, not a
+    /// generic auth failure.
     private static func isAuthFailure(_ error: AuthenticatedAPIClientError) -> Bool {
         switch error {
         case .notAuthenticated, .sessionExpired:
             return true
         case .http(let status, _):
             return status == 401
-        case .offline, .invalidResponse, .underlying:
+        case .offline, .invalidResponse, .underlying, .rateLimited:
             return false
         }
     }

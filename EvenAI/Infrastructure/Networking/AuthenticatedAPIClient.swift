@@ -77,20 +77,68 @@ actor AuthenticatedAPIClient {
     private var lastRecoveryFailure: (error: Error, at: ContinuousClock.Instant)?
     private let recoveryFailureCooldown: Duration
     private let clock: ContinuousClock
+    /// Wall-clock (not `ContinuousClock`) deadline before which NO
+    /// automatic session-recovery attempt may touch `/auth/device` at
+    /// all — set only from a genuine, backend-reported `429`/
+    /// `RATE_LIMITED` response (see `parseRetryAfterSeconds(from:)`),
+    /// never invented client-side. Deliberately `Date`, not
+    /// `ContinuousClock.Instant`: this needs to survive an app relaunch
+    /// (Section 6 of the follow-up rate-limit hardening pass — a force-
+    /// quit must not immediately restart the request storm), and only a
+    /// wall-clock timestamp remains meaningful across a process restart.
+    /// Distinct from — and checked BEFORE — `lastRecoveryFailure`'s much
+    /// shorter generic cooldown: a real 15-minute backend rate-limit
+    /// window must never be treated the same as an ordinary transient
+    /// hiccup that's fine to retry again in a few seconds.
+    private var rateLimitedUntil: Date?
+    private let defaults: UserDefaults
+    private static let rateLimitedUntilDefaultsKey = "com.evenai.session.rateLimitedUntilTimestamp"
+    /// `UserDefaults` isn't `Sendable`, so it can't cross directly into
+    /// an actor's `init` as a plain parameter under Swift 6 strict
+    /// concurrency — a `@Sendable` closure that PRODUCES it, invoked
+    /// here inside the actor's own initializer, is the standard way
+    /// around that: the closure itself is `Sendable` (captures nothing
+    /// non-`Sendable` when the default `{ .standard }` is used, or when
+    /// a test passes a fresh, locally-created instance), and the
+    /// `UserDefaults` value it returns is constructed/obtained ONLY
+    /// after execution has already entered this initializer — it never
+    /// "crosses" the actor boundary as a value in flight.
+    typealias DefaultsProvider = @Sendable () -> UserDefaults
+    /// Used only when the backend's `429` response carries neither a
+    /// parseable `Retry-After` header nor a `RateLimit-Reset` header —
+    /// matches the known, currently-configured window
+    /// (`even-ai-assistant-asr`'s `authRateLimit`: 15 minutes) as the
+    /// safest assumption when the server didn't say otherwise.
+    private static let defaultRateLimitWindow: Duration = .seconds(15 * 60)
 
     init(
         baseURL: URL = BackendConfiguration.baseURL,
         session: URLSession = .shared,
         tokenStore: AuthTokenStoring = KeychainAuthTokenStore(),
         deviceIdentityStore: DeviceIdentityStoring = KeychainDeviceIdentityStore(),
+        defaults defaultsProvider: @escaping DefaultsProvider = { .standard },
         recoveryFailureCooldown: Duration = .seconds(5)
     ) {
         self.baseURL = baseURL
         self.session = session
         self.tokenStore = tokenStore
         self.deviceIdentityStore = deviceIdentityStore
+        let defaults = defaultsProvider()
+        self.defaults = defaults
         self.recoveryFailureCooldown = recoveryFailureCooldown
         self.clock = ContinuousClock()
+        // Load any still-active rate-limit deadline persisted from a
+        // PRIOR process run — an already-expired one is simply never
+        // set here (nothing to suppress), and is opportunistically
+        // cleared from storage the first time anything reads it.
+        if let stored = defaults.object(forKey: Self.rateLimitedUntilDefaultsKey) as? TimeInterval {
+            let deadline = Date(timeIntervalSince1970: stored)
+            if deadline > Date() {
+                rateLimitedUntil = deadline
+            } else {
+                defaults.removeObject(forKey: Self.rateLimitedUntilDefaultsKey)
+            }
+        }
     }
 
     /// A snapshot of the one authoritative session state, right now —
@@ -164,15 +212,21 @@ actor AuthenticatedAPIClient {
     /// callers can ever both observe it `nil` and each start their own
     /// task). Throws only if *both* tiers fail.
     ///
-    /// ALSO cooldown-protected against REPEATED failed attempts arriving
-    /// close together — see `lastRecoveryFailure`'s own doc comment for
-    /// the exact physical-device symptom this fixes. Bypassed only by
-    /// `retrySessionRecovery()`, an explicit user-initiated action.
+    /// ALSO protected against REPEATED failed attempts arriving close
+    /// together, at two different granularities: a real, backend-timed
+    /// rate-limit deadline (`rateLimitedUntil`, checked FIRST — never
+    /// bypassable by anything except the real reset time itself) and a
+    /// much shorter generic cooldown for every other transient failure
+    /// kind (`lastRecoveryFailure`, bypassable by
+    /// `retrySessionRecovery()`, an explicit user-initiated action).
     @discardableResult
     func recoverSession() async throws -> User {
         if let existing = recoveryTask {
             DiagnosticTrace.log("SESSION_SINGLE_FLIGHT_JOINED", "")
             return try await existing.value
+        }
+        if let suppression = rateLimitSuppression() {
+            throw suppression
         }
         if let lastFailure = lastRecoveryFailure, clock.now - lastFailure.at < recoveryFailureCooldown {
             DiagnosticTrace.log("SESSION_RECOVERY_COOLDOWN_ACTIVE", "suppressing a redundant attempt — reusing the recent failure")
@@ -182,18 +236,60 @@ actor AuthenticatedAPIClient {
     }
 
     /// Explicit, user-initiated retry (Section J's "Retry Session"
-    /// affordance) — the ONE way to bypass `recoverSession()`'s cooldown.
-    /// Safe against an infinite loop by construction: this is only ever
-    /// invoked by a real human tapping a button, never by this class's
-    /// own code, so nothing here can call it repeatedly on its own.
+    /// affordance) — bypasses ONLY the short generic cooldown
+    /// (`lastRecoveryFailure`), never the real backend rate-limit
+    /// deadline (`rateLimitedUntil`): per the follow-up hardening pass's
+    /// own explicit requirement, "Retry Session" must stay
+    /// disabled/suppressed until the server's actual reset time, even
+    /// for a deliberate human tap — a production device retrying while
+    /// the backend is still rate-limiting it is exactly the failure mode
+    /// this exists to prevent. Once that deadline passes, this (or the
+    /// very next ordinary `recoverSession()` call) is what performs the
+    /// one fresh attempt the reset permits.
     @discardableResult
     func retrySessionRecovery() async throws -> User {
+        if let suppression = rateLimitSuppression() {
+            throw suppression
+        }
         lastRecoveryFailure = nil
         if let existing = recoveryTask {
             DiagnosticTrace.log("SESSION_SINGLE_FLIGHT_JOINED", "")
             return try await existing.value
         }
         return try await startRecovery()
+    }
+
+    /// `nil` if no rate-limit deadline is active (or it has already
+    /// passed — in which case it's cleared here, so this is also the one
+    /// place an EXPIRED deadline gets cleaned up without needing a
+    /// separate timer). Otherwise logs `SESSION_RECOVERY_SUPPRESSED` and
+    /// returns the exact error to throw — never touches the network.
+    private func rateLimitSuppression() -> AuthenticatedAPIClientError? {
+        guard let deadline = rateLimitedUntil else { return nil }
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0 else {
+            clearRateLimit()
+            return nil
+        }
+        let remainingSeconds = Int(remaining.rounded(.up))
+        DiagnosticTrace.log("SESSION_RECOVERY_SUPPRESSED", "reason=rateLimited remainingSeconds=\(remainingSeconds)")
+        return .rateLimited(retryAfterSeconds: remainingSeconds)
+    }
+
+    private func setRateLimit(retryAfterSeconds: Int) {
+        let deadline = Date().addingTimeInterval(TimeInterval(retryAfterSeconds))
+        rateLimitedUntil = deadline
+        defaults.set(deadline.timeIntervalSince1970, forKey: Self.rateLimitedUntilDefaultsKey)
+        DiagnosticTrace.log("SESSION_RATE_LIMITED", "retryAfterSeconds=\(retryAfterSeconds)")
+        DiagnosticTrace.log("SESSION_RETRY_NOT_BEFORE", "timestamp=\(deadline.timeIntervalSince1970)")
+    }
+
+    /// Called the moment recovery succeeds — Section 5's own
+    /// requirement: "successful recovery clears rate-limit state."
+    private func clearRateLimit() {
+        guard rateLimitedUntil != nil else { return }
+        rateLimitedUntil = nil
+        defaults.removeObject(forKey: Self.rateLimitedUntilDefaultsKey)
     }
 
     private func startRecovery() async throws -> User {
@@ -406,6 +502,14 @@ actor AuthenticatedAPIClient {
             return status >= 500
         case .notAuthenticated, .sessionExpired:
             return false
+        case .rateLimited:
+            // Never retried automatically, by this method or by ANY
+            // caller — retrying a rate-limited failure, even once more,
+            // is exactly the "hammer the endpoint" behavior this whole
+            // mechanism exists to stop. The user (or `retrySessionRecovery()`,
+            // itself gated on the real retry-not-before time) is the
+            // only path that ever tries again.
+            return false
         }
     }
 
@@ -498,6 +602,7 @@ actor AuthenticatedAPIClient {
         publish(.ready(type))
         DiagnosticTrace.log("SESSION_CREDENTIAL_AVAILABLE", "type=\(type.rawValue)")
         lastRecoveryFailure = nil
+        clearRateLimit()
         sessionChangeContinuation?.yield(user)
     }
 
@@ -524,8 +629,9 @@ actor AuthenticatedAPIClient {
         switch apiError {
         case .offline:
             return .offline
-        case .http(let status, let code):
-            if status == 429 || code == "RATE_LIMITED" { return .rateLimited }
+        case .rateLimited(let retryAfterSeconds):
+            return .rateLimited(retryAfterSeconds: retryAfterSeconds)
+        case .http(let status, _):
             return status >= 500 ? .backendUnavailable : .invalidCredential
         case .notAuthenticated, .sessionExpired:
             return .invalidCredential
@@ -576,6 +682,16 @@ actor AuthenticatedAPIClient {
         return decoded.account.toDomain()
     }
 
+    /// `/auth/device` is the ONE endpoint this app calls that the
+    /// backend actually rate-limits (`even-ai-assistant-asr`'s
+    /// `authRateLimit`: 20 requests/15 minutes per IP, applied to
+    /// `/auth/device`/`/auth/signup`/`/auth/login` — confirmed NOT
+    /// applied to `/auth/refresh`, which has no such limit). A `429`
+    /// here is handled specially: parses the backend's own
+    /// `Retry-After`/`RateLimit-Reset` signal, records
+    /// `rateLimitedUntil` (persisted — see that property's own doc
+    /// comment), and throws the dedicated `.rateLimited` case rather
+    /// than a generic `.http(429, ...)`.
     private func performDeviceAuth() async throws -> User {
         let deviceID = deviceIdentityStore.currentDeviceID()
         let payload: [String: String] = [
@@ -595,7 +711,18 @@ actor AuthenticatedAPIClient {
         } catch let urlError as URLError {
             throw Self.classify(urlError)
         }
-        try Self.validate(response, data: data)
+        guard let http = response as? HTTPURLResponse else {
+            throw AuthenticatedAPIClientError.invalidResponse
+        }
+        if http.statusCode == 429 {
+            let retryAfterSeconds = Self.parseRetryAfterSeconds(from: http) ?? Int(Self.defaultRateLimitWindow.components.seconds)
+            setRateLimit(retryAfterSeconds: retryAfterSeconds)
+            throw AuthenticatedAPIClientError.rateLimited(retryAfterSeconds: retryAfterSeconds)
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let code = try? JSONDecoder().decode(APIErrorPayloadDTO.self, from: data).error.code
+            throw AuthenticatedAPIClientError.http(status: http.statusCode, code: code)
+        }
 
         let decoded = try JSONDecoder.evenAI.decode(DeviceAuthResponseDTO.self, from: data)
         accessToken = decoded.accessToken
@@ -606,6 +733,45 @@ actor AuthenticatedAPIClient {
     private static var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
     }
+
+    /// Reads the backend's own rate-limit signal off a `429` response —
+    /// never a client-invented guess (see `performDeviceAuth()`'s doc
+    /// comment). Prefers the standard `Retry-After` header (RFC 6585 —
+    /// `express-rate-limit`'s `standardHeaders: true` sets this on a
+    /// blocked request), which may be either delta-seconds ("900") or an
+    /// HTTP-date; falls back to the IETF draft `RateLimit-Reset` header
+    /// (also emitted by `standardHeaders: true`, delta-seconds only) if
+    /// `Retry-After` is absent or unparseable. Returns `nil` — never a
+    /// fabricated number — if neither header yields a usable value, so
+    /// the caller's own `defaultRateLimitWindow` fallback is what
+    /// applies, and that fallback is clearly attributable, not
+    /// disguised as a real server signal.
+    private static func parseRetryAfterSeconds(from response: HTTPURLResponse) -> Int? {
+        if let retryAfter = response.value(forHTTPHeaderField: "Retry-After") {
+            if let seconds = Int(retryAfter.trimmingCharacters(in: .whitespaces)), seconds >= 0 {
+                return seconds
+            }
+            if let httpDate = Self.httpDateFormatter.date(from: retryAfter) {
+                let seconds = Int(httpDate.timeIntervalSinceNow.rounded(.up))
+                return max(seconds, 0)
+            }
+        }
+        if let resetHeader = response.value(forHTTPHeaderField: "RateLimit-Reset"),
+           let seconds = Int(resetHeader.trimmingCharacters(in: .whitespaces)), seconds >= 0 {
+            return seconds
+        }
+        return nil
+    }
+
+    /// RFC 7231 IMF-fixdate — the format `Retry-After` uses when it
+    /// carries a date instead of delta-seconds.
+    private static let httpDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return formatter
+    }()
 
     // MARK: - Response validation / error classification
 
@@ -646,6 +812,21 @@ enum AuthenticatedAPIClientError: Error, Sendable, LocalizedError, Equatable {
     case notAuthenticated
     case sessionExpired
     case offline
+    /// The backend explicitly rate-limited a session-recovery request
+    /// (`/auth/device`, `HTTP 429`/`RATE_LIMITED` — see
+    /// `even-ai-assistant-asr`'s `authRateLimit`: 20 requests per 15-
+    /// minute window, IP-keyed). `retryAfterSeconds` is the backend's own
+    /// signal (its `Retry-After` header, or `RateLimit-Reset` as a
+    /// fallback — see `AuthenticatedAPIClient
+    /// .parseRetryAfterSeconds(from:)`), never a client-invented guess.
+    /// Deliberately a DISTINCT case from `.http(status: 429, ...)` — this
+    /// is what lets every downstream classifier (`LiveTranslationStartError`,
+    /// Chat's own load-failure handling) recognize "the backend told us
+    /// to slow down" as a single, unambiguous signal, both on the LIVE
+    /// 429 response and on every later call this class suppresses on its
+    /// own before ever reaching the network again (see
+    /// `AuthenticatedAPIClient.recoverSession()`'s rate-limit check).
+    case rateLimited(retryAfterSeconds: Int)
     case http(status: Int, code: String?)
     case invalidResponse
     case underlying(String)
@@ -655,6 +836,7 @@ enum AuthenticatedAPIClientError: Error, Sendable, LocalizedError, Equatable {
         case .notAuthenticated: "Not signed in."
         case .sessionExpired: "Your session has expired."
         case .offline: "No internet connection."
+        case .rateLimited(let seconds): "Too many session attempts. Try again in \(seconds)s."
         case .http(let status, let code): "Request failed (HTTP \(status)\(code.map { ", \($0)" } ?? ""))."
         case .invalidResponse: "The server returned an unexpected response."
         case .underlying(let message): message

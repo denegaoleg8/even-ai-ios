@@ -28,6 +28,15 @@ final class AuthState {
     /// whether via an explicit `retrySession()` call or a later reactive
     /// recovery elsewhere in the app (see `observeSessionChanges()`).
     private(set) var sessionRecoveryFailed = false
+    /// Non-`nil` ONLY when `sessionRecoveryFailed`'s cause was
+    /// specifically the backend rate-limiting session recovery — see
+    /// `AuthError.rateLimited`'s own doc comment. Lets Settings show its
+    /// "Retry Session" affordance correctly DISABLED with a countdown
+    /// (per the rate-limit hardening pass's own explicit requirement:
+    /// even a deliberate human tap must not bypass a real backend
+    /// rate-limit window) rather than an actively tappable button that
+    /// would just fail again identically.
+    private(set) var rateLimitedRetryAfterSeconds: Int?
     /// Set by `signIn` when the device already had its own local
     /// (anonymous) account with chats — see `AuthResult.mergeAvailableFrom`.
     /// Deliberately *not* cleared just because the merge screen was
@@ -72,6 +81,7 @@ final class AuthState {
         do {
             currentUser = try await authService.restoreSession()
             sessionRecoveryFailed = false
+            rateLimitedRetryAfterSeconds = nil
         } catch {
             // Both recovery tiers were exhausted — a genuine failure,
             // not merely "hasn't resolved yet." `currentUser` stays
@@ -81,19 +91,28 @@ final class AuthState {
             // instead of the previous silent `try?` leaving no trace
             // anywhere that recovery ever actually failed.
             sessionRecoveryFailed = true
+            rateLimitedRetryAfterSeconds = (error as? AuthError).flatMap {
+                if case .rateLimited(let seconds) = $0 { return seconds }
+                return nil
+            }
         }
     }
 
     /// Explicit, user-initiated retry (Settings' "Retry Session"
     /// button) — see `AuthServicing.retrySession()`'s own doc comment
-    /// for why this bypasses the cooldown a recently-failed automatic
-    /// recovery leaves in place elsewhere in the app.
+    /// for why this bypasses only the SHORT generic cooldown, never a
+    /// real backend rate-limit window.
     func retrySession() async {
         do {
             currentUser = try await authService.retrySession()
             sessionRecoveryFailed = false
+            rateLimitedRetryAfterSeconds = nil
         } catch {
             sessionRecoveryFailed = true
+            rateLimitedRetryAfterSeconds = (error as? AuthError).flatMap {
+                if case .rateLimited(let seconds) = $0 { return seconds }
+                return nil
+            }
         }
     }
 
@@ -176,6 +195,7 @@ final class AuthState {
                 // "Retry Session" affordance in Settings without the
                 // user needing to tap it themselves.
                 self.sessionRecoveryFailed = false
+                self.rateLimitedRetryAfterSeconds = nil
                 if identityChanged {
                     await invalidateChatCache()
                 }

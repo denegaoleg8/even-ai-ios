@@ -59,6 +59,16 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     struct StubResponse {
         let status: Int
         let body: Data
+        /// Extra response headers beyond the always-present
+        /// `Content-Type` — used to simulate `Retry-After`/
+        /// `RateLimit-Reset` on a stubbed `429`, among other things.
+        var headers: [String: String] = [:]
+
+        init(status: Int, body: Data, headers: [String: String] = [:]) {
+            self.status = status
+            self.body = body
+            self.headers = headers
+        }
     }
 
     nonisolated(unsafe) static var handler: (@Sendable (URLRequest) -> StubResponse)?
@@ -88,11 +98,13 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
             return
         }
         let result = handler(request)
+        var headerFields = ["Content-Type": "application/json"]
+        for (key, value) in result.headers { headerFields[key] = value }
         let response = HTTPURLResponse(
             url: request.url!,
             statusCode: result.status,
             httpVersion: "HTTP/1.1",
-            headerFields: ["Content-Type": "application/json"]
+            headerFields: headerFields
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
 

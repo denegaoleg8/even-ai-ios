@@ -130,6 +130,8 @@ struct NetworkAuthService: AuthServicing {
             return .offline
         case .sessionExpired, .notAuthenticated:
             return .sessionExpired
+        case .rateLimited(let retryAfterSeconds):
+            return .rateLimited(retryAfterSeconds: retryAfterSeconds)
         case .invalidResponse, .underlying:
             return .serverUnavailable
         case .http(let status, let code):

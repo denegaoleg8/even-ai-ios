@@ -37,8 +37,23 @@ import Foundation
 /// duplicated here.
 @Suite("Session recovery — shared auth/session lifecycle", .serialized)
 struct SessionRecoveryTests {
+    private func freshDefaults() -> UserDefaults {
+        UserDefaults(suiteName: "SessionRecoveryTests.\(UUID().uuidString)")!
+    }
+
+    /// A fresh, isolated `UserDefaults` suite PER CALL, never `.standard`
+    /// — `rateLimitedUntil` is persisted (Section 6 of the rate-limit
+    /// hardening pass: it must survive an app relaunch), so two clients
+    /// sharing `.standard` in the same test process would leak rate-
+    /// limit state between them exactly like two real, separate
+    /// `AuthenticatedAPIClient` instances constructed across a genuine
+    /// relaunch are SUPPOSED to share it — correct in production,
+    /// exactly the behavior `relaunchRespectsPersistedRateLimit` below
+    /// deliberately exercises, but wrong for any OTHER test in this file
+    /// that wants a clean slate.
     private func makeClient(
         tokenStore: AuthTokenStoring = InMemoryAuthTokenStore(),
+        defaults: (@Sendable () -> UserDefaults)? = nil,
         recoveryFailureCooldown: Duration = .seconds(5)
     ) -> AuthenticatedAPIClient {
         StubURLProtocol.reset()
@@ -46,12 +61,13 @@ struct SessionRecoveryTests {
             baseURL: URL(string: "https://example.com/api")!,
             session: StubURLProtocol.makeSession(),
             tokenStore: tokenStore,
+            defaults: defaults ?? { self.freshDefaults() },
             recoveryFailureCooldown: recoveryFailureCooldown
         )
     }
 
-    private static func jsonResponse(_ status: Int, _ object: [String: Any]) -> StubURLProtocol.StubResponse {
-        StubURLProtocol.StubResponse(status: status, body: try! JSONSerialization.data(withJSONObject: object))
+    private static func jsonResponse(_ status: Int, _ object: [String: Any], headers: [String: String] = [:]) -> StubURLProtocol.StubResponse {
+        StubURLProtocol.StubResponse(status: status, body: try! JSONSerialization.data(withJSONObject: object), headers: headers)
     }
 
     private static func accountJSON(id: UUID = UUID()) -> [String: Any] {
@@ -331,15 +347,15 @@ struct SessionRecoveryTests {
         #expect(StubURLProtocol.recordedRequests().last?.value(forHTTPHeaderField: "Authorization") == nil)
     }
 
-    // MARK: - Redundant-attempt suppression (the actual physical-device fix)
+    // MARK: - Redundant-attempt suppression (the actual physical-device fix — GENERIC/short cooldown, non-rate-limit failures)
 
-    @Test("a repeated recoverSession() call immediately after a failure reuses the SAME cached failure — no second network attempt")
+    @Test("a repeated recoverSession() call immediately after a generic (non-rate-limit) failure reuses the SAME cached failure — no second network attempt")
     func repeatedCallAfterFailureIsSuppressedByCooldown() async throws {
         let client = makeClient(recoveryFailureCooldown: .seconds(30))
         let deviceAuthCallCount = Counter()
         StubURLProtocol.handler = { _ in
             deviceAuthCallCount.increment()
-            return Self.jsonResponse(429, ["error": ["code": "RATE_LIMITED", "message": "slow down"]])
+            return Self.jsonResponse(500, ["error": ["code": "INTERNAL_ERROR", "message": "down"]])
         }
 
         await #expect(throws: AuthenticatedAPIClientError.self) { try await client.recoverSession() }
@@ -347,20 +363,20 @@ struct SessionRecoveryTests {
 
         // A second, immediate call — modeling Chat's own reactive 401
         // path firing moments later — must NOT make a second network
-        // attempt against an endpoint that just rate-limited this device.
+        // attempt against a backend that just failed.
         await #expect(throws: AuthenticatedAPIClientError.self) { try await client.recoverSession() }
         #expect(deviceAuthCallCount.value == 1)
     }
 
-    @Test("retrySessionRecovery() bypasses the cooldown — the explicit user-initiated retry always attempts the network")
-    func retrySessionRecoveryBypassesCooldown() async throws {
+    @Test("retrySessionRecovery() bypasses the SHORT generic cooldown — the explicit user-initiated retry attempts the network again")
+    func retrySessionRecoveryBypassesGenericCooldown() async throws {
         let client = makeClient(recoveryFailureCooldown: .seconds(30))
         let deviceAuthCallCount = Counter()
         let accountID = UUID()
         StubURLProtocol.handler = { _ in
             deviceAuthCallCount.increment()
             if deviceAuthCallCount.value == 1 {
-                return Self.jsonResponse(429, ["error": ["code": "RATE_LIMITED", "message": "slow down"]])
+                return Self.jsonResponse(500, ["error": ["code": "INTERNAL_ERROR", "message": "down"]])
             }
             return Self.deviceAuthResponse(id: accountID, accessToken: "retry-token", refreshToken: "retry-refresh")
         }
@@ -369,7 +385,7 @@ struct SessionRecoveryTests {
         #expect(deviceAuthCallCount.value == 1)
 
         // A REGULAR recoverSession() call right now would be suppressed
-        // by the cooldown — but the explicit retry bypasses it.
+        // by the generic cooldown — but the explicit retry bypasses it.
         let user = try await client.retrySessionRecovery()
         #expect(user.id == accountID)
         #expect(deviceAuthCallCount.value == 2)
@@ -400,17 +416,267 @@ struct SessionRecoveryTests {
         #expect(await client.currentSessionState() == .ready(.authenticated))
     }
 
-    @Test("currentSessionState() reflects .failed(.rateLimited) after a 429, distinct from .failed(.backendUnavailable) after a 5xx")
+    @Test("currentSessionState() reflects .failed(.rateLimited) with the backend's own Retry-After value after a 429, distinct from .failed(.backendUnavailable) after a 5xx")
     func sessionStateDistinguishesRateLimitedFromBackendUnavailable() async throws {
         let rateLimitedClient = makeClient()
-        StubURLProtocol.handler = { _ in Self.jsonResponse(429, ["error": ["code": "RATE_LIMITED", "message": "slow down"]]) }
+        StubURLProtocol.handler = { _ in
+            Self.jsonResponse(429, ["error": ["code": "RATE_LIMITED", "message": "slow down"]], headers: ["Retry-After": "123"])
+        }
         _ = try? await rateLimitedClient.recoverSession()
-        #expect(await rateLimitedClient.currentSessionState() == .failed(.rateLimited))
+        #expect(await rateLimitedClient.currentSessionState() == .failed(.rateLimited(retryAfterSeconds: 123)))
 
         let backendDownClient = makeClient()
         StubURLProtocol.handler = { _ in Self.jsonResponse(500, ["error": ["code": "INTERNAL_ERROR", "message": "down"]]) }
         _ = try? await backendDownClient.recoverSession()
         #expect(await backendDownClient.currentSessionState() == .failed(.backendUnavailable))
+    }
+
+    // MARK: - Retry-After hardening pass (physical-device follow-up:
+    // the 5-second cooldown didn't honor the backend's real reset time)
+
+    @Test("a 429 with a delta-seconds Retry-After header is parsed correctly")
+    func retryAfterDeltaSecondsIsParsedCorrectly() async throws {
+        let client = makeClient()
+        StubURLProtocol.handler = { _ in
+            Self.jsonResponse(429, ["error": ["code": "RATE_LIMITED", "message": "slow down"]], headers: ["Retry-After": "742"])
+        }
+
+        do {
+            _ = try await client.recoverSession()
+            Issue.record("expected recoverSession() to throw")
+        } catch AuthenticatedAPIClientError.rateLimited(let seconds) {
+            #expect(seconds == 742)
+        }
+    }
+
+    @Test("a 429 with an HTTP-date Retry-After header is parsed correctly")
+    func retryAfterHTTPDateIsParsedCorrectly() async throws {
+        let client = makeClient()
+        let futureDate = Date().addingTimeInterval(600)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        let httpDate = formatter.string(from: futureDate)
+
+        StubURLProtocol.handler = { _ in
+            Self.jsonResponse(429, ["error": ["code": "RATE_LIMITED", "message": "slow down"]], headers: ["Retry-After": httpDate])
+        }
+
+        do {
+            _ = try await client.recoverSession()
+            Issue.record("expected recoverSession() to throw")
+        } catch AuthenticatedAPIClientError.rateLimited(let seconds) {
+            // Allow a couple seconds of slack for formatting/parsing/test
+            // execution time — this is checking "roughly 600s away," not
+            // an exact-to-the-millisecond match.
+            #expect(abs(seconds - 600) <= 3)
+        }
+    }
+
+    @Test("a 429 with a RateLimit-Reset header (no Retry-After) falls back to it correctly")
+    func rateLimitResetHeaderIsUsedWhenRetryAfterIsAbsent() async throws {
+        let client = makeClient()
+        StubURLProtocol.handler = { _ in
+            Self.jsonResponse(429, ["error": ["code": "RATE_LIMITED", "message": "slow down"]], headers: ["RateLimit-Reset": "300"])
+        }
+
+        do {
+            _ = try await client.recoverSession()
+            Issue.record("expected recoverSession() to throw")
+        } catch AuthenticatedAPIClientError.rateLimited(let seconds) {
+            #expect(seconds == 300)
+        }
+    }
+
+    @Test("a 429 with NEITHER header falls back to the known 15-minute window, never a fabricated short guess")
+    func missingHeadersFallBackToKnownWindow() async throws {
+        let client = makeClient()
+        StubURLProtocol.handler = { _ in Self.jsonResponse(429, ["error": ["code": "RATE_LIMITED", "message": "slow down"]]) }
+
+        do {
+            _ = try await client.recoverSession()
+            Issue.record("expected recoverSession() to throw")
+        } catch AuthenticatedAPIClientError.rateLimited(let seconds) {
+            #expect(seconds == 15 * 60)
+        }
+    }
+
+    // MARK: - 2: repeated ensureSession() calls during a rate-limit cooldown send ZERO additional /auth/device requests
+
+    @Test("2: repeated ensureSession() calls while genuinely rate-limited send ZERO additional /auth/device requests — never every 5 seconds, never at all until the real window passes")
+    func repeatedEnsureSessionDuringRateLimitSendsNoRequests() async throws {
+        let client = makeClient()
+        let requestCount = Counter()
+        StubURLProtocol.handler = { _ in
+            requestCount.increment()
+            return Self.jsonResponse(429, ["error": ["code": "RATE_LIMITED", "message": "slow down"]], headers: ["Retry-After": "900"])
+        }
+
+        _ = try? await client.recoverSession()
+        #expect(requestCount.value == 1)
+
+        // Many repeated calls — modeling every dependent screen's own
+        // reactive 401 path firing independently, back to back — must
+        // never make a second network attempt while still genuinely
+        // rate-limited.
+        for _ in 0..<10 {
+            try? await client.ensureSession()
+        }
+        #expect(requestCount.value == 1)
+    }
+
+    // MARK: - 3: Chat + Live Translation concurrently still produce only one recovery attempt, even when rate-limited
+
+    @Test("3: concurrent Chat + Live Translation startup during an active rate-limit both observe the SAME suppressed state — one attempt, not two")
+    func concurrentConsumersShareRateLimitSuppression() async throws {
+        let client = makeClient()
+        let requestCount = Counter()
+        StubURLProtocol.handler = { _ in
+            requestCount.increment()
+            return Self.jsonResponse(429, ["error": ["code": "RATE_LIMITED", "message": "slow down"]], headers: ["Retry-After": "900"])
+        }
+        _ = try? await client.recoverSession() // establishes the rate-limit state
+        #expect(requestCount.value == 1)
+
+        async let chatAttempt: () = { try? await client.ensureSession() }()
+        async let liveTranslationAttempt: () = { try? await client.ensureSession() }()
+        _ = await (chatAttempt, liveTranslationAttempt)
+
+        #expect(requestCount.value == 1) // neither concurrent consumer made a second request
+    }
+
+    // MARK: - 4: app relaunch during an active rate limit respects retry-not-before
+
+    @Test("4: a brand-new AuthenticatedAPIClient instance (modeling a force-quit + relaunch) still respects a persisted, still-active rate-limit deadline — no immediate request storm restart")
+    func relaunchDuringActiveRateLimitRespectsRetryNotBefore() async throws {
+        nonisolated(unsafe) let sharedDefaults = freshDefaults()
+        let firstProcessClient = makeClient(defaults: { sharedDefaults })
+        let requestCount = Counter()
+        StubURLProtocol.handler = { _ in
+            requestCount.increment()
+            return Self.jsonResponse(429, ["error": ["code": "RATE_LIMITED", "message": "slow down"]], headers: ["Retry-After": "900"])
+        }
+        _ = try? await firstProcessClient.recoverSession()
+        #expect(requestCount.value == 1)
+
+        // A brand-new client instance, same underlying UserDefaults —
+        // exactly what happens across a force-quit + relaunch.
+        StubURLProtocol.reset()
+        let relaunchedClient = AuthenticatedAPIClient(
+            baseURL: URL(string: "https://example.com/api")!,
+            session: StubURLProtocol.makeSession(),
+            tokenStore: InMemoryAuthTokenStore(),
+            defaults: { sharedDefaults }
+        )
+        StubURLProtocol.handler = { _ in
+            requestCount.increment()
+            return Self.deviceAuthResponse(accessToken: "should-never-be-reached", refreshToken: "should-never-be-reached")
+        }
+
+        do {
+            _ = try await relaunchedClient.recoverSession()
+            Issue.record("expected the relaunched client to still be suppressed")
+        } catch AuthenticatedAPIClientError.rateLimited {
+            // Expected — no additional request was made.
+        }
+        #expect(requestCount.value == 1) // the relaunch never re-attempted the network
+    }
+
+    // MARK: - 5: expiry permits exactly one fresh recovery
+
+    @Test("5: once the rate-limit deadline has genuinely passed, exactly one fresh recovery attempt is permitted")
+    func expiryPermitsExactlyOneFreshRecovery() async throws {
+        // A deadline that's effectively already in the past by the time
+        // this test reads it back — proves the EXPIRY check itself
+        // (`rateLimitSuppression()`'s `remaining > 0` guard), not a real
+        // multi-second wait.
+        nonisolated(unsafe) let defaults = freshDefaults()
+        defaults.set(Date().addingTimeInterval(-1).timeIntervalSince1970, forKey: "com.evenai.session.rateLimitedUntilTimestamp")
+        let client = makeClient(defaults: { defaults })
+        let accountID = UUID()
+        let requestCount = Counter()
+        StubURLProtocol.handler = { _ in
+            requestCount.increment()
+            return Self.deviceAuthResponse(id: accountID, accessToken: "fresh-token", refreshToken: "fresh-refresh")
+        }
+
+        let user = try await client.recoverSession()
+        #expect(user.id == accountID)
+        #expect(requestCount.value == 1) // the expired deadline never suppressed this attempt
+    }
+
+    // MARK: - 6: successful recovery clears rate-limit state
+
+    @Test("6: a successful recovery after a rate-limit window clears the rate-limit state entirely — both in-memory and persisted")
+    func successfulRecoveryClearsRateLimitState() async throws {
+        nonisolated(unsafe) let defaults = freshDefaults()
+        let client = makeClient(defaults: { defaults })
+        let accountID = UUID()
+        nonisolated(unsafe) var isStillRateLimited = true
+        StubURLProtocol.handler = { _ in
+            if isStillRateLimited {
+                return Self.jsonResponse(429, ["error": ["code": "RATE_LIMITED", "message": "slow down"]], headers: ["Retry-After": "0"])
+            }
+            return Self.deviceAuthResponse(id: accountID, accessToken: "recovered-token", refreshToken: "recovered-refresh")
+        }
+
+        _ = try? await client.recoverSession() // establishes a (zero-second, i.e. immediately-expired) rate limit
+        isStillRateLimited = false
+
+        let user = try await client.retrySessionRecovery()
+        #expect(user.id == accountID)
+
+        // Both halves of the rate-limit state are gone — not just the
+        // in-memory flag.
+        #expect(defaults.object(forKey: "com.evenai.session.rateLimitedUntilTimestamp") == nil)
+        #expect(await client.currentSessionState() == .ready(.anonymous))
+    }
+
+    // MARK: - 7: non-429 failures do not incorrectly create a rate-limit cooldown
+
+    @Test("7: a non-429 failure (5xx) never creates a 15-minute rate-limit cooldown — only the short generic one")
+    func nonRateLimitFailureNeverCreatesLongCooldown() async throws {
+        let client = makeClient(recoveryFailureCooldown: .zero)
+        let requestCount = Counter()
+        nonisolated(unsafe) var isBackendDown = true
+        StubURLProtocol.handler = { _ in
+            requestCount.increment()
+            if isBackendDown {
+                return Self.jsonResponse(500, ["error": ["code": "INTERNAL_ERROR", "message": "down"]])
+            }
+            return Self.deviceAuthResponse(accessToken: "recovered", refreshToken: "recovered")
+        }
+
+        await #expect(throws: AuthenticatedAPIClientError.self) { try await client.recoverSession() }
+        #expect(requestCount.value == 1)
+        isBackendDown = false
+
+        // With the generic cooldown set to .zero, a SECOND attempt
+        // immediately afterward must genuinely retry the network — no
+        // 15-minute rate-limit deadline was ever created by a plain 5xx.
+        let user = try await client.recoverSession()
+        #expect(user.email == nil) // resolved normally
+        #expect(requestCount.value == 2)
+    }
+
+    // MARK: - 8: normal valid refresh path never calls /auth/device
+
+    @Test("8: a normal, successful refresh never calls /auth/device at all — not even once")
+    func normalRefreshPathNeverCallsDeviceAuth() async throws {
+        let tokenStore = InMemoryAuthTokenStore()
+        tokenStore.save(refreshToken: "genuinely-valid-refresh")
+        let client = makeClient(tokenStore: tokenStore)
+        let accountID = UUID()
+
+        StubURLProtocol.handler = { request in
+            #expect(request.url?.path.hasSuffix("/auth/device") != true)
+            #expect(request.url?.path.hasSuffix("/auth/refresh") == true)
+            return Self.jsonResponse(200, ["accessToken": "refreshed", "refreshToken": "rotated", "account": Self.accountJSON(id: accountID)])
+        }
+
+        let user = try await client.recoverSession()
+        #expect(user.id == accountID)
     }
 }
 

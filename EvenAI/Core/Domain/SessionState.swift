@@ -34,7 +34,9 @@ enum SessionRecoveryFailureReason: Sendable, Equatable {
     /// The backend is rejecting requests due to rate limiting (429) —
     /// never a credential problem; never self-heals by clearing
     /// anything, since the credential itself may be perfectly fine.
-    case rateLimited
+    /// `retryAfterSeconds` is the backend's own signal — see
+    /// `AuthenticatedAPIClientError.rateLimited`'s own doc comment.
+    case rateLimited(retryAfterSeconds: Int)
     /// A backend/network failure that isn't a credential judgment at all
     /// (5xx, timeout, unreachable, malformed response).
     case backendUnavailable
@@ -46,7 +48,7 @@ enum SessionRecoveryFailureReason: Sendable, Equatable {
     var underlyingDescription: String {
         switch self {
         case .invalidCredential: "invalidCredential"
-        case .rateLimited: "rateLimited"
+        case .rateLimited(let seconds): "rateLimited(retryAfterSeconds=\(seconds))"
         case .backendUnavailable: "backendUnavailable"
         case .offline: "offline"
         case .unknown: "unknown"
