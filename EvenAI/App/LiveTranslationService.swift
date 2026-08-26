@@ -261,6 +261,26 @@ final class LiveTranslationService {
     /// only through `setConversationMode(_:)`. Loaded from `defaults` at
     /// construction, same pattern as `sourceLanguageMode`/`audioSource`.
     private(set) var conversationMode: ConversationMode
+    /// The user's STT provider preference — see `TranscriptionProviderMode`'s
+    /// own doc comment. `private(set)`, changed only through
+    /// `setTranscriptionProviderMode(_:)`. Loaded from `defaults` at
+    /// construction, same pattern as `sourceLanguageMode`/`audioSource`/
+    /// `conversationMode`. Read live by `TranscriptionProviderRouter` (via
+    /// the `mode:` closure `EvenAIApp` wires it up with) every time a
+    /// session starts — this property is the single source of truth the
+    /// router consults, so persisting it here (not duplicating it inside
+    /// the router) keeps exactly one place able to change it.
+    private(set) var transcriptionProviderMode: TranscriptionProviderMode
+    /// Which STT provider actually transcribed the current/most recent
+    /// session — `nil` before the first `start()`. Read by the Live
+    /// Translation UI for the "clear provider labeling" requirement (on-
+    /// device vs. cloud). Set once `start()`'s `transcriber
+    /// .startTranscribing(pcmUpdates:)` call returns successfully, by
+    /// reading `(transcriber as? TranscriptionProviderRouter)?.lastActiveProvider`
+    /// — `nil` for any transcriber that isn't a `TranscriptionProviderRouter`
+    /// (e.g. a test's own fake), which simply means this label is unknown,
+    /// not that anything is wrong.
+    private(set) var lastActiveTranscriptionProvider: ActiveTranscriptionProvider?
     /// Conversation Mode: see `DisplayMode`'s own doc comment.
     /// Listening/translation/history recording are NEVER gated on this —
     /// only the act of actually pushing a new display update to G2 is
@@ -303,16 +323,16 @@ final class LiveTranslationService {
     /// is defaulted — every existing construction call site keeps
     /// compiling unchanged.
     private let replyGenerator: SuggestedReplyGenerating
-    /// Milestone: "Glasses Chat" — persists each finalized, translated turn
-    /// as a real message in the one persistent glasses conversation (see
-    /// `GlassesChatProvider`). Both optional, defaulted to `nil`, so every
-    /// existing construction call site (tests included) keeps compiling
-    /// unchanged, matching `agentContextStore`/`replyGenerator`'s own
-    /// pattern; `EvenAIApp` passes the real instances explicitly. `nil`
-    /// means "don't persist to Chat" — never attempted, never logged as a
-    /// failure, since there's nothing wrong with a caller (e.g. a test)
-    /// that simply isn't exercising this feature.
-    private let chatService: ChatServicing?
+    /// "Glasses Chat" — persists each finalized, translated turn as a real,
+    /// local-first message via `GlassesChatProvider.appendTurn(originalText:translation:)`
+    /// (see that type's own doc comment: SwiftData-backed, no network call,
+    /// never blocked by Railway being offline). Optional, defaulted to
+    /// `nil`, so every existing construction call site (tests included)
+    /// keeps compiling unchanged, matching `agentContextStore`/
+    /// `replyGenerator`'s own pattern; `EvenAIApp` passes the real instance
+    /// explicitly. `nil` means "don't persist to Chat" — never attempted,
+    /// never logged as a failure, since there's nothing wrong with a
+    /// caller (e.g. a test) that simply isn't exercising this feature.
     private let glassesChatProvider: GlassesChatProvider?
 
     private var consumeTask: Task<Void, Never>?
@@ -491,6 +511,7 @@ final class LiveTranslationService {
     private static let sourceLanguageModeDefaultsKey = "com.evenai.liveTranslation.sourceLanguageMode"
     private static let audioSourceDefaultsKey = "com.evenai.liveTranslation.audioSource"
     private static let conversationModeDefaultsKey = "com.evenai.liveTranslation.conversationMode"
+    private static let transcriptionProviderModeDefaultsKey = "com.evenai.liveTranslation.transcriptionProviderMode"
 
     init(
         glassesTransport: GlassesTransport,
@@ -499,7 +520,6 @@ final class LiveTranslationService {
         agentContextStore: AgentContextStore = AgentContextStore(),
         replyGenerator: SuggestedReplyGenerating = NoOpSuggestedReplyGenerator(),
         translationTimeout: Duration = .seconds(8),
-        chatService: ChatServicing? = nil,
         glassesChatProvider: GlassesChatProvider? = nil,
         duplicateSuppressionWindow: TimeInterval = 2,
         defaults: UserDefaults = .standard,
@@ -511,7 +531,6 @@ final class LiveTranslationService {
         self.agentContextStore = agentContextStore
         self.replyGenerator = replyGenerator
         self.translationTimeout = translationTimeout
-        self.chatService = chatService
         self.glassesChatProvider = glassesChatProvider
         self.duplicateSuppressionWindow = duplicateSuppressionWindow
         self.defaults = defaults
@@ -533,6 +552,12 @@ final class LiveTranslationService {
             self.conversationMode = savedMode
         } else {
             self.conversationMode = .standard
+        }
+        if let saved = defaults.string(forKey: Self.transcriptionProviderModeDefaultsKey),
+           let savedMode = TranscriptionProviderMode(rawValue: saved) {
+            self.transcriptionProviderMode = savedMode
+        } else {
+            self.transcriptionProviderMode = .auto
         }
         observeConnection()
     }
@@ -588,6 +613,34 @@ final class LiveTranslationService {
         // configuration never being told about this change at all (see
         // `RootView.syncTranslationConfiguration()`).
         DiagnosticTrace.log("LANGUAGE_MODE_SERVICE_UPDATED", "mode=\(mode.rawValue)")
+        // Same "must propagate immediately, no restart required" fix as
+        // the real `TranslationSession`'s own reconfiguration
+        // (`RootView.syncTranslationConfiguration()`) — if `transcriber`
+        // is a `TranscriptionProviderRouter`, an already-listening
+        // on-device session's `SFSpeechRecognizer` locale switches right
+        // now, not on the next `start()`. A no-op for any other
+        // `ContinuousTranscribing` (cloud-only sessions have no per-call
+        // locale to reconfigure; a test's own fake simply doesn't
+        // implement this).
+        (transcriber as? TranscriptionProviderRouter)?.applyCurrentLocale()
+    }
+
+    /// The one way `transcriptionProviderMode` ever changes — persists
+    /// immediately (survives app relaunch). Takes effect on the NEXT
+    /// `start()` — switching provider mid-session isn't attempted (unlike
+    /// `sourceLanguageMode`'s live locale switch above): tearing down a
+    /// live cloud WebSocket or on-device recognizer and rebuilding the
+    /// other provider mid-utterance would risk losing in-flight audio, and
+    /// a user changing this setting is a deliberate, infrequent choice —
+    /// not something that needs to interrupt an active conversation to
+    /// honor immediately. See `TranscriptionProviderMode`'s own doc
+    /// comment for what each case means and `TranscriptionProviderRouter`
+    /// for how `EvenAIApp` wires this property's live value in.
+    func setTranscriptionProviderMode(_ mode: TranscriptionProviderMode) {
+        guard mode != transcriptionProviderMode else { return }
+        transcriptionProviderMode = mode
+        defaults.set(mode.rawValue, forKey: Self.transcriptionProviderModeDefaultsKey)
+        DiagnosticTrace.log("STT_PROVIDER_MODE_SELECTED", "mode=\(mode.rawValue)")
     }
 
     /// THE single authoritative resolved source language for the current
@@ -683,7 +736,11 @@ final class LiveTranslationService {
             let pcmUpdates = await glassesTransport.microphonePCMUpdates()
             let updates = try await transcriber.startTranscribing(pcmUpdates: instrumentedPCMStream(pcmUpdates))
             state = .listening
-            DiagnosticTrace.log("LIVE_START_SESSION_STARTED", "audioSource=\(audioSource.rawValue)")
+            lastActiveTranscriptionProvider = (transcriber as? TranscriptionProviderRouter)?.lastActiveProvider
+            DiagnosticTrace.log(
+                "LIVE_START_SESSION_STARTED",
+                "audioSource=\(audioSource.rawValue) sttProvider=\(lastActiveTranscriptionProvider?.rawValue ?? "unknown")"
+            )
             consumeTask = Task { [weak self] in
                 await self?.consume(updates)
             }
@@ -1676,25 +1733,23 @@ final class LiveTranslationService {
         translatedTurn.ukrainianTranslation = displayText
         agentContextStore.updateTurn(translatedTurn)
 
-        // "Glasses Chat" — persists this turn as a real Chat message,
-        // entirely independent of G2 display: never awaited by this
-        // pipeline, never allowed to delay or fail the display below, and
-        // deliberately NOT tracked in `turnTasks` (so it isn't cancelled
-        // by `stop()` either) — an already-translated turn should still
-        // make it into history even if the user stops Live Translation a
-        // moment later. `chatService`/`glassesChatProvider` being `nil`
-        // (no production wiring, e.g. in a test) means this is simply
-        // never attempted — not a failure.
-        if let chatService, let glassesChatProvider {
+        // "Glasses Chat" — persists this turn as a real, LOCAL-FIRST Chat
+        // message (see `GlassesChatProvider.appendTurn(originalText:translation:)`
+        // — SwiftData-backed, no network call, never blocked by Railway
+        // being offline), entirely independent of G2 display: never
+        // awaited by this pipeline, never allowed to delay or fail the
+        // display below, and deliberately NOT tracked in `turnTasks` (so
+        // it isn't cancelled by `stop()` either) — an already-translated
+        // turn should still make it into history even if the user stops
+        // Live Translation a moment later. `glassesChatProvider` being
+        // `nil` (no production wiring, e.g. in a test) means this is
+        // simply never attempted — not a failure.
+        if let glassesChatProvider {
             Task {
                 do {
                     DiagnosticTrace.log("GLASSES_CHAT_TRACE", "APPEND_START turnID=\(turnID)")
                     let chat = try await glassesChatProvider.findOrCreateGlassesChat()
-                    _ = try await chatService.appendMessage(
-                        chatID: chat.id,
-                        role: .user,
-                        content: "\(text)\n→ \(displayText)"
-                    )
+                    _ = try await glassesChatProvider.appendTurn(originalText: text, translation: displayText)
                     DiagnosticTrace.log("GLASSES_CHAT_TRACE", "APPEND_DONE turnID=\(turnID) chatID=\(chat.id)")
                 } catch {
                     DiagnosticTrace.log("GLASSES_CHAT_TRACE", "APPEND_FAILED turnID=\(turnID) error=\(error)")

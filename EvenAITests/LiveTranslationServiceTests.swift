@@ -1,6 +1,18 @@
 import Testing
 import Foundation
+import SwiftData
 @testable import EvenAI
+
+/// A brand-new, isolated in-memory SwiftData container — backs
+/// `LocalGlassesChatStore` in every test below that exercises the
+/// (local-first, no-network) Glasses Chat append path, so tests never
+/// share persisted state with each other or the real app.
+private func freshGlassesChatStore() -> LocalGlassesChatStore {
+    let schema = Schema([ChatEntity.self, MessageEntity.self])
+    let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+    let container = try! ModelContainer(for: schema, configurations: [configuration])
+    return LocalGlassesChatStore(modelContainer: container)
+}
 
 /// Ambient G2-mic translation — the only Voice feature ("Dictate to Chat"
 /// was removed) — app-level, not owned by any screen (see
@@ -378,23 +390,23 @@ struct LiveTranslationServiceTests {
 
     // MARK: - "Glasses Chat" persistence
 
-    @Test("a finalized turn is appended to the Glasses Chat as a real, persisted message")
+    @Test("a finalized turn is appended to the Glasses Chat as a real, LOCALLY persisted message — no network/ChatServicing involved")
     func turnIsAppendedToGlassesChat() async throws {
         let spy = SpyGlassesTransport()
-        let chatService = RecordingAppendChatService()
-        let provider = GlassesChatProvider(chatService: chatService, defaults: UserDefaults(suiteName: "test.\(UUID().uuidString)")!)
+        let store = freshGlassesChatStore()
+        let provider = GlassesChatProvider(localStore: store, defaults: UserDefaults(suiteName: "test.\(UUID().uuidString)")!)
         let service = LiveTranslationService(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт"),
-            chatService: chatService,
             glassesChatProvider: provider
         )
 
         await service.start()
         try? await Task.sleep(for: .milliseconds(60))
 
-        let appended = await chatService.appendedMessages
+        let chat = try await provider.findOrCreateGlassesChat()
+        let appended = await store.fetchMessages(chatID: chat.id)
         #expect(appended.count == 1)
         #expect(appended.first?.role == .user)
         #expect(appended.first?.content.contains("hello there") == true)
@@ -464,11 +476,11 @@ struct LiveTranslationServiceTests {
     /// history — chat history is a log, not a "latest wins" display — in
     /// the order they actually reach the backend, without either call
     /// corrupting or dropping the other.
-    @Test("phrase A's slow Glasses Chat append and phrase B's append never interfere with each other")
+    @Test("phrase A's Glasses Chat append and phrase B's append never interfere with each other")
     func concurrentGlassesChatAppendsDoNotInterfere() async throws {
         let spy = SpyGlassesTransport()
-        let chatService = RecordingAppendChatService(artificialDelay: .milliseconds(40))
-        let provider = GlassesChatProvider(chatService: chatService, defaults: UserDefaults(suiteName: "test.\(UUID().uuidString)")!)
+        let store = freshGlassesChatStore()
+        let provider = GlassesChatProvider(localStore: store, defaults: UserDefaults(suiteName: "test.\(UUID().uuidString)")!)
         let service = LiveTranslationService(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["phrase A", "phrase B"]),
@@ -476,14 +488,14 @@ struct LiveTranslationServiceTests {
                 languageCodes: ["phrase A": "en", "phrase B": "en"],
                 translation: "переклад"
             ),
-            chatService: chatService,
             glassesChatProvider: provider
         )
 
         await service.start()
         try? await Task.sleep(for: .milliseconds(200))
 
-        let appended = await chatService.appendedMessages
+        let chat = try await provider.findOrCreateGlassesChat()
+        let appended = await store.fetchMessages(chatID: chat.id)
         #expect(appended.count == 2)
         #expect(appended.contains { $0.content.contains("phrase A") })
         #expect(appended.contains { $0.content.contains("phrase B") })
@@ -1072,8 +1084,8 @@ struct LiveTranslationServiceTests {
     /// does, exactly once.
     @Test("partials are never persisted to Glasses Chat — only the final turn is, exactly once")
     func partialsNeverReachGlassesChat() async throws {
-        let chatService = RecordingAppendChatService()
-        let provider = GlassesChatProvider(chatService: chatService, defaults: UserDefaults(suiteName: "test.\(UUID().uuidString)")!)
+        let store = freshGlassesChatStore()
+        let provider = GlassesChatProvider(localStore: store, defaults: UserDefaults(suiteName: "test.\(UUID().uuidString)")!)
         let transcriber = ManualContinuousTranscriber()
         let service = LiveTranslationService(
             glassesTransport: SpyGlassesTransport(),
@@ -1082,7 +1094,6 @@ struct LiveTranslationServiceTests {
                 languageCodes: ["Where are": "en", "Where are you going": "en"],
                 translation: "Куди ви йдете?"
             ),
-            chatService: chatService,
             glassesChatProvider: provider,
             defaults: freshDefaults()
         )
@@ -1091,12 +1102,13 @@ struct LiveTranslationServiceTests {
         await service.start()
         await transcriber.emitPartial("Where are")
         try? await Task.sleep(for: .milliseconds(250))
-        #expect(await chatService.appendedMessages.isEmpty) // partial alone: nothing persisted yet
+        let chat = try await provider.findOrCreateGlassesChat()
+        #expect(await store.fetchMessages(chatID: chat.id).isEmpty) // partial alone: nothing persisted yet
 
         await transcriber.emit("Where are you going")
         try? await Task.sleep(for: .milliseconds(100))
 
-        let appended = await chatService.appendedMessages
+        let appended = await store.fetchMessages(chatID: chat.id)
         #expect(appended.count == 1)
         #expect(appended.first?.content.contains("Where are you going") == true)
     }
@@ -1980,44 +1992,3 @@ struct LiveTranslationServiceTests {
     }
 }
 
-/// Records every `appendMessage` call — used to verify "Glasses Chat"
-/// integration without a real backend. `createChat`/`fetchChat` behave
-/// like a normal, empty, always-succeeding backend so `GlassesChatProvider`
-/// resolves a chat the first time it's asked.
-private actor RecordingAppendChatService: ChatServicing {
-    private(set) var appendedMessages: [Message] = []
-    private var chatsByID: [Chat.ID: Chat] = [:]
-    private let artificialDelay: Duration
-
-    init(artificialDelay: Duration = .zero) {
-        self.artificialDelay = artificialDelay
-    }
-
-    func fetchChats() async throws -> [Chat] { Array(chatsByID.values) }
-
-    func fetchChat(id: Chat.ID) async throws -> Chat {
-        guard let chat = chatsByID[id] else { throw FailingChatService.Failure() }
-        return chat
-    }
-
-    func createChat(title: String) async throws -> Chat {
-        let chat = Chat(title: title)
-        chatsByID[chat.id] = chat
-        return chat
-    }
-
-    func renameChat(id: Chat.ID, title: String) async throws -> Chat { Chat(id: id, title: title) }
-    func deleteChat(id: Chat.ID) async throws { chatsByID[id] = nil }
-    func fetchMessages(chatID: Chat.ID) async throws -> [Message] { [] }
-
-    func appendMessage(chatID: Chat.ID, role: MessageRole, content: String) async throws -> Message {
-        if artificialDelay > .zero { try? await Task.sleep(for: artificialDelay) }
-        let message = Message(chatID: chatID, role: role, content: content)
-        appendedMessages.append(message)
-        return message
-    }
-
-    nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
-        AsyncThrowingStream { $0.finish() }
-    }
-}

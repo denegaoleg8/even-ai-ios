@@ -27,6 +27,8 @@ struct LiveTranslationView: View {
             sourceLanguagePicker
             audioSourcePicker
             conversationModePicker
+            transcriptionProviderPicker
+            activeProviderLabel
 
             if !liveTranslation.followLive {
                 returnToLiveIndicator
@@ -166,6 +168,52 @@ struct LiveTranslationView: View {
                 .accessibilityIdentifier("liveTranslation.conversationMode.\(mode.rawValue)")
                 .accessibilityAddTraits(isSelected ? [.isSelected] : [])
             }
+        }
+    }
+
+    /// Transcription provider selector — "Auto | On-device | Cloud", per
+    /// the local-first architecture pass's §7/§16 requirements: a simple,
+    /// always-visible setting (no modal sheet, matching the other three
+    /// pickers on this screen) and clear provider labeling. `.onDevice`
+    /// NEVER silently falls back to cloud (see `TranscriptionProviderRouter`'s
+    /// own doc comment) — selecting it is a hard privacy commitment, not
+    /// just a preference.
+    private var transcriptionProviderPicker: some View {
+        HStack(spacing: AppMetrics.Spacing.sm) {
+            ForEach(TranscriptionProviderMode.allCases, id: \.self) { mode in
+                let isSelected = liveTranslation.transcriptionProviderMode == mode
+                Button {
+                    liveTranslation.setTranscriptionProviderMode(mode)
+                } label: {
+                    Text(mode.displayLabel)
+                        .font(AppTypography.chatPreview.weight(isSelected ? .semibold : .regular))
+                        .padding(.horizontal, AppMetrics.Spacing.sm)
+                        .padding(.vertical, AppMetrics.Spacing.xs)
+                        .background(isSelected ? AppColor.accent : AppColor.secondaryBackground)
+                        .foregroundStyle(isSelected ? Color.white : AppColor.textPrimary)
+                        .clipShape(RoundedRectangle(cornerRadius: AppMetrics.Radius.medium))
+                }
+                .accessibilityIdentifier("liveTranslation.transcriptionProvider.\(mode.rawValue)")
+                .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+            }
+        }
+    }
+
+    /// "Clear provider labeling" (§16): which STT provider actually
+    /// transcribed the current/most recent session — on-device audio never
+    /// leaves the phone; cloud audio is sent to this app's backend/OpenAI.
+    /// Shown only once known (after a session has actually started at
+    /// least once) — before that, there's nothing truthful to label yet.
+    @ViewBuilder
+    private var activeProviderLabel: some View {
+        if let provider = liveTranslation.lastActiveTranscriptionProvider {
+            let text = provider == .onDevice
+                ? "On-device — audio never leaves this phone"
+                : "Cloud — audio is sent to the backend"
+            Text(text)
+                .font(.caption)
+                .foregroundStyle(AppColor.textSecondary)
+                .accessibilityIdentifier("liveTranslation.activeProviderLabel")
         }
     }
 

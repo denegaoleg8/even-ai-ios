@@ -66,3 +66,17 @@ extension ContinuousTranscribing {
         get async { 0 }
     }
 }
+
+/// A `ContinuousTranscribing` implementation that recognizes ONE
+/// configurable on-device locale at a time — `GlassesSpeechTranscriber` is
+/// the real implementation. Factored out as its own protocol (rather than
+/// `TranscriptionProviderRouter` depending on the concrete class directly)
+/// so tests can substitute a fake that doesn't touch the real `Speech`
+/// framework/audio session (which needs a real, authorized device/
+/// simulator environment `xcodebuild test` can't always guarantee) while
+/// still exercising the router's actual provider-selection logic.
+@MainActor
+protocol OnDeviceTranscribing: ContinuousTranscribing {
+    var locale: Locale { get }
+    func setLocale(_ locale: Locale)
+}

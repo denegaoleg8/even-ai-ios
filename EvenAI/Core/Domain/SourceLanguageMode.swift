@@ -36,4 +36,24 @@ enum SourceLanguageMode: String, CaseIterable, Codable, Sendable {
         case .pl: "pl"
         }
     }
+
+    /// The exact `Locale` identifier `GlassesSpeechTranscriber` constructs
+    /// its on-device `SFSpeechRecognizer` with for this mode — the
+    /// local-first architecture pass's answer to "which locale for EN/DE/
+    /// PL": `en-US` (not a bare `en`, which `SFSpeechRecognizer` doesn't
+    /// accept as a region-less identifier), `de-DE`, `pl-PL`. `.auto` has
+    /// no fixed locale of its own here either — `GlassesSpeechTranscriber`
+    /// falls back to `Locale.autoupdatingCurrent`'s language if it's one of
+    /// the three primary source languages, else `en-US` — see that type's
+    /// own doc comment for why true on-device multi-language auto-*switching*
+    /// mid-conversation isn't attempted (a real `SFSpeechRecognizer`
+    /// platform limitation, not an oversight).
+    var onDeviceLocaleIdentifier: String? {
+        switch self {
+        case .auto: nil
+        case .en: "en-US"
+        case .de: "de-DE"
+        case .pl: "pl-PL"
+        }
+    }
 }

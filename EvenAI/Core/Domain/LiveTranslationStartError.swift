@@ -47,6 +47,20 @@ enum LiveTranslationStartError: Error, Equatable {
     /// reason other than authentication (a non-101 upgrade response, or
     /// the underlying socket erroring before ever exchanging a message).
     case sttHandshakeFailed(underlying: String)
+    /// Local-first architecture pass: On-device mode (`TranscriptionProviderMode
+    /// .onDevice`) was selected, but `SFSpeechRecognizer` for the
+    /// resolved locale isn't usable right now (`GlassesSpeechTranscriber
+    /// .VoiceInputError.recognizerUnavailable` — the locale's on-device
+    /// speech model isn't installed/supported on this device, or Speech
+    /// Recognition permission hasn't been granted). Distinct from
+    /// `.unknown`: this is an actionable, honest "clear one-time
+    /// setup/download state" per the product's offline-first requirement
+    /// — Apple manages on-device language model downloads at the OS
+    /// level (Settings → General → Keyboard/Dictation), not something
+    /// this app can trigger or show progress for directly, so the message
+    /// points there rather than claiming a download this app doesn't
+    /// control.
+    case onDeviceSpeechUnavailable(underlying: String)
     /// Anything that doesn't cleanly classify as one of the above —
     /// still surfaced honestly as "unknown," never silently folded into
     /// the G2 message.
@@ -68,6 +82,8 @@ enum LiveTranslationStartError: Error, Equatable {
             "Couldn't start Live Translation. Check your internet connection and try again."
         case .sttHandshakeFailed:
             "Couldn't start Live Translation. The translation service is temporarily unavailable — try again."
+        case .onDeviceSpeechUnavailable:
+            "On-device speech recognition isn't available for this language on this device. Check Settings → General → Keyboard → Dictation Languages, or switch Transcription to Auto/Cloud in Live Translation settings."
         case .unknown:
             "Couldn't start Live Translation. Try again."
         }
@@ -84,6 +100,7 @@ enum LiveTranslationStartError: Error, Equatable {
         case .rateLimited: "rateLimited"
         case .backendUnavailable: "backendUnavailable"
         case .sttHandshakeFailed: "sttHandshakeFailed"
+        case .onDeviceSpeechUnavailable: "onDeviceSpeechUnavailable"
         case .unknown: "unknown"
         }
     }
@@ -95,6 +112,9 @@ enum LiveTranslationStartError: Error, Equatable {
     /// .start()`, which knows which `AudioSource` was active; this
     /// function only sees the transcriber/network layer.
     static func classifyTranscriberStartFailure(_ error: Error) -> LiveTranslationStartError {
+        if error is VoiceInputError {
+            return .onDeviceSpeechUnavailable(underlying: "\(error)")
+        }
         if let apiError = error as? AuthenticatedAPIClientError {
             switch apiError {
             case .offline:

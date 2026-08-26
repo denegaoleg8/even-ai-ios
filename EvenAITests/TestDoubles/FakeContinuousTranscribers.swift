@@ -136,3 +136,62 @@ actor HandshakeFailingContinuousTranscriber: ContinuousTranscribing {
 
     func stopTranscribing() async {}
 }
+
+/// `OnDeviceTranscribing` fake — used by `TranscriptionProviderRouterTests`
+/// to exercise `TranscriptionProviderRouter`'s provider-selection logic
+/// without touching the real `Speech` framework/audio session (which
+/// `GlassesSpeechTranscriber` needs a genuinely authorized device/simulator
+/// for — not guaranteed in every `xcodebuild test` environment). `@MainActor`,
+/// mirroring `GlassesSpeechTranscriber`'s own isolation — `OnDeviceTranscribing
+/// .locale`/`.setLocale(_:)` are synchronous protocol requirements, which
+/// only same-actor (not cross-actor) access can satisfy without `await`.
+/// `startError` decides whether `startTranscribing` succeeds (yielding
+/// `finals`) or throws synchronously — models both "on-device recognition
+/// unavailable for this locale" (throws) and "on-device recognition
+/// worked" (succeeds) without any real recognizer.
+@MainActor
+final class FakeOnDeviceTranscriber: OnDeviceTranscribing, @unchecked Sendable {
+    private(set) var locale: Locale
+    private(set) var setLocaleCallCount = 0
+    private(set) var startCallCount = 0
+    private(set) var stopCallCount = 0
+    private let finals: [String]
+    private let startError: Error?
+
+    init(locale: Locale = Locale(identifier: "en-US"), finals: [String] = [], startError: Error? = nil) {
+        self.locale = locale
+        self.finals = finals
+        self.startError = startError
+    }
+
+    func setLocale(_ newLocale: Locale) {
+        locale = newLocale
+        setLocaleCallCount += 1
+    }
+
+    func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<TranscriptionUpdate, Error> {
+        startCallCount += 1
+        if let startError { throw startError }
+        let finals = self.finals
+        return AsyncThrowingStream { continuation in
+            for final in finals { continuation.yield(.final(final)) }
+        }
+    }
+
+    func stopTranscribing() async {
+        stopCallCount += 1
+    }
+}
+
+/// A `ContinuousTranscribing` that fails the test outright if ever called
+/// — used to prove `.onDevice` mode never touches `cloud` at all, and
+/// `.auto` mode never touches `cloud` when `local` succeeds.
+actor NeverCalledTranscriber: ContinuousTranscribing {
+    struct UnexpectedlyCalled: Error {}
+
+    func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<TranscriptionUpdate, Error> {
+        throw UnexpectedlyCalled()
+    }
+
+    func stopTranscribing() async {}
+}

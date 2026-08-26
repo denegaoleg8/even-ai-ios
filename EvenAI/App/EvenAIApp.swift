@@ -36,51 +36,89 @@ struct EvenAIApp: App {
     init() {
         let translator = AppleLanguageTranslator()
         let agentContextStore = AgentContextStore()
-        let glassesChatProvider = GlassesChatProvider(chatService: AppContainer.live.chatService)
+        // Local-first architecture pass: Glasses Chat no longer depends on
+        // `ChatServicing`/Railway at all — see `GlassesChatProvider`'s and
+        // `LocalGlassesChatStore`'s own doc comments.
+        let glassesChatProvider = GlassesChatProvider(localStore: LocalGlassesChatStore())
         _languageTranslator = State(initialValue: translator)
         _agentContextStore = State(initialValue: agentContextStore)
         _glassesChatProvider = State(initialValue: glassesChatProvider)
         _liveTranslation = State(
             initialValue: LiveTranslationService(
                 glassesTransport: AppContainer.live.glassesTransport,
-                // Milestone 8b: switched from GlassesSpeechTranscriber
-                // (Apple Speech, single hardcoded en-US locale) to the
-                // Milestone 8a-audited OpenAIRealtimeTranscriber —
-                // multilingual (English/German/Polish/Ukrainian)
-                // recognition is configured entirely server-side (see
-                // even-ai-assistant-asr's src/realtimeTranscription/
-                // openaiClient.js SUPPORTED_LANGUAGES); nothing here or
-                // in LiveTranslationService needed to change beyond this
-                // one line, since both conform to the same
-                // ContinuousTranscribing protocol. GlassesSpeechTranscriber
-                // itself is untouched and still fully available as an
-                // immediate rollback — see its own file.
-                transcriber: {
-                    // TEMPORARY diagnostic for the Milestone 8b physical-
-                    // device failure — confirms the running binary really
-                    // did construct OpenAIRealtimeTranscriber (not a stale
-                    // build still using GlassesSpeechTranscriber). Remove
-                    // once root-caused.
-                    DiagnosticTrace.log("8B_TRACE", "EvenAIApp constructing OpenAIRealtimeTranscriber as production transcriber")
-                    return OpenAIRealtimeTranscriber(apiClient: AppContainer.live.apiClient)
-                }(),
+                // Local-first architecture pass: Milestone 8b hardcoded
+                // OpenAIRealtimeTranscriber as THE production transcriber
+                // (abandoning GlassesSpeechTranscriber specifically
+                // because it only supported en-US) — meaning Live
+                // Translation could not even START without Railway/auth
+                // succeeding first. `TranscriptionProviderRouter` restores
+                // on-device as the DEFAULT, preferred path
+                // (`GlassesSpeechTranscriber` now supports EN/DE/PL — see
+                // `SourceLanguageMode.onDeviceLocaleIdentifier` — so the
+                // reason it was abandoned no longer applies), with
+                // `OpenAIRealtimeTranscriber` retained unchanged as the
+                // opt-in `.cloud` choice / `.auto` mode's fallback. See
+                // `TranscriptionProviderRouter`'s own doc comment for the
+                // exact selection contract.
+                transcriber: TranscriptionProviderRouter(
+                    local: GlassesSpeechTranscriber(),
+                    cloud: OpenAIRealtimeTranscriber(apiClient: AppContainer.live.apiClient),
+                    mode: { Self.resolveTranscriptionProviderMode(defaults: .standard) },
+                    resolveLocale: { Self.resolveOnDeviceLocale(sourceLanguageModeDefaults: .standard) }
+                ),
                 translator: translator,
                 agentContextStore: agentContextStore,
                 // Milestone 7: real, backend-calling generator — shares
                 // `AppContainer.live.apiClient` with Chat/Auth, same
                 // "one client, one session" rule those already follow.
+                // Optional-online-enhancement layer only (§8 of the
+                // local-first architecture pass): its failures never
+                // reach here — `LiveTranslationService.generateSuggestedReplies`
+                // catches everything and simply skips display.
                 replyGenerator: NetworkSuggestedReplyGenerator(apiClient: AppContainer.live.apiClient),
-                // "Glasses Chat": persists each finalized turn as a real
-                // message in the one persistent glasses conversation.
-                // Shares `AppContainer.live.chatService` — the same
-                // instance Chat itself reads/writes through (below), so a
-                // Live Translation turn and a normal Chat send go through
-                // the exact same caching/auth/network path, never two
-                // independent ones.
-                chatService: AppContainer.live.chatService,
                 glassesChatProvider: glassesChatProvider
             )
         )
+    }
+
+    /// Reads the SAME persisted `sourceLanguageMode` UserDefaults key
+    /// `LiveTranslationService` itself owns (`com.evenai.liveTranslation.sourceLanguageMode`)
+    /// directly, rather than threading a `LiveTranslationService`
+    /// reference into `TranscriptionProviderRouter` — avoids a circular
+    /// construction dependency (the router has to exist before
+    /// `LiveTranslationService` does, since it's one of that type's own
+    /// init parameters). `.auto`'s on-device locale defaults to the
+    /// device's own current region if it's one of the three primary
+    /// source languages, else `en-US` — see `SourceLanguageMode
+    /// .onDeviceLocaleIdentifier`'s own doc comment for why true
+    /// mid-conversation on-device language auto-switching isn't attempted.
+    private static func resolveOnDeviceLocale(sourceLanguageModeDefaults defaults: UserDefaults) -> Locale {
+        let key = "com.evenai.liveTranslation.sourceLanguageMode"
+        if let saved = defaults.string(forKey: key),
+           let mode = SourceLanguageMode(rawValue: saved),
+           let identifier = mode.onDeviceLocaleIdentifier {
+            return Locale(identifier: identifier)
+        }
+        let deviceLanguage = Locale.autoupdatingCurrent.language.languageCode?.identifier ?? "en"
+        switch deviceLanguage {
+        case "de": return Locale(identifier: "de-DE")
+        case "pl": return Locale(identifier: "pl-PL")
+        default: return Locale(identifier: "en-US")
+        }
+    }
+
+    /// Reads the SAME persisted `transcriptionProviderMode` key
+    /// `LiveTranslationService` owns, for the same circular-dependency
+    /// reason as `resolveOnDeviceLocale(sourceLanguageModeDefaults:)`
+    /// above. `static` (not an instance method) deliberately — this
+    /// closure is captured inside `init()`, before `self` is fully
+    /// initialized, so it must not reference `self` at all.
+    private static func resolveTranscriptionProviderMode(defaults: UserDefaults) -> TranscriptionProviderMode {
+        let key = "com.evenai.liveTranslation.transcriptionProviderMode"
+        guard let saved = defaults.string(forKey: key),
+              let mode = TranscriptionProviderMode(rawValue: saved)
+        else { return .auto }
+        return mode
     }
 
     var body: some Scene {

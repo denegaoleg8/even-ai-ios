@@ -261,7 +261,7 @@ struct ChatListView: View {
         ChatListView(chatService: mockChatService)
             .environment(AppState())
             .environment(AuthState())
-            .environment(GlassesChatProvider(chatService: mockChatService))
+            .environment(GlassesChatProvider(localStore: LocalGlassesChatStore(modelContainer: PersistenceController.preview)))
     } detail: {
         Text("Detail")
     }

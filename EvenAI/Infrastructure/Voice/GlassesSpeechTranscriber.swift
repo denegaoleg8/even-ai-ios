@@ -3,24 +3,33 @@ import Foundation
 import Speech
 
 /// `ContinuousTranscribing` implementation using only Apple's `Speech`
-/// framework — no third-party dependency. Consumes raw PCM `Data` (16kHz,
-/// 16-bit, mono, signed little-endian — G2's own microphone format, see
-/// `MicPcmEvent`) by manually constructing `AVAudioPCMBuffer`s, since this
-/// audio never touches `AVAudioEngine`'s own input node — there is no
-/// phone microphone involved anywhere in this feature; G2's own
-/// microphone, relayed over BLE, is the only audio source.
+/// framework — no third-party dependency, no network call of any kind (see
+/// `startTranscribing`). Consumes raw PCM `Data` (16kHz, 16-bit, mono,
+/// signed little-endian — G2's own microphone format, see `MicPcmEvent`) by
+/// manually constructing `AVAudioPCMBuffer`s, since this audio never
+/// touches `AVAudioEngine`'s own input node — there is no phone microphone
+/// involved anywhere in this feature; G2's own microphone, relayed over
+/// BLE, is the only audio source.
 ///
-/// Single `en-US` recognizer, deliberately — a parallel dual-recognizer
+/// Single recognizer at a time, deliberately — a parallel dual-recognizer
 /// (`en-US` + `uk-UA`) experiment was tried and reverted: physical-device
 /// tracing showed both `recognitionTask`s immediately erroring with
 /// `kAFAssistantErrorDomain Code=1110 "No speech detected"` before either
 /// ever received a first PCM append, then repeatedly recreating in an
 /// uncontrolled restart loop — i.e. running two concurrent `SFSpeechRecognizer`
 /// sessions against the same buffer feed did not work on the tested device,
-/// for reasons not yet root-caused (see the reverted commit's diagnostic
-/// history, not this file, for the `ML_TRACE` evidence). Multilingual
-/// support is a known gap for a future milestone, not solved here — see
-/// `LiveTranslationService`'s doc comment for the current scope.
+/// for reasons not yet root-caused. That's why this type still can't
+/// truly *auto-detect and switch between* EN/DE/PL mid-conversation
+/// on-device — but as of the local-first architecture pass, it no longer
+/// needs to: `locale` (settable via `setLocale(_:)`) selects WHICH single
+/// locale the one active recognizer uses, driven by
+/// `SourceLanguageMode.onDeviceLocaleIdentifier` — explicit EN/DE/PL each
+/// get their own correctly-localized recognizer; `.auto` picks one locale
+/// per session (the device's own region if it's en/de/pl, else `en-US`)
+/// and stays on it, rather than running detection across recognizers. Real
+/// multi-language auto-switching within one session remains cloud-only
+/// (`OpenAIRealtimeTranscriber`) — an honest platform limitation, not
+/// papered over; see `TranscriptionProviderRouter`'s doc comment.
 ///
 /// `@MainActor` + `@unchecked Sendable`: all mutable state is confined to
 /// the main actor by this class-wide isolation, never accessed
@@ -46,8 +55,15 @@ import Speech
 /// starting Live Translation does interrupt other apps' audio playback,
 /// which is an accepted, known trade-off, not an oversight.
 @MainActor
-final class GlassesSpeechTranscriber: ContinuousTranscribing, @unchecked Sendable {
-    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+final class GlassesSpeechTranscriber: OnDeviceTranscribing, @unchecked Sendable {
+    /// The on-device recognizer locale a NEW session (or a mid-session
+    /// restart via `setLocale(_:)`) uses — never `nil` after `init`.
+    /// `SFSpeechRecognizer` instances are cheap, locale-scoped value
+    /// objects (Apple's own guidance), so a fresh one is constructed per
+    /// locale rather than cached indefinitely; this app only ever needs
+    /// one of three-plus-default locales in practice.
+    private(set) var locale: Locale
+    private var recognizer: SFSpeechRecognizer?
     private let audioFormat = AVAudioFormat(
         commonFormat: .pcmFormatInt16,
         sampleRate: Double(micPcmSampleRate),
@@ -88,7 +104,15 @@ final class GlassesSpeechTranscriber: ContinuousTranscribing, @unchecked Sendabl
     /// few buffers are simply dropped.
     private var isFinalizingUtterance = false
 
-    nonisolated init() {}
+    /// `locale` defaults to `en-US` — the same default production always
+    /// used before this type became locale-configurable. Real callers
+    /// (`TranscriptionProviderRouter`) always pass a resolved locale
+    /// explicitly (see `SourceLanguageMode.onDeviceLocaleIdentifier` /
+    /// `TranscriptionProviderRouter.resolvedLocale(for:)`); this default
+    /// only matters for direct construction (previews, tests).
+    nonisolated init(locale: Locale = Locale(identifier: "en-US")) {
+        self.locale = locale
+    }
 
     // `task: SFSpeechRecognitionTask?` isn't `Sendable`, so it can't be
     // touched from `deinit` (nonisolated even on a `@MainActor` class) —
@@ -102,12 +126,39 @@ final class GlassesSpeechTranscriber: ContinuousTranscribing, @unchecked Sendabl
         pcmConsumerTask?.cancel()
     }
 
+    /// Changes which locale the on-device recognizer uses — called by
+    /// `LiveTranslationService.setSourceLanguageMode(_:)` (via
+    /// `TranscriptionProviderRouter`) so an explicit EN/DE/PL switch takes
+    /// effect immediately, mirroring how `AppleLanguageTranslator`'s real
+    /// `TranslationSession` is already reconfigured live on the same
+    /// event. A no-op if `newLocale` already matches. If a session is
+    /// currently active, seamlessly restarts recognition with the new
+    /// locale using the exact same "begin a fresh session mid-stream"
+    /// mechanism `beginNewSession(recognizer:)` already uses for
+    /// duration-limit rollovers — G2's mic is never toggled, only the
+    /// recognizer underneath it changes.
+    func setLocale(_ newLocale: Locale) {
+        guard newLocale.identifier != locale.identifier else { return }
+        locale = newLocale
+        recognizer = nil
+        guard isActive, let freshRecognizer = SFSpeechRecognizer(locale: newLocale) else { return }
+        recognizer = freshRecognizer
+        beginNewSession(recognizer: freshRecognizer)
+        DiagnosticTrace.log("LOCAL_STT_LOCALE_CHANGED", "locale=\(newLocale.identifier) reason=midSessionSwitch")
+    }
+
     func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<TranscriptionUpdate, Error> {
         stopInternal()
 
-        guard let recognizer, recognizer.isAvailable, let audioFormat else {
+        guard let freshRecognizer = SFSpeechRecognizer(locale: locale), freshRecognizer.isAvailable, let audioFormat else {
+            DiagnosticTrace.log("LOCAL_STT_UNAVAILABLE", "locale=\(locale.identifier)")
             throw VoiceInputError.recognizerUnavailable
         }
+        recognizer = freshRecognizer
+        DiagnosticTrace.log(
+            "LOCAL_STT_SESSION_START",
+            "locale=\(locale.identifier) onDeviceSupported=\(freshRecognizer.supportsOnDeviceRecognition)"
+        )
 
         // Off the main actor: `setCategory`/`setActive` are synchronous and
         // can block for a non-trivial duration — running them on the main
@@ -121,7 +172,7 @@ final class GlassesSpeechTranscriber: ContinuousTranscribing, @unchecked Sendabl
         }.value
 
         isActive = true
-        beginNewSession(recognizer: recognizer)
+        beginNewSession(recognizer: freshRecognizer)
 
         return AsyncThrowingStream { continuation in
             self.continuation = continuation

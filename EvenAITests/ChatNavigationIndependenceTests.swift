@@ -51,7 +51,7 @@ struct ChatNavigationIndependenceTests {
         let chatService = MockChatService(modelContainer: freshModelContainer())
         let normalChat = try await chatService.createChat(title: "My conversation")
 
-        let provider = GlassesChatProvider(chatService: chatService, defaults: freshDefaults())
+        let provider = GlassesChatProvider(localStore: LocalGlassesChatStore(modelContainer: freshModelContainer()), defaults: freshDefaults())
         _ = try await provider.findOrCreateGlassesChat() // resolved, valid, cached
 
         let viewModel = ChatViewModel(chatID: normalChat.id, chatService: chatService, glassesTransport: MockGlassesTransport())

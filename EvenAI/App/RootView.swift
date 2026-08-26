@@ -114,5 +114,5 @@ struct RootView: View {
             )
         )
         .environment(AgentContextStore())
-        .environment(GlassesChatProvider(chatService: MockChatService()))
+        .environment(GlassesChatProvider(localStore: LocalGlassesChatStore(modelContainer: PersistenceController.preview)))
 }

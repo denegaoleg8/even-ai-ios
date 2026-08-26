@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import SwiftData
 @testable import EvenAI
 
 /// Full session-lifecycle audit — the remaining scenarios from the
@@ -118,9 +119,13 @@ struct AuthSessionIntegrationTests {
             session: StubURLProtocol.makeSession(),
             tokenStore: InMemoryAuthTokenStore()
         )
-        let chatService = RecordingChatServiceForAuthTest()
+        let schema = Schema([ChatEntity.self, MessageEntity.self])
+        let modelContainer = try! ModelContainer(
+            for: schema,
+            configurations: [ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)]
+        )
         let defaults = UserDefaults(suiteName: "AuthSessionIntegrationTests.\(UUID().uuidString)")!
-        let provider = GlassesChatProvider(chatService: chatService, defaults: defaults)
+        let provider = GlassesChatProvider(localStore: LocalGlassesChatStore(modelContainer: modelContainer), defaults: defaults)
 
         // Resolve (create) a Glasses Chat before any auth self-heal.
         let glassesChat = try await provider.findOrCreateGlassesChat()
@@ -129,7 +134,9 @@ struct AuthSessionIntegrationTests {
         // A session self-heal happens on the SHARED apiClient — clearing
         // the credential and recovering a fresh anonymous one — entirely
         // independent machinery (GlassesChatProvider only ever touches
-        // its own `defaults`/`chatService`, never `apiClient` directly).
+        // its own `defaults`/`localStore`, never `apiClient` directly —
+        // doubly true now that it's local-first and has no network
+        // dependency whatsoever).
         await apiClient.clearSession()
         StubURLProtocol.handler = { _ in
             StubURLProtocol.StubResponse(
@@ -148,7 +155,6 @@ struct AuthSessionIntegrationTests {
         #expect(defaults.string(forKey: "com.evenai.glassesChatID") == glassesChat.id.uuidString)
         let stillCached = try await provider.findOrCreateGlassesChat()
         #expect(stillCached.id == glassesChat.id)
-        #expect(await chatService.createChatCallCount == 1) // never created a second time
     }
 }
 
@@ -174,37 +180,5 @@ private extension NSLock {
         lock()
         defer { unlock() }
         return body()
-    }
-}
-
-/// Minimal `ChatServicing` double for the Glasses Chat self-heal test —
-/// only `createChat`/`fetchChat` are exercised.
-private actor RecordingChatServiceForAuthTest: ChatServicing {
-    private(set) var createChatCallCount = 0
-    private var chatsByID: [Chat.ID: Chat] = [:]
-
-    func fetchChats() async throws -> [Chat] { Array(chatsByID.values) }
-
-    func fetchChat(id: Chat.ID) async throws -> Chat {
-        guard let chat = chatsByID[id] else { throw URLError(.fileDoesNotExist) }
-        return chat
-    }
-
-    func createChat(title: String) async throws -> Chat {
-        createChatCallCount += 1
-        let chat = Chat(title: title)
-        chatsByID[chat.id] = chat
-        return chat
-    }
-
-    func renameChat(id: Chat.ID, title: String) async throws -> Chat { Chat(id: id, title: title) }
-    func deleteChat(id: Chat.ID) async throws { chatsByID[id] = nil }
-    func fetchMessages(chatID: Chat.ID) async throws -> [Message] { [] }
-    func appendMessage(chatID: Chat.ID, role: MessageRole, content: String) async throws -> Message {
-        Message(chatID: chatID, role: role, content: content)
-    }
-
-    nonisolated func streamReply(chatID: Chat.ID, content: String) -> AsyncThrowingStream<ChatStreamEvent, Error> {
-        AsyncThrowingStream { $0.finish() }
     }
 }
