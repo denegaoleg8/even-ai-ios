@@ -57,11 +57,13 @@ actor ScriptedContinuousTranscriber: ContinuousTranscribing {
 /// time-bounded dedupe window's boundary, or a streaming-translation race
 /// between two partials), which a fixed, synchronously-yielded array can't.
 actor ManualContinuousTranscriber: ContinuousTranscribing {
+    private(set) var startCallCount = 0
     private(set) var stopCallCount = 0
     private var continuation: AsyncThrowingStream<TranscriptionUpdate, Error>.Continuation?
 
     func startTranscribing(pcmUpdates: AsyncStream<Data>) async throws -> AsyncThrowingStream<TranscriptionUpdate, Error> {
-        AsyncThrowingStream { continuation in
+        startCallCount += 1
+        return AsyncThrowingStream { continuation in
             Task { await self.retain(continuation) }
         }
     }
@@ -78,6 +80,18 @@ actor ManualContinuousTranscriber: ContinuousTranscribing {
     /// Emits a still-growing partial for the utterance in progress.
     func emitPartial(_ text: String) {
         continuation?.yield(.partial(text))
+    }
+
+    /// Fails the CURRENT stream with `error` — models a provider that
+    /// started successfully (unlike `ThrowingStartContinuousTranscriber`/
+    /// `HandshakeFailingContinuousTranscriber`, which fail before or at
+    /// the very first iteration) but then drops mid-session, e.g. a cloud
+    /// connection whose bounded reconnect budget is later exhausted. Used
+    /// by `CloudTranscriptionFallbackTests` to exercise
+    /// `TranscriptionProviderRouter`'s Cloud→local mid-stream fallback.
+    func failStream(with error: Error) {
+        continuation?.finish(throwing: error)
+        continuation = nil
     }
 
     func stopTranscribing() async {
@@ -157,6 +171,14 @@ final class FakeOnDeviceTranscriber: OnDeviceTranscribing, @unchecked Sendable {
     private(set) var stopCallCount = 0
     private let finals: [String]
     private let startError: Error?
+    /// Retained across the CURRENT `startTranscribing` call so
+    /// `emit(_:)`/`emitPartial(_:)`/`failStream(with:)` can drive it on
+    /// demand — the same "manual" pattern `ManualContinuousTranscriber`
+    /// uses, needed here (rather than reusing that type directly) because
+    /// only a `@MainActor` class, not a plain `actor`, can satisfy
+    /// `OnDeviceTranscribing`'s synchronous `locale`/`setLocale`
+    /// requirements — see this type's own original doc comment.
+    private var continuation: AsyncThrowingStream<TranscriptionUpdate, Error>.Continuation?
 
     init(locale: Locale = Locale(identifier: "en-US"), finals: [String] = [], startError: Error? = nil) {
         self.locale = locale
@@ -174,12 +196,36 @@ final class FakeOnDeviceTranscriber: OnDeviceTranscribing, @unchecked Sendable {
         if let startError { throw startError }
         let finals = self.finals
         return AsyncThrowingStream { continuation in
+            self.continuation = continuation
             for final in finals { continuation.yield(.final(final)) }
         }
     }
 
+    /// Emits a final transcript on demand, on the CURRENT session's
+    /// stream — for tests that need to control wall-clock timing between
+    /// updates (e.g. driving one turn, waiting, then driving another
+    /// across a Cloud→local fallback), which the fixed `finals` array
+    /// (yielded all at once, immediately on start) can't do.
+    func emit(_ text: String) {
+        continuation?.yield(.final(text))
+    }
+
+    func emitPartial(_ text: String) {
+        continuation?.yield(.partial(text))
+    }
+
+    /// Fails the CURRENT stream — models a provider that started
+    /// successfully but then drops mid-session (e.g. a cloud connection
+    /// whose bounded reconnect budget is later exhausted).
+    func failStream(with error: Error) {
+        continuation?.finish(throwing: error)
+        continuation = nil
+    }
+
     func stopTranscribing() async {
         stopCallCount += 1
+        continuation?.finish()
+        continuation = nil
     }
 }
 

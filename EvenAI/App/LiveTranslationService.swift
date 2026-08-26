@@ -281,6 +281,19 @@ final class LiveTranslationService {
     /// (e.g. a test's own fake), which simply means this label is unknown,
     /// not that anything is wrong.
     private(set) var lastActiveTranscriptionProvider: ActiveTranscriptionProvider?
+    /// Cloud-mode production-safety fix: non-`nil` exactly when the user
+    /// selected `.cloud` and the session is actually running on-device
+    /// because cloud failed (at start, or mid-session) — a truthful,
+    /// non-blocking notice for the Live Translation UI, e.g. "Cloud
+    /// transcription is currently unavailable. Using on-device
+    /// transcription." Never treated as an error: `state` stays
+    /// `.listening`, translation/G2 display/history continue completely
+    /// unaffected — see `noteCloudFallback(_:)` and
+    /// `TranscriptionProviderRouter.onCloudFallback`. Reset to `nil` at
+    /// the start of every new `start()` call (a fresh session gets a
+    /// fresh chance) and whenever the user switches away from `.cloud`
+    /// mode (the notice would otherwise be stale/irrelevant).
+    private(set) var cloudFallbackNotice: String?
     /// Conversation Mode: see `DisplayMode`'s own doc comment.
     /// Listening/translation/history recording are NEVER gated on this —
     /// only the act of actually pushing a new display update to G2 is
@@ -641,6 +654,30 @@ final class LiveTranslationService {
         transcriptionProviderMode = mode
         defaults.set(mode.rawValue, forKey: Self.transcriptionProviderModeDefaultsKey)
         DiagnosticTrace.log("STT_PROVIDER_MODE_SELECTED", "mode=\(mode.rawValue)")
+        // A stale "Cloud is unavailable, using on-device" notice from a
+        // PREVIOUS Cloud session is meaningless once the user has moved
+        // away from Cloud mode entirely.
+        if mode != .cloud {
+            cloudFallbackNotice = nil
+        }
+    }
+
+    /// Wired up as `TranscriptionProviderRouter.onCloudFallback` (see
+    /// `EvenAIApp.init()`) — called on the main actor the moment an
+    /// explicit-Cloud session falls back to on-device, whether that
+    /// happens before `start()` even returns or well into an already-
+    /// `.listening` session. Deliberately touches NOTHING except
+    /// `cloudFallbackNotice`/`lastActiveTranscriptionProvider`: `state`
+    /// stays `.listening`, `agentContextStore`/history/G2 display are
+    /// completely untouched — a cloud-provider failure is explicitly NOT
+    /// a session-ending event once local-first architecture exists to
+    /// absorb it. Never confused with a G2/auth/session error: this is
+    /// the ONE path that produces `cloudFallbackNotice`'s message, and it
+    /// is never routed through `LiveTranslationStartError` at all.
+    func noteCloudFallback(_ error: Error) {
+        cloudFallbackNotice = "Cloud transcription is currently unavailable. Using on-device transcription."
+        lastActiveTranscriptionProvider = .onDevice
+        DiagnosticTrace.log("STT_CLOUD_FALLBACK_NOTICED", "error=\(error)")
     }
 
     /// THE single authoritative resolved source language for the current
@@ -688,6 +725,10 @@ final class LiveTranslationService {
         DiagnosticTrace.log("LIVE_START_REQUESTED", "audioSource=\(audioSource.rawValue) conversationMode=\(conversationMode.rawValue)")
         isEnabledIntent = true
         lastRecognizedPhrase = nil
+        // A stale "Cloud unavailable, using on-device" notice from a
+        // PREVIOUS session must never carry over — this session gets its
+        // own fresh attempt (Railway/cloud connectivity may have changed).
+        cloudFallbackNotice = nil
         // "Reset the Auto language lock when a new Live Translation
         // session begins" — a lock from a previous session (possibly a
         // different speaker/language entirely) must never carry over.

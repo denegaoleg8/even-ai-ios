@@ -43,42 +43,55 @@ struct EvenAIApp: App {
         _languageTranslator = State(initialValue: translator)
         _agentContextStore = State(initialValue: agentContextStore)
         _glassesChatProvider = State(initialValue: glassesChatProvider)
-        _liveTranslation = State(
-            initialValue: LiveTranslationService(
-                glassesTransport: AppContainer.live.glassesTransport,
-                // Local-first architecture pass: Milestone 8b hardcoded
-                // OpenAIRealtimeTranscriber as THE production transcriber
-                // (abandoning GlassesSpeechTranscriber specifically
-                // because it only supported en-US) — meaning Live
-                // Translation could not even START without Railway/auth
-                // succeeding first. `TranscriptionProviderRouter` restores
-                // on-device as the DEFAULT, preferred path
-                // (`GlassesSpeechTranscriber` now supports EN/DE/PL — see
-                // `SourceLanguageMode.onDeviceLocaleIdentifier` — so the
-                // reason it was abandoned no longer applies), with
-                // `OpenAIRealtimeTranscriber` retained unchanged as the
-                // opt-in `.cloud` choice / `.auto` mode's fallback. See
-                // `TranscriptionProviderRouter`'s own doc comment for the
-                // exact selection contract.
-                transcriber: TranscriptionProviderRouter(
-                    local: GlassesSpeechTranscriber(),
-                    cloud: OpenAIRealtimeTranscriber(apiClient: AppContainer.live.apiClient),
-                    mode: { Self.resolveTranscriptionProviderMode(defaults: .standard) },
-                    resolveLocale: { Self.resolveOnDeviceLocale(sourceLanguageModeDefaults: .standard) }
-                ),
-                translator: translator,
-                agentContextStore: agentContextStore,
-                // Milestone 7: real, backend-calling generator — shares
-                // `AppContainer.live.apiClient` with Chat/Auth, same
-                // "one client, one session" rule those already follow.
-                // Optional-online-enhancement layer only (§8 of the
-                // local-first architecture pass): its failures never
-                // reach here — `LiveTranslationService.generateSuggestedReplies`
-                // catches everything and simply skips display.
-                replyGenerator: NetworkSuggestedReplyGenerator(apiClient: AppContainer.live.apiClient),
-                glassesChatProvider: glassesChatProvider
-            )
+        // Local-first architecture pass: Milestone 8b hardcoded
+        // OpenAIRealtimeTranscriber as THE production transcriber
+        // (abandoning GlassesSpeechTranscriber specifically because it
+        // only supported en-US) — meaning Live Translation could not even
+        // START without Railway/auth succeeding first.
+        // `TranscriptionProviderRouter` restores on-device as the
+        // DEFAULT, preferred path (`GlassesSpeechTranscriber` now
+        // supports EN/DE/PL — see `SourceLanguageMode.onDeviceLocaleIdentifier`
+        // — so the reason it was abandoned no longer applies), with
+        // `OpenAIRealtimeTranscriber` retained unchanged as the opt-in
+        // `.cloud` choice / `.auto` mode's fallback. See
+        // `TranscriptionProviderRouter`'s own doc comment for the exact
+        // selection contract — including the Cloud-mode production-safety
+        // fix (confirmed physical-device cause: `POST auth/device` failing
+        // against the now-unavailable Railway deployment used to throw
+        // straight through and terminate the whole session; Cloud now
+        // transparently falls back to on-device instead).
+        //
+        // Held as a named local (not inline in the `LiveTranslationService`
+        // initializer below) specifically so `onCloudFallback` can be wired
+        // up right after `liveTranslation` is constructed — the router has
+        // to exist before `LiveTranslationService` does (it's one of that
+        // type's own init parameters), so it can't reference
+        // `liveTranslation` at construction time.
+        let transcriberRouter = TranscriptionProviderRouter(
+            local: GlassesSpeechTranscriber(),
+            cloud: OpenAIRealtimeTranscriber(apiClient: AppContainer.live.apiClient),
+            mode: { Self.resolveTranscriptionProviderMode(defaults: .standard) },
+            resolveLocale: { Self.resolveOnDeviceLocale(sourceLanguageModeDefaults: .standard) }
         )
+        let liveTranslation = LiveTranslationService(
+            glassesTransport: AppContainer.live.glassesTransport,
+            transcriber: transcriberRouter,
+            translator: translator,
+            agentContextStore: agentContextStore,
+            // Milestone 7: real, backend-calling generator — shares
+            // `AppContainer.live.apiClient` with Chat/Auth, same
+            // "one client, one session" rule those already follow.
+            // Optional-online-enhancement layer only (§8 of the
+            // local-first architecture pass): its failures never
+            // reach here — `LiveTranslationService.generateSuggestedReplies`
+            // catches everything and simply skips display.
+            replyGenerator: NetworkSuggestedReplyGenerator(apiClient: AppContainer.live.apiClient),
+            glassesChatProvider: glassesChatProvider
+        )
+        transcriberRouter.onCloudFallback = { [weak liveTranslation] error in
+            liveTranslation?.noteCloudFallback(error)
+        }
+        _liveTranslation = State(initialValue: liveTranslation)
     }
 
     /// Reads the SAME persisted `sourceLanguageMode` UserDefaults key

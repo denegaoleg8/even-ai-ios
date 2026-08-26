@@ -215,6 +215,21 @@ struct LiveTranslationView: View {
                 .foregroundStyle(AppColor.textSecondary)
                 .accessibilityIdentifier("liveTranslation.activeProviderLabel")
         }
+        // Cloud-mode production-safety fix: shown whenever the user
+        // selected Cloud but the session is actually running on-device
+        // because cloud failed (Railway unreachable, most commonly) —
+        // truthful and non-alarming; never implies a G2/auth/session
+        // problem, since there isn't one. Live Translation keeps
+        // listening/translating/displaying on G2 throughout — this is
+        // purely informational.
+        if let notice = liveTranslation.cloudFallbackNotice {
+            Text(notice)
+                .font(.caption)
+                .foregroundStyle(AppColor.textSecondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, AppMetrics.Spacing.lg)
+                .accessibilityIdentifier("liveTranslation.cloudFallbackNotice")
+        }
     }
 
     /// "↓ LIVE" — shown only once the user has manually navigated G2 away
