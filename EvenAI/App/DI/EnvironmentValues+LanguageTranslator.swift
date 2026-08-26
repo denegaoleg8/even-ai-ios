@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// How `RootView` gets the concrete `AppleLanguageTranslator` it needs to
-/// host `.translationTask(_:action:)` — `LiveTranslationService` only
+/// host `.translationTask(_:action:)` — `AIConversationEngine` only
 /// depends on the abstract `LanguageTranslating` protocol (see its doc
 /// comment), but the SwiftUI-session-vending half of translation is
 /// specific to this one concrete implementation, so it's threaded through

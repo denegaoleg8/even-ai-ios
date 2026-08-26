@@ -5,7 +5,7 @@ import Foundation
 /// your G2 connection" for a failure that had nothing to do with G2 at
 /// all.
 ///
-/// This exists to fix a real regression: `LiveTranslationService.start()`
+/// This exists to fix a real regression: `AIConversationEngine.start()`
 /// used to funnel every failure — a genuine G2/microphone problem, a
 /// failed session-credential recovery, an unreachable backend, or a
 /// failed STT WebSocket handshake — into the exact same "Couldn't start
@@ -108,7 +108,7 @@ enum LiveTranslationStartError: Error, Equatable {
     /// Classifies whatever `transcriber.startTranscribing(pcmUpdates:)`
     /// threw. Deliberately never returns `.glassesUnavailable`/
     /// `.microphoneUnavailable` — those are only ever produced directly
-    /// by the audio/G2 setup catch block in `LiveTranslationService
+    /// by the audio/G2 setup catch block in `AIConversationEngine
     /// .start()`, which knows which `AudioSource` was active; this
     /// function only sees the transcriber/network layer.
     static func classifyTranscriberStartFailure(_ error: Error) -> LiveTranslationStartError {

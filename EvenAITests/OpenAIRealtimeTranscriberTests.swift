@@ -4,10 +4,10 @@ import Foundation
 
 /// Milestone 8a: `OpenAIRealtimeTranscriber`'s orchestration contract —
 /// entirely against `FakeRealtimeTranscriptionSocket`, never a real
-/// network connection. Not wired into `LiveTranslationService`/production
+/// network connection. Not wired into `AIConversationEngine`/production
 /// anywhere yet; these tests cover this type in isolation, the same way
 /// `GlassesSpeechTranscriber` itself has no equivalent direct-unit-test
-/// file (it's exercised through `LiveTranslationServiceTests` instead) —
+/// file (it's exercised through `AIConversationEngineTests` instead) —
 /// except here we *can* unit test directly, since
 /// `RealtimeTranscriptionSocket` is a seam `GlassesSpeechTranscriber`
 /// never had (no fake `SFSpeechRecognizer`).

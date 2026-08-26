@@ -4,7 +4,7 @@ import Foundation
 /// Scriptable fake: maps each expected input text to a fixed detected
 /// language code (or `nil` for "uncertain"), and translates by returning a
 /// caller-supplied fixed string regardless of input — a real translation
-/// isn't needed to exercise `LiveTranslationViewModel`'s decision logic.
+/// isn't needed to exercise `AIConversationViewModel`'s decision logic.
 /// An input text with no entry in `languageCodes` is treated as
 /// undetectable (`nil`), matching `LanguageTranslating`'s "uncertain ⇒ do
 /// nothing" contract.
@@ -63,21 +63,21 @@ actor RecordingLanguageTranslator: LanguageTranslating {
 /// Detects every input as a fixed, always-foreign language; translation
 /// throws only for texts named in `failingTexts` (everything else
 /// succeeds with `translation`) — lets a test verify
-/// `LiveTranslationService.handle(final:)`'s translation-failure path
+/// `AIConversationEngine.handle(final:)`'s translation-failure path
 /// (no turn appended, no display update, session stays `.listening`) for
 /// one phrase while confirming a *different* phrase in the same session
 /// still succeeds normally, without needing a real translator that fails
 /// unconditionally.
 /// `translateToUkrainian` never returns for any text named in
 /// `hangingTexts` (it sleeps far longer than any test's timeout, then gets
-/// cancelled once `LiveTranslationService.translateWithTimeout`'s race
+/// cancelled once `AIConversationEngine.translateWithTimeout`'s race
 /// resolves) — every other text translates normally and immediately. Lets
 /// a test prove the timeout actually bounds a stuck translation call
 /// instead of permanently wedging `consume(_:)`'s sequential loop, the
 /// concrete failure mode behind a real physical-device hang (a
 /// `TranslationSession.translate(_:)` call that could never return
 /// because the system UI it needed to present was blocked by another
-/// sheet — see `LiveTranslationService.translateWithTimeout`'s doc
+/// sheet — see `AIConversationEngine.translateWithTimeout`'s doc
 /// comment).
 actor HangingLanguageTranslator: LanguageTranslating {
     private let languageCodes: [String: String]
@@ -108,7 +108,7 @@ actor HangingLanguageTranslator: LanguageTranslating {
 /// deterministic "turn A's translation is slower than turn B's" race
 /// (turn A spoken first but finishes translating after turn B) without
 /// relying on incidental scheduling timing, to exercise
-/// `LiveTranslationService`'s sequence-based "a newer turn has already
+/// `AIConversationEngine`'s sequence-based "a newer turn has already
 /// displayed" staleness guard directly at the *translation* level (not
 /// just replies).
 actor DelayedLanguageTranslator: LanguageTranslating {

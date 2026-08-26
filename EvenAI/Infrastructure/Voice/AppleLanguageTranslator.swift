@@ -22,7 +22,7 @@ import NaturalLanguage
 /// `Sendable`, so it can't be stored in a property and used later (that
 /// was tried and rejected — Swift 6 strict concurrency correctly flags it
 /// as a data-race risk). Instead, `runSession(_:)` runs for the lifetime
-/// of `LiveTranslationView`'s `.translationTask` closure and is the *only*
+/// of `AIConversationView`'s `.translationTask` closure and is the *only*
 /// place `session` is ever touched: it drains `translateToUkrainian`
 /// requests as they arrive and resolves each one with
 /// `session.translate(_:)` from directly within that same closure/task.
@@ -38,7 +38,7 @@ final class AppleLanguageTranslator: LanguageTranslating, @unchecked Sendable {
     /// Bounds each individual `session.translate(_:)` call inside
     /// `runSession(_:)`'s own loop — NOT the same thing as a caller's own
     /// timeout on `translateToUkrainian(_:from:)` (see
-    /// `LiveTranslationService.translateWithTimeout(_:from:)`), and not
+    /// `AIConversationEngine.translateWithTimeout(_:from:)`), and not
     /// redundant with it. `pendingTranslations` is a single-consumer FIFO
     /// queue: `runSession(_:)` dequeues one item and awaits its
     /// `session.translate(_:)` call before it ever looks at the next
@@ -76,7 +76,7 @@ final class AppleLanguageTranslator: LanguageTranslating, @unchecked Sendable {
         // either still rejecting these exact words or accepting
         // genuinely ambiguous/noisy input elsewhere. See
         // `CommonShortUtterances`'s own doc comment for why this table is
-        // shared with `LiveTranslationService`'s Auto-lock hysteresis,
+        // shared with `AIConversationEngine`'s Auto-lock hysteresis,
         // not private to this file.
         if let knownLanguage = CommonShortUtterances.language(for: text) {
             return knownLanguage
@@ -121,7 +121,7 @@ final class AppleLanguageTranslator: LanguageTranslating, @unchecked Sendable {
 
     /// Root-cause fix (major performance pass — language-selection state
     /// bug): `RootView` now reconfigures/recreates the real
-    /// `TranslationSession` whenever `LiveTranslationService
+    /// `TranslationSession` whenever `AIConversationEngine
     /// .resolvedSourceLanguageCode` changes (an explicit EN/DE/PL switch,
     /// or Auto's first lock) — a LEGITIMATE, expected event now, not a
     /// rare edge case. When that happens, `.translationTask`'s modifier
@@ -170,7 +170,7 @@ final class AppleLanguageTranslator: LanguageTranslating, @unchecked Sendable {
     /// Translation is no longer on screen. Any request still queued at
     /// that point is failed immediately with `SessionEndedError` — never
     /// left to silently hang until a caller's own external timeout
-    /// (`LiveTranslationService.translateWithTimeout(_:from:)`'s 8s)
+    /// (`AIConversationEngine.translateWithTimeout(_:from:)`'s 8s)
     /// eventually recovers it. This is what makes a deliberate language-
     /// mode switch "immediately recover the current session" rather than
     /// stalling any translation that happened to be mid-flight for up to

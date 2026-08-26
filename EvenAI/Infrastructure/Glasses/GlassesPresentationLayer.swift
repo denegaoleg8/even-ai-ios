@@ -46,7 +46,7 @@ enum GlassesPresentationLayer {
     /// phrase/translation, multi-page) header alone — "Source +
     /// translation, no reply section yet" is an explicitly allowed
     /// display state (see this type's doc comment and
-    /// `LiveTranslationService`'s turn/display state model), not a
+    /// `AIConversationEngine`'s turn/display state model), not a
     /// placeholder needing special-casing here.
     ///
     /// With replies present, the result is one page PER reply (capped at
@@ -101,7 +101,7 @@ enum GlassesPresentationLayer {
     /// product's own instruction is "render a WINDOW of it," not attempt
     /// infinite history on-device. Appended AFTER replies (not before),
     /// so "page 0 = live" stays a simple, unconditional invariant
-    /// `LiveTranslationService`'s follow-live tracking depends on
+    /// `AIConversationEngine`'s follow-live tracking depends on
     /// (`GlassesNavigationEvent.pageChanged(index: 0)` always means "back
     /// on the live turn," regardless of how many reply pages exist for
     /// it) — swiping past all replies is what reaches history context,
@@ -195,7 +195,7 @@ enum GlassesPresentationLayer {
     /// A single dedicated page for one turn's history-viewport content —
     /// used both by `conversationPages(for:previousTurn:)` (to append the
     /// live turn's trailing look-back page) AND, on demand, directly by
-    /// `LiveTranslationService.renderHistoryViewport(anchorTurnID:)` when
+    /// `AIConversationEngine.renderHistoryViewport(anchorTurnID:)` when
     /// `.browsingHistory` is entered/re-entered — so history always
     /// renders identically regardless of which of those two call sites
     /// produced it. `nil` if `turn` has no usable translation (Ukrainian

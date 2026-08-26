@@ -52,7 +52,7 @@ actor PairFailureGlassesTransport: GlassesTransport {
 /// mirrored to the glasses — used to verify `ChatMessageSender` (and, via
 /// it, `ChatViewModel.sendDraft()`) actually reaches the glasses mirror,
 /// without needing a real connection. Also used directly by
-/// `LiveTranslationServiceTests`. Always reports `.connected` so
+/// `AIConversationEngineTests`. Always reports `.connected` so
 /// `sendText` never short-circuits on `GlassesTransportError.notConnected`.
 actor SpyGlassesTransport: GlassesTransport {
     private(set) var sentTexts: [String] = []
@@ -63,7 +63,7 @@ actor SpyGlassesTransport: GlassesTransport {
     /// `sentTexts`-based assertions already see.
     private(set) var displayedPageSets: [[String]] = []
     /// Every `setMicrophoneEnabled(_:)` call, in order — used by
-    /// `LiveTranslationServiceTests` to verify the mic is enabled on
+    /// `AIConversationEngineTests` to verify the mic is enabled on
     /// start and disabled on stop.
     private(set) var microphoneEnabledCalls: [Bool] = []
 
@@ -100,7 +100,7 @@ actor SpyGlassesTransport: GlassesTransport {
     /// Test hook: simulate one raw PCM chunk arriving from G2/phone mic
     /// after a subscriber has already started observing
     /// `microphonePCMUpdates()` — used to exercise
-    /// `LiveTranslationService`'s audio-reliability instrumentation
+    /// `AIConversationEngine`'s audio-reliability instrumentation
     /// (chunk/gap counting) under controlled, deterministic timing.
     func simulatePCMChunk(_ data: Data = Data(repeating: 0, count: 320)) {
         for continuation in pcmContinuations.values {
@@ -113,7 +113,7 @@ actor SpyGlassesTransport: GlassesTransport {
     }
 
     /// Every `setPreferredAudioSource(_:)` call, in order — used by
-    /// `LiveTranslationServiceTests` to verify audio-source selection
+    /// `AIConversationEngineTests` to verify audio-source selection
     /// propagates immediately, including mid-session.
     private(set) var audioSourceCalls: [AudioSource] = []
     func setPreferredAudioSource(_ source: AudioSource) async {
@@ -179,7 +179,7 @@ actor DisplayFailingGlassesTransport: GlassesTransport {
 
 /// Like `SpyGlassesTransport`, but its connection state can be changed
 /// after the fact via `simulateConnectionChange(_:)` — used by
-/// `LiveTranslationServiceTests` to verify the service stops itself when
+/// `AIConversationEngineTests` to verify the service stops itself when
 /// G2 disconnects mid-session, something `SpyGlassesTransport`'s
 /// single-value-forever stream can't simulate.
 actor ControllableGlassesTransport: GlassesTransport {

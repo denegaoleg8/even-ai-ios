@@ -26,7 +26,7 @@ import Foundation
 /// ## Chunk-boundary signals (this type implements 3 of the 4
 /// content-driven ones the product asked for; the 4th — "final
 /// transcript arrives" — is handled one layer up, in
-/// `LiveTranslationService`, since a final is a structurally different
+/// `AIConversationEngine`, since a final is a structurally different
 /// event from a partial, not something this buffer ever sees)
 ///
 /// 1. **Punctuation / clause boundary** — the accumulated text now ends
@@ -87,7 +87,7 @@ struct AdaptiveStreamingTranslationBuffer: Equatable {
         /// `text` is ready to translate now; `revision` is this
         /// utterance's monotonically increasing chunk counter — the
         /// authoritative staleness key alongside `utteranceID` (see
-        /// `LiveTranslationService.settleStreamingChunk(...)`'s doc
+        /// `AIConversationEngine.settleStreamingChunk(...)`'s doc
         /// comment for how these two together prevent an older,
         /// slower-resolving translation response from ever overwriting a
         /// newer one).

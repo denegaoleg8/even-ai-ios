@@ -3,19 +3,19 @@ import Testing
 @testable import EvenAI
 
 /// Milestone 3: end-to-end proof that Chat observes the SAME
-/// `AgentContextStore` instance `LiveTranslationService` writes into —
+/// `AgentContextStore` instance `AIConversationEngine` writes into —
 /// one shared store, read by `ChatLiveConversationPresenter` (what
-/// `ChatView` actually calls), written by `LiveTranslationService`, never
+/// `ChatView` actually calls), written by `AIConversationEngine`, never
 /// two independent copies.
 @MainActor
 @Suite("Chat + shared AgentContextStore")
 struct ChatSharedAgentContextIntegrationTests {
     private static let propagationDelay: Duration = .milliseconds(30)
 
-    @Test("a live turn recorded by LiveTranslationService appears in Chat's presenter, through the shared store")
+    @Test("a live turn recorded by AIConversationEngine appears in Chat's presenter, through the shared store")
     func liveTurnAppearsInChatFromSharedStore() async throws {
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт"),
@@ -25,7 +25,7 @@ struct ChatSharedAgentContextIntegrationTests {
         await service.start()
         try? await Task.sleep(for: Self.propagationDelay)
 
-        // Chat never reads `LiveTranslationService` for this — it only
+        // Chat never reads `AIConversationEngine` for this — it only
         // ever calls the presenter against the shared store, exactly as
         // `ChatView.body` does.
         let presented = ChatLiveConversationPresenter.present(store.session)
@@ -38,7 +38,7 @@ struct ChatSharedAgentContextIntegrationTests {
     func multipleTurnsUpdateCorrectly() async throws {
         let store = AgentContextStore()
         let transcriber = ScriptedContinuousTranscriber(finals: ["first phrase", "second phrase"])
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(
@@ -59,7 +59,7 @@ struct ChatSharedAgentContextIntegrationTests {
     @Test("Ukrainian speech still does not appear as a translated live turn in Chat")
     func ukrainianSpeechDoesNotAppearInChat() async throws {
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["привіт, як справи"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["привіт, як справи": "uk"]),
@@ -94,10 +94,10 @@ struct ChatSharedAgentContextIntegrationTests {
         #expect(viewModel.draftText.isEmpty)
     }
 
-    @Test("no second AgentContextStore is created — the writer (LiveTranslationService) and reader (Chat) see the same instance")
+    @Test("no second AgentContextStore is created — the writer (AIConversationEngine) and reader (Chat) see the same instance")
     func noSecondStoreIsCreated() async throws {
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт"),

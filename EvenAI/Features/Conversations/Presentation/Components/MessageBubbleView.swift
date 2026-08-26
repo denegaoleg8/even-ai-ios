@@ -2,7 +2,7 @@ import SwiftUI
 
 /// Glasses Chat persists each finalized live-translation turn as one
 /// plain-text message: `"<source>\n→ <Ukrainian translation>"` (see
-/// `LiveTranslationService.processTurn(...)`'s Glasses Chat append). A
+/// `AIConversationEngine.processTurn(...)`'s Glasses Chat append). A
 /// flat `Text(message.content)` rendered that as one undifferentiated
 /// paragraph — genuinely hard to scan back through as history (Section F,
 /// "focused usability/performance cleanup"). This parser recovers the two

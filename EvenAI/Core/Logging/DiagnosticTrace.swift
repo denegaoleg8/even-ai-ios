@@ -4,7 +4,7 @@ import Foundation
 /// after the original, much larger diagnostic pass (which included a
 /// `DICTATE_TRACE` prefix, removed along with the Dictate-to-Chat feature
 /// itself, and a great deal of verbose entry/exit/"first callback" tracing
-/// in `GlassesSpeechTranscriber`, `LiveTranslationService`, and
+/// in `GlassesSpeechTranscriber`, `AIConversationEngine`, and
 /// `MentraGlassesTransport`, removed once it had served its purpose for
 /// that investigation). The remaining call sites are deliberately kept:
 /// each one is a failure or anomaly (a translation/`sendText` error, a PCM

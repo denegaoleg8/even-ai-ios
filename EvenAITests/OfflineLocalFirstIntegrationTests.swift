@@ -12,7 +12,7 @@ import SwiftData
 ///
 /// The proof strategy for "zero auth/Railway calls" is structural, not
 /// behavioral interception: every test in this suite constructs its
-/// `LiveTranslationService` graph from ONLY types that have no network
+/// `AIConversationEngine` graph from ONLY types that have no network
 /// capability at all — `FakeOnDeviceTranscriber`/`ScriptedLanguageTranslator`
 /// (both pure, in-memory fakes), `LocalGlassesChatStore` (SwiftData, no
 /// network), `NoOpSuggestedReplyGenerator` (returns `[]`, never touches
@@ -49,7 +49,7 @@ struct OfflineLocalFirstIntegrationTests {
         let transcriber = FakeOnDeviceTranscriber(finals: ["good morning", "how are you"])
         let store = freshGlassesChatStore()
         let provider = GlassesChatProvider(localStore: store, defaults: freshDefaults())
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(
@@ -84,7 +84,7 @@ struct OfflineLocalFirstIntegrationTests {
     func localStartRequiresNoNetworkCapableTypeToExist() async throws {
         let spy = SpyGlassesTransport()
         let transcriber = FakeOnDeviceTranscriber(finals: ["hallo"])
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: ["hallo": "de"], translation: "привіт")
@@ -107,7 +107,7 @@ struct OfflineLocalFirstIntegrationTests {
         let spy = SpyGlassesTransport()
         let transcriber = FakeOnDeviceTranscriber(finals: ["first", "second", "third"])
         struct BackendUnreachable: Error {}
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(
@@ -136,7 +136,7 @@ struct OfflineLocalFirstIntegrationTests {
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
         let transcriber = FakeOnDeviceTranscriber(finals: ["welcome everyone", "let's begin"])
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(
@@ -146,17 +146,17 @@ struct OfflineLocalFirstIntegrationTests {
             agentContextStore: store,
             // replyGenerator defaults to NoOpSuggestedReplyGenerator — no
             // reply provider at all, the most degraded "offline" case.
-            // Isolated `defaults:` — `setConversationMode(.meeting)` below
+            // Isolated `defaults:` — `setConversationProfile(.meeting)` below
             // persists to whatever `UserDefaults` this instance was given;
             // without an isolated suite here, that write would leak into
             // `UserDefaults.standard` and silently poison every OTHER
-            // test in this process that constructs a `LiveTranslationService`
+            // test in this process that constructs a `AIConversationEngine`
             // without its own explicit `defaults:` override (several
-            // `LiveTranslationServiceG2DisplayTests` do exactly that,
+            // `AIConversationEngineG2DisplayTests` do exactly that,
             // assuming the untouched `.standard` conversation mode).
             defaults: freshDefaults()
         )
-        service.setConversationMode(.meeting)
+        service.setConversationProfile(.meeting)
 
         await service.start()
         try? await Task.sleep(for: Self.propagationDelay)
@@ -177,7 +177,7 @@ struct OfflineLocalFirstIntegrationTests {
     func providerModeSwitchMidSessionNeverWedgesSession() async throws {
         let spy = SpyGlassesTransport()
         let transcriber = FakeOnDeviceTranscriber(finals: ["before switch", "after switch"])
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(

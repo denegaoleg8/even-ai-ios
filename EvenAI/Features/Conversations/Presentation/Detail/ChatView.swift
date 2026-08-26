@@ -4,10 +4,10 @@ struct ChatView: View {
     let chatID: Chat.ID
     @Environment(AuthState.self) private var authState
     @Environment(AppState.self) private var appState
-    /// The ONE shared conversation/session record `LiveTranslationService`
+    /// The ONE shared conversation/session record `AIConversationEngine`
     /// appends live-conversation turns into (see `AgentContextStore`'s
     /// doc comment) — `ChatView` reads it directly rather than reaching
-    /// through `LiveTranslationService` for this, so there is exactly one
+    /// through `AIConversationEngine` for this, so there is exactly one
     /// source of truth for "what was the last live turn," not two.
     @Environment(AgentContextStore.self) private var agentContextStore
     @State private var viewModel: ChatViewModel

@@ -220,7 +220,7 @@ final class MentraGlassesTransport: GlassesTransport, @unchecked Sendable {
     /// Displays an already-paginated sequence of pages — `sendText(_:)`
     /// above is now just this, fed `GlassesTextPaginator`'s own output,
     /// so there is exactly one place pagination is actually started/sent
-    /// from, not two. Milestone 6: `LiveTranslationService` calls this
+    /// from, not two. Milestone 6: `AIConversationEngine` calls this
     /// directly with `GlassesPresentationLayer.pages(for:)`'s output,
     /// which is already page-shaped and needs no further splitting.
     func displayPages(_ pages: [String]) async throws {
@@ -558,7 +558,7 @@ extension MentraGlassesTransport: MentraBluetoothSDKDelegate {
         // unambiguous "take me back" touch event (confirmed against the
         // vendored SDK: `.doubleClick` → `"double_tap"`, never produced
         // by a swipe or the exit-class events below). Purely an upward
-        // signal to `LiveTranslationService` (via `navigationEvents()`)
+        // signal to `AIConversationEngine` (via `navigationEvents()`)
         // — this transport doesn't know what "live" means; it only
         // reports that the gesture happened.
         if touch.gestureName == "double_tap" {
@@ -925,7 +925,7 @@ struct GlassesPaginationState {
 /// Holds at most ONE pending page set: a second `requestDisplay(_:ready:)`
 /// call while still not ready replaces (never queues alongside) the first
 /// — this is what makes "newest turn wins" and "never duplicate a page
-/// set" hold at this layer, matching `LiveTranslationService`'s own
+/// set" hold at this layer, matching `AIConversationEngine`'s own
 /// newest-turn-wins guarantee at the presentation layer above it.
 struct GlassesReadinessGate {
     private(set) var pendingPages: [String]?

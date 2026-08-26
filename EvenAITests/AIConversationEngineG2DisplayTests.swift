@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import EvenAI
 
-/// `LiveTranslationService`'s integration with
+/// `AIConversationEngine`'s integration with
 /// `GlassesTransport.displayPages(_:)` and `GlassesPresentationLayer` —
 /// no real STT/Azure/OpenAI, no real `SuggestedReplyGenerator`.
 ///
@@ -13,8 +13,8 @@ import Foundation
 /// tests build the exact expected header text, matching
 /// `GlassesPresentationLayer`'s own (private) `conversationHeader`.
 @MainActor
-@Suite("LiveTranslationService + G2 display (GlassesPresentationLayer)")
-struct LiveTranslationServiceG2DisplayTests {
+@Suite("AIConversationEngine + G2 display (GlassesPresentationLayer)")
+struct AIConversationEngineG2DisplayTests {
     private static let propagationDelay: Duration = .milliseconds(100)
 
     private static func reply(_ original: String, _ ukrainian: String, ordering: Int) -> SuggestedReply {
@@ -31,7 +31,7 @@ struct LiveTranslationServiceG2DisplayTests {
         // completing, `displayedPageSets` would stay empty forever.
         let generator = GatedSuggestedReplyGenerator()
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
@@ -50,7 +50,7 @@ struct LiveTranslationServiceG2DisplayTests {
         let replies = [Self.reply("Sure", "Так", ordering: 0)]
         let generator = FakeSuggestedReplyGenerator(defaultReplies: replies)
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
@@ -73,7 +73,7 @@ struct LiveTranslationServiceG2DisplayTests {
         )
         // Unified pages(for:) — the reply update carries the SAME header
         // as the first call, with the reply section added below it. See
-        // LiveTranslationService.generateSuggestedReplies(for:)'s doc
+        // AIConversationEngine.generateSuggestedReplies(for:)'s doc
         // comment for the physical bug this fixes (the translation used
         // to visibly disappear when replies arrived).
         #expect(calls[1] == GlassesPresentationLayer.pages(for: expectedTurn))
@@ -85,7 +85,7 @@ struct LiveTranslationServiceG2DisplayTests {
         let replies = [Self.reply("Sure", "Так", ordering: 0), Self.reply("Thursday", "Четвер", ordering: 1)]
         let generator = FakeSuggestedReplyGenerator(defaultReplies: replies)
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
@@ -116,7 +116,7 @@ struct LiveTranslationServiceG2DisplayTests {
         ])
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["first phrase", "second phrase"]),
             translator: ScriptedLanguageTranslator(
@@ -155,7 +155,7 @@ struct LiveTranslationServiceG2DisplayTests {
         ])
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["one", "two", "three"]),
             translator: ScriptedLanguageTranslator(
@@ -200,7 +200,7 @@ struct LiveTranslationServiceG2DisplayTests {
     func emptySuggestedRepliesLeavesTranslationOnlyDisplay() async throws {
         let generator = FakeSuggestedReplyGenerator() // defaultReplies: []
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
@@ -218,7 +218,7 @@ struct LiveTranslationServiceG2DisplayTests {
     func ukrainianTurnProducesNoDisplayUpdate() async throws {
         let generator = FakeSuggestedReplyGenerator()
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["привіт, як справи"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["привіт, як справи": "uk"]),
@@ -238,7 +238,7 @@ struct LiveTranslationServiceG2DisplayTests {
             "Guten Tag": [Self.reply("Sure", "Так", ordering: 0)],
         ])
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
@@ -283,7 +283,7 @@ struct LiveTranslationServiceG2DisplayTests {
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(
@@ -341,7 +341,7 @@ struct LiveTranslationServiceG2DisplayTests {
         ])
         let spy = SpyGlassesTransport()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(
@@ -377,7 +377,7 @@ struct LiveTranslationServiceG2DisplayTests {
         ]
         let generator = FakeSuggestedReplyGenerator(defaultReplies: replies)
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["How are you?"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["How are you?": "en"], translation: "Як ти?"),

@@ -115,7 +115,7 @@ import Observation
 /// and can never delay, block, or take priority over (1)-(3).
 @MainActor
 @Observable
-final class LiveTranslationService {
+final class AIConversationEngine {
     enum State: Sendable, Equatable {
         case idle
         case listening
@@ -257,15 +257,15 @@ final class LiveTranslationService {
     /// through `setAudioSource(_:)`. Loaded from `defaults` at
     /// construction, same pattern as `sourceLanguageMode`.
     private(set) var audioSource: AudioSource
-    /// See `ConversationMode`'s own doc comment. `private(set)`, changed
-    /// only through `setConversationMode(_:)`. Loaded from `defaults` at
+    /// See `ConversationProfile`'s own doc comment. `private(set)`, changed
+    /// only through `setConversationProfile(_:)`. Loaded from `defaults` at
     /// construction, same pattern as `sourceLanguageMode`/`audioSource`.
-    private(set) var conversationMode: ConversationMode
+    private(set) var conversationProfile: ConversationProfile
     /// The user's STT provider preference — see `TranscriptionProviderMode`'s
     /// own doc comment. `private(set)`, changed only through
     /// `setTranscriptionProviderMode(_:)`. Loaded from `defaults` at
     /// construction, same pattern as `sourceLanguageMode`/`audioSource`/
-    /// `conversationMode`. Read live by `TranscriptionProviderRouter` (via
+    /// `conversationProfile`. Read live by `TranscriptionProviderRouter` (via
     /// the `mode:` closure `EvenAIApp` wires it up with) every time a
     /// session starts — this property is the single source of truth the
     /// router consults, so persisting it here (not duplicating it inside
@@ -490,6 +490,13 @@ final class LiveTranslationService {
     // `ConversationSessionMetrics`.
     private var audioFirstByteAt: Date?
     private var lastAudioChunkAt: Date?
+    /// AI Conversation consolidation pass — performance-target tracing
+    /// (§20): `AI_CONVERSATION_FIRST_PARTIAL`/`AI_CONVERSATION_FIRST_TRANSLATION`
+    /// each fire exactly once per session, the first time a partial
+    /// transcript/translation appears — reset in `start()`, same pattern
+    /// as `audioFirstByteAt`'s own "first of this session" tracking.
+    private var hasLoggedFirstPartialThisSession = false
+    private var hasLoggedFirstTranslationThisSession = false
     /// Exponential moving average of "normal" (non-anomalous) inter-
     /// chunk gaps, in milliseconds — the adaptive baseline
     /// `recordAudioChunk(_:)` compares each new gap against. `nil` until
@@ -538,7 +545,7 @@ final class LiveTranslationService {
     /// synced/shared conversation data).
     private static let sourceLanguageModeDefaultsKey = "com.evenai.liveTranslation.sourceLanguageMode"
     private static let audioSourceDefaultsKey = "com.evenai.liveTranslation.audioSource"
-    private static let conversationModeDefaultsKey = "com.evenai.liveTranslation.conversationMode"
+    private static let conversationProfileDefaultsKey = "com.evenai.liveTranslation.conversationProfile"
     private static let transcriptionProviderModeDefaultsKey = "com.evenai.liveTranslation.transcriptionProviderMode"
 
     init(
@@ -575,11 +582,22 @@ final class LiveTranslationService {
         } else {
             self.audioSource = .g2Mic
         }
-        if let saved = defaults.string(forKey: Self.conversationModeDefaultsKey),
-           let savedMode = ConversationMode(rawValue: saved) {
-            self.conversationMode = savedMode
+        if let saved = defaults.string(forKey: Self.conversationProfileDefaultsKey),
+           let savedMode = ConversationProfile(rawValue: saved) {
+            self.conversationProfile = savedMode
         } else {
-            self.conversationMode = .standard
+            // Deliberately `.conversation`, NOT `.auto`, as the actual
+            // default: this is the exact, already-proven behavior every
+            // existing test/physical-device session already exercises
+            // (immediate reply-merge display — see `GlassesPresentationLayer
+            // .pages(for:)`). `.auto` is offered FIRST in the picker (see
+            // `ConversationProfile`'s own declaration order) as the
+            // recommended choice for a new/normal user, but a silent
+            // change to the app's actual default behavior is exactly the
+            // kind of regression risk "preserve proven code" exists to
+            // avoid — a user (or test) that never touches this setting
+            // keeps getting precisely what already worked.
+            self.conversationProfile = .conversation
         }
         if let saved = defaults.string(forKey: Self.transcriptionProviderModeDefaultsKey),
            let savedMode = TranscriptionProviderMode(rawValue: saved) {
@@ -590,16 +608,16 @@ final class LiveTranslationService {
         observeConnection()
     }
 
-    /// The one way `conversationMode` ever changes — persists
+    /// The one way `conversationProfile` ever changes — persists
     /// immediately (survives app relaunch). Takes effect on the NEXT
     /// reply (mid-turn is not retroactively affected — a reply already
     /// displayed doesn't un-display itself), which is an acceptable,
     /// simple semantic for a preset switch a user makes deliberately
     /// between conversations, not mid-sentence.
-    func setConversationMode(_ mode: ConversationMode) {
-        guard mode != conversationMode else { return }
-        conversationMode = mode
-        defaults.set(mode.rawValue, forKey: Self.conversationModeDefaultsKey)
+    func setConversationProfile(_ mode: ConversationProfile) {
+        guard mode != conversationProfile else { return }
+        conversationProfile = mode
+        defaults.set(mode.rawValue, forKey: Self.conversationProfileDefaultsKey)
         DiagnosticTrace.log("CONVERSATION_MODE_SELECTED", "mode=\(mode.rawValue)")
     }
 
@@ -732,12 +750,84 @@ final class LiveTranslationService {
         sourceLanguageMode.explicitLanguageCode ?? autoLockedLanguage
     }
 
+    /// AI Conversation consolidation pass — Auto profile's presentation
+    /// heuristic. `.conversation`/`.meeting` always return themselves
+    /// unconditionally; this only does real work when `conversationProfile
+    /// == .auto`, resolving to whichever of THOSE TWO profiles'
+    /// presentation behavior (see the reply-display branch in
+    /// `generateSuggestedReplies`) currently fits the recent conversation
+    /// better. Deliberately NOT speaker diarization, sentiment, or
+    /// anything requiring a model — only simple, honest evidence already
+    /// sitting in `agentContextStore.session.turns`:
+    ///
+    /// - A direct question as the latest turn always resolves to
+    ///   `.conversation` — surfacing a prompt reply matters most exactly
+    ///   when the user has just been asked something.
+    /// - Otherwise, recent cadence (average gap between the last several
+    ///   turns) and recent utterance length (average word count) vote
+    ///   together: frequent, short exchanges look like `.conversation`
+    ///   (1-to-1 back-and-forth); slower cadence or longer utterances
+    ///   look like `.meeting` (a monologue or group discussion, where the
+    ///   transcript should stay dominant and replies shouldn't crowd it).
+    /// - Fewer than 2 recent turns is insufficient evidence either way —
+    ///   resolves to `.conversation`, matching `conversationProfile`'s own
+    ///   proven, simpler default (see its own `init` doc comment).
+    ///
+    /// Recomputed fresh on every call (cheap — a handful of array
+    /// operations over an already-bounded recent window) rather than
+    /// cached, so it always reflects the CURRENT state of the
+    /// conversation, not a snapshot from whenever `.auto` was selected.
+    var effectiveDisplayProfile: ConversationProfile {
+        switch conversationProfile {
+        case .conversation, .meeting:
+            return conversationProfile
+        case .auto:
+            return Self.autoHeuristicDisplayProfile(recentTurns: agentContextStore.session.turns.suffix(6))
+        }
+    }
+
+    /// `static`/pure (no `self` access beyond the passed-in turns) so this
+    /// exact heuristic is directly unit-testable without needing a full
+    /// `AIConversationEngine` instance — see `AutoProfileHeuristicTests`.
+    static func autoHeuristicDisplayProfile(recentTurns: some BidirectionalCollection<ConversationTurn>) -> ConversationProfile {
+        guard recentTurns.count >= 2 else { return .conversation }
+
+        if let latest = recentTurns.last, Self.looksLikeDirectQuestion(latest.originalText) {
+            return .conversation
+        }
+
+        let timestamps = recentTurns.map(\.timestamp)
+        let gaps = zip(timestamps, timestamps.dropFirst()).map { $1.timeIntervalSince($0) }
+        let averageGapSeconds = gaps.isEmpty ? 0 : gaps.reduce(0, +) / Double(gaps.count)
+        let averageWordCount = recentTurns
+            .map { $0.originalText.split(separator: " ").count }
+            .reduce(0, +) / recentTurns.count
+
+        // Both a fast cadence AND short utterances → clearly a quick
+        // back-and-forth. Either a slow cadence OR long utterances →
+        // leans toward a monologue/group discussion. A mixed signal
+        // (e.g. fast cadence but long utterances) defaults to
+        // `.conversation` — the simpler, more reply-forward behavior,
+        // consistent with never overcomplicating this heuristic.
+        if averageGapSeconds >= Self.autoMeetingCadenceThresholdSeconds || averageWordCount >= Self.autoMeetingWordCountThreshold {
+            return .meeting
+        }
+        return .conversation
+    }
+
+    private static let autoMeetingCadenceThresholdSeconds: Double = 6
+    private static let autoMeetingWordCountThreshold = 14
+
+    private static func looksLikeDirectQuestion(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
+    }
+
     /// Enables the G2 microphone and starts the continuous transcribe →
     /// detect → translate → display loop. Safe to call again while already
     /// `.listening` (no-op).
     func start() async {
         guard state != .listening else { return }
-        DiagnosticTrace.log("LIVE_START_REQUESTED", "audioSource=\(audioSource.rawValue) conversationMode=\(conversationMode.rawValue)")
+        DiagnosticTrace.log("LIVE_START_REQUESTED", "audioSource=\(audioSource.rawValue) conversationProfile=\(conversationProfile.rawValue)")
         isEnabledIntent = true
         lastRecognizedPhrase = nil
         // A stale "Cloud unavailable, using on-device" notice from a
@@ -761,6 +851,8 @@ final class LiveTranslationService {
         audioFirstByteAt = nil
         lastAudioChunkAt = nil
         audioExpectedIntervalMs = nil
+        hasLoggedFirstPartialThisSession = false
+        hasLoggedFirstTranslationThisSession = false
         resetUtteranceState()
         observeNavigation()
 
@@ -860,7 +952,7 @@ final class LiveTranslationService {
                 + "errorMessage=\(error.map { "\($0)" } ?? "nil") "
                 + "sttConnected=\(wasListening) "
                 + "audioSource=\(audioSource.rawValue) "
-                + "conversationMode=\(conversationMode.rawValue) "
+                + "conversationProfile=\(conversationProfile.rawValue) "
                 + "lastTurnID=\(agentContextStore.session.latestTurn?.id.uuidString ?? "nil") "
                 + "finalTranscriptCount=\(sessionMetrics.finalTranscriptCount) "
                 + "sttReconnectCount=\(reconnects)"
@@ -975,6 +1067,7 @@ final class LiveTranslationService {
         if audioFirstByteAt == nil {
             audioFirstByteAt = now
             DiagnosticTrace.log("AUDIO_FIRST_BYTE_TS", "value=\(now.timeIntervalSince1970)")
+            DiagnosticTrace.log("AI_CONVERSATION_AUDIO_FIRST_BYTE", "value=\(now.timeIntervalSince1970)")
         }
         defer { lastAudioChunkAt = now }
         guard let last = lastAudioChunkAt else { return }
@@ -1174,7 +1267,7 @@ final class LiveTranslationService {
     /// `followLive` — the shared implementation behind both G2's own
     /// double-tap gesture (`GlassesNavigationEvent.returnToLiveRequested`)
     /// and an equivalent "↓ LIVE" control the iPhone-side UI can offer
-    /// (`LiveTranslationView`). Safe to call even when already following
+    /// (`AIConversationView`). Safe to call even when already following
     /// live (redisplays the freshest content regardless — a harmless,
     /// idempotent refresh).
     func returnToLive() async {
@@ -1419,6 +1512,7 @@ final class LiveTranslationService {
             ukrainianTranslation: nil
         )
         DiagnosticTrace.log("TURN_RECEIVED", "id=\(turn.id) text=\"\(text.prefix(60))\" language=\(languageCode)")
+        DiagnosticTrace.log("AI_CONVERSATION_FINAL", "turnID=\(turn.id) text=\"\(text.prefix(60))\" language=\(languageCode)")
         DiagnosticTrace.log("FINAL_TRANSCRIPT_RECEIVED", "turnID=\(turn.id) text=\"\(text.prefix(60))\"")
         sessionMetrics.finalTranscriptCount += 1
         DiagnosticTrace.log("FINAL_TRANSCRIPT_COUNT", "value=\(sessionMetrics.finalTranscriptCount)")
@@ -1502,6 +1596,11 @@ final class LiveTranslationService {
     private func handlePartial(_ rawText: String) {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text != currentPartialTranscript else { return }
+
+        if !hasLoggedFirstPartialThisSession {
+            hasLoggedFirstPartialThisSession = true
+            DiagnosticTrace.log("AI_CONVERSATION_FIRST_PARTIAL", "value=\(Date().timeIntervalSince1970)")
+        }
 
         let now = Date()
         if utteranceID == nil {
@@ -1788,6 +1887,10 @@ final class LiveTranslationService {
 
         lastTranslation = displayText
         DiagnosticTrace.log("REAL_TURN_TRACE", "TRANSLATION original=\"\(text.prefix(60))\" lang=\(languageCode) translation=\"\(displayText.prefix(60))\"")
+        if !hasLoggedFirstTranslationThisSession {
+            hasLoggedFirstTranslationThisSession = true
+            DiagnosticTrace.log("AI_CONVERSATION_FIRST_TRANSLATION", "turnID=\(turnID) value=\(Date().timeIntervalSince1970)")
+        }
 
         var translatedTurn = turn
         translatedTurn.ukrainianTranslation = displayText
@@ -1888,6 +1991,7 @@ final class LiveTranslationService {
             DiagnosticTrace.log("POST_STT_TRACE", "DISPLAY_REQUEST turnID=\(turnID)")
             try await glassesTransport.displayPages(translationPages)
             currentTurnDisplayState = .translated(turnID: turnID)
+            DiagnosticTrace.log("AI_CONVERSATION_DISPLAY", "turnID=\(turnID) value=\(Date().timeIntervalSince1970)")
             DiagnosticTrace.log("REAL_TURN_TRACE", "DISPLAY_DONE stage=translationOnly turnID=\(turnID)")
             DiagnosticTrace.log("DISPLAY_END", "id=\(turnID)")
             DiagnosticTrace.log("TURN_TRANSLATION_DISPLAYED", "turnID=\(turnID)")
@@ -2068,6 +2172,7 @@ final class LiveTranslationService {
         DiagnosticTrace.log("POST_STT_TRACE", "SUGGESTED_REPLIES_START turnID=\(turnID)")
         DiagnosticTrace.log("SUGGESTED_REPLIES_START", "turnID=\(turnID)")
         DiagnosticTrace.log("REPLIES_TASK_START", "id=\(turnID)")
+        DiagnosticTrace.log("AI_CONVERSATION_REPLY_START", "turnID=\(turnID) value=\(Date().timeIntervalSince1970)")
         let repliesStart = Date()
         DiagnosticTrace.log("LATENCY_TRACE", "REPLIES_START id=\(turnID)")
         DiagnosticTrace.log("LATENCY_TRACE", "REPLIES_REQUEST_START_TS id=\(turnID) value=\(repliesStart.timeIntervalSince1970)")
@@ -2093,15 +2198,18 @@ final class LiveTranslationService {
             DiagnosticTrace.log("LATENCY_TRACE", "REPLIES_GENERATION_LATENCY_MS id=\(turnID) value=\(repliesLatencyMs)")
             DiagnosticTrace.log("REPLIES_TASK_END", "id=\(turnID)")
             DiagnosticTrace.log("REPLIES_GENERATION_FINISHED", "turnID=\(turnID) count=\(replies.count)")
+            DiagnosticTrace.log("AI_CONVERSATION_REPLY_RESULT", "turnID=\(turnID) outcome=success count=\(replies.count)")
         } catch is CancellationError {
             DiagnosticTrace.log("REPLIES_TASK_CANCELLED", "id=\(turnID)")
             DiagnosticTrace.log("REPLIES_GENERATION_FINISHED", "turnID=\(turnID) reason=cancelled")
+            DiagnosticTrace.log("AI_CONVERSATION_REPLY_RESULT", "turnID=\(turnID) outcome=cancelled")
             DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=repliesCancelled")
             return
         } catch is RepliesTimeoutError {
             DiagnosticTrace.log("REPLIES_TASK_TIMEOUT", "id=\(turnID)")
             DiagnosticTrace.log("LIVE_TRACE", "suggested-reply generation timed out for turnID=\(turnID)")
             DiagnosticTrace.log("REPLIES_GENERATION_FINISHED", "turnID=\(turnID) reason=timeout")
+            DiagnosticTrace.log("AI_CONVERSATION_REPLY_RESULT", "turnID=\(turnID) outcome=timeout")
             DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=repliesTimeout")
             return
         } catch let unavailable as LocalReplyUnavailableError {
@@ -2114,6 +2222,7 @@ final class LiveTranslationService {
             repliesUnavailableReason = unavailable.userFacingMessage
             DiagnosticTrace.log("REPLIES_LOCAL_PROVIDER_UNAVAILABLE", "turnID=\(turnID) reason=\(unavailable.reason)")
             DiagnosticTrace.log("REPLIES_GENERATION_FINISHED", "turnID=\(turnID) reason=localUnavailable")
+            DiagnosticTrace.log("AI_CONVERSATION_REPLY_RESULT", "turnID=\(turnID) outcome=localUnavailable reason=\(unavailable.reason)")
             DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=repliesLocalUnavailable")
             return
         } catch {
@@ -2122,6 +2231,7 @@ final class LiveTranslationService {
             DiagnosticTrace.log("POST_STT_TRACE", "SUGGESTED_REPLIES_RESULT turnID=\(turnID) error type=\(type(of: error)) message=\(error)")
             DiagnosticTrace.log("SUGGESTED_REPLIES_RESULT", "turnID=\(turnID) error type=\(type(of: error)) message=\(error)")
             DiagnosticTrace.log("REPLIES_GENERATION_FINISHED", "turnID=\(turnID) reason=error")
+            DiagnosticTrace.log("AI_CONVERSATION_REPLY_RESULT", "turnID=\(turnID) outcome=error errorType=\(type(of: error))")
             DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=repliesFailed")
             return
         }
@@ -2190,13 +2300,17 @@ final class LiveTranslationService {
         // `meetingConversationPages(for:previousTurn:)` keeps page 0 as
         // the plain header/transcript (identical to what's already on
         // screen), with reply pages appended afterward as additional,
-        // swipeable — but not auto-shown — content. Standard Mode is
-        // unchanged: `conversationPages(for:previousTurn:)` merges the
+        // swipeable — but not auto-shown — content. Conversation profile
+        // is unchanged: `conversationPages(for:previousTurn:)` merges the
         // first reply directly onto page 0, so it's shown immediately.
-        let replyPages = conversationMode == .meeting
+        // Auto resolves to whichever of the two `effectiveDisplayProfile`
+        // decided fits the recent conversation right now (see that
+        // property's own doc comment) — the SAME two page builders either
+        // way; Auto never invents a third display shape.
+        let replyPages = effectiveDisplayProfile == .meeting
             ? GlassesPresentationLayer.meetingConversationPages(for: updatedTurn, previousTurn: previousTurn(before: turnID))
             : GlassesPresentationLayer.conversationPages(for: updatedTurn, previousTurn: previousTurn(before: turnID))
-        DiagnosticTrace.log("REAL_TURN_TRACE", "PAGES stage=withReplies turnID=\(turnID) count=\(replyPages.count) mode=\(conversationMode.rawValue)")
+        DiagnosticTrace.log("REAL_TURN_TRACE", "PAGES stage=withReplies turnID=\(turnID) count=\(replyPages.count) mode=\(conversationProfile.rawValue)")
         DiagnosticTrace.log("SUGGESTED_REPLIES_PAGES_CREATED", "id=\(turnID) count=\(replyPages.count)")
         let replyDisplayStart = Date()
         // Conversation Mode: never overwrite what the user is manually

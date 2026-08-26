@@ -16,14 +16,14 @@ import Foundation
 /// every call — churning the ONE session Live Translation and Chat
 /// share.
 ///
-/// These tests prove: (a) `LiveTranslationService.start()` now reports
+/// These tests prove: (a) `AIConversationEngine.start()` now reports
 /// the TRUTHFUL cause of a startup failure — `LiveTranslationStartError`
 /// — never collapsing an auth/backend/STT failure into a false G2
 /// message, and a genuine G2/microphone failure is still correctly
 /// reported as such; (b) a startup failure never leaves the session in a
 /// half-started state.
 @MainActor
-@Suite("LiveTranslationService — startup failure classification")
+@Suite("AIConversationEngine — startup failure classification")
 struct LiveTranslationStartClassificationTests {
     private func freshDefaults() -> UserDefaults {
         UserDefaults(suiteName: "LiveTranslationStartClassificationTests.\(UUID().uuidString)")!
@@ -33,7 +33,7 @@ struct LiveTranslationStartClassificationTests {
 
     @Test("1: connected G2 + a transcriber that starts cleanly → session reaches .listening")
     func connectedG2WithHealthyTranscriberStarts() async throws {
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: [], autoFinish: false),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -54,11 +54,11 @@ struct LiveTranslationStartClassificationTests {
         // credential gets attached, and the backend's own
         // `wsServer.test.js` ("accepts a valid access token...") proves
         // that credential is accepted end-to-end. This test proves the
-        // `LiveTranslationService` level of the same contract: starting
+        // `AIConversationEngine` level of the same contract: starting
         // with NO prior session at all (the anonymous-device path) never
         // itself produces a `LiveTranslationStartError` for a healthy
         // transcriber.
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: [], autoFinish: false),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -72,7 +72,7 @@ struct LiveTranslationStartClassificationTests {
 
     @Test("3: a session-recovery/authentication failure during STT startup reports an auth error, never a G2 error")
     func authFailureDuringStartupReportsAuthError() async throws {
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ThrowingStartContinuousTranscriber(error: AuthenticatedAPIClientError.notAuthenticated),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -92,7 +92,7 @@ struct LiveTranslationStartClassificationTests {
 
     @Test("4: a backend-unavailable failure during STT startup reports a backend error, never a G2 error")
     func backendFailureDuringStartupReportsBackendError() async throws {
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ThrowingStartContinuousTranscriber(error: AuthenticatedAPIClientError.offline),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -110,7 +110,7 @@ struct LiveTranslationStartClassificationTests {
 
     @Test("4b: an async STT handshake failure (after startTranscribing already returned, before any update arrived) reports the SAME truthful classification, not the generic 'stopped unexpectedly' message")
     func asyncHandshakeFailureReportsTruthfulClassification() async throws {
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: HandshakeFailingContinuousTranscriber(error: URLError(.cannotConnectToHost)),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -132,7 +132,7 @@ struct LiveTranslationStartClassificationTests {
 
     @Test("5: an actual G2 connection failure (G2 mic selected) reports a G2 error")
     func g2FailureDuringStartupReportsG2Error() async throws {
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: PairFailureGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -152,7 +152,7 @@ struct LiveTranslationStartClassificationTests {
 
     @Test("6: a microphone-enable failure while AudioSource.phoneMic is selected reports a microphone error, never a G2 error")
     func phoneMicFailureDuringStartupReportsMicrophoneError() async throws {
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: PairFailureGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -173,7 +173,7 @@ struct LiveTranslationStartClassificationTests {
 
     @Test("7: a handshake that never confirms (fails before any update ever arrives) is never reported as a successful start")
     func unconfirmedHandshakeIsNeverReportedAsSuccess() async throws {
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: HandshakeFailingContinuousTranscriber(error: AuthenticatedAPIClientError.sessionExpired),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -198,7 +198,7 @@ struct LiveTranslationStartClassificationTests {
     @Test("8: a startup failure fully tears down — mic disabled, no half-started state left behind")
     func startupFailureDoesNotLeaveHalfStartedState() async throws {
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ThrowingStartContinuousTranscriber(error: AuthenticatedAPIClientError.notAuthenticated),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -219,7 +219,7 @@ struct LiveTranslationStartClassificationTests {
         // session would otherwise wedge every later attempt too.
         let transcriber = ManualContinuousTranscriber()
         let store = AgentContextStore()
-        let recoveredService = LiveTranslationService(
+        let recoveredService = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: ["hello": "en"], translation: "привіт"),

@@ -2,10 +2,10 @@ import Foundation
 import Observation
 
 /// The app-level owner of the ONE shared `AgentContextSession` — mirrors
-/// `AppState`/`AuthState`/`LiveTranslationService`: stateful, observable,
+/// `AppState`/`AuthState`/`AIConversationEngine`: stateful, observable,
 /// app-lifetime state constructed once in `EvenAIApp` and shared *by
 /// identity*, not just by value, with every consumer that needs to read
-/// or extend it. `LiveTranslationService` is the first such consumer
+/// or extend it. `AIConversationEngine` is the first such consumer
 /// (Milestone 2) — Chat mirroring and any other reader are later,
 /// unscoped work.
 ///
@@ -27,7 +27,7 @@ final class AgentContextStore {
     }
 
     /// Appends a turn to the shared session — the one mutation
-    /// `LiveTranslationService` needs for Milestone 2.
+    /// `AIConversationEngine` needs for Milestone 2.
     func appendTurn(_ turn: ConversationTurn) {
         session.append(turn)
     }

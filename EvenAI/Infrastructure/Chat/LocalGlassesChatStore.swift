@@ -10,7 +10,7 @@ import SwiftData
 /// fallback at all. With Railway offline, `findOrCreateGlassesChat()`
 /// threw, `ChatListView.openGlassesChat()` caught it and silently did
 /// nothing, and every Live Translation turn's Chat-append `Task` in
-/// `LiveTranslationService.processTurn` failed and was permanently lost —
+/// `AIConversationEngine.processTurn` failed and was permanently lost —
 /// not even written to disk, since the write-through cache only mirrors a
 /// SUCCESSFUL network write.
 ///

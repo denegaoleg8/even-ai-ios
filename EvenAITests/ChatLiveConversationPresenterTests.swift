@@ -3,8 +3,8 @@ import Testing
 @testable import EvenAI
 
 /// Pure tests for what `ChatView`'s live-conversation section shows —
-/// no SwiftUI hosting, no `LiveTranslationService`. Complements
-/// `LiveTranslationServiceAgentContextTests` (which proves turns are
+/// no SwiftUI hosting, no `AIConversationEngine`. Complements
+/// `AIConversationEngineAgentContextTests` (which proves turns are
 /// recorded correctly) by proving Chat's own presentation of those turns
 /// is correct: latest-first prominence, older turns newest-first, and
 /// zero turns when the session is empty.

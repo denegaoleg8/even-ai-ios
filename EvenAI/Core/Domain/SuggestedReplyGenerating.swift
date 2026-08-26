@@ -38,7 +38,7 @@ protocol SuggestedReplyGenerating: Sendable {
     /// policy with whoever produces/acts on turns rather than duplicating
     /// the check at every layer.
     ///
-    /// Throws on failure. Callers (see `LiveTranslationService`) must
+    /// Throws on failure. Callers (see `AIConversationEngine`) must
     /// treat a thrown error as "no replies this time" — the turn's own
     /// translation must remain visible regardless, per the product
     /// requirement that a reply-generation failure never hides it.

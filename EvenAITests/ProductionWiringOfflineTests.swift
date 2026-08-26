@@ -134,7 +134,7 @@ struct ProductionWiringOfflineTests {
         #expect(requests.isEmpty, "auto mode's local attempt made \(requests.count) network request(s): \(requests.map { $0.url?.path ?? "?" })")
     }
 
-    /// The full real production graph — `LiveTranslationService` wired
+    /// The full real production graph — `AIConversationEngine` wired
     /// with the real `TranscriptionProviderRouter` (real
     /// `OpenAIRealtimeTranscriber`/`AuthenticatedAPIClient` as `cloud`,
     /// never reached in `.onDevice` mode), real `GlassesChatProvider` +
@@ -168,7 +168,7 @@ struct ProductionWiringOfflineTests {
         )
         let chatStore = freshGlassesChatStore()
         let glassesChatProvider = GlassesChatProvider(localStore: chatStore, defaults: freshDefaults())
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: router,
             translator: ScriptedLanguageTranslator(
@@ -230,7 +230,7 @@ struct ProductionWiringOfflineTests {
         )
         let chatStore = freshGlassesChatStore()
         let glassesChatProvider = GlassesChatProvider(localStore: chatStore, defaults: freshDefaults())
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: router,
             translator: ScriptedLanguageTranslator(
@@ -240,9 +240,9 @@ struct ProductionWiringOfflineTests {
             agentContextStore: store,
             replyGenerator: NetworkSuggestedReplyGenerator(apiClient: apiClient),
             glassesChatProvider: glassesChatProvider,
-            defaults: freshDefaults() // isolated — setConversationMode below must never leak into UserDefaults.standard
+            defaults: freshDefaults() // isolated — setConversationProfile below must never leak into UserDefaults.standard
         )
-        service.setConversationMode(.meeting)
+        service.setConversationProfile(.meeting)
 
         await service.start()
         try? await Task.sleep(for: .milliseconds(300))

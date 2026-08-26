@@ -108,7 +108,7 @@ final class GlassesChatProvider {
     /// Glasses Chat message, local-first exactly like `appendTurn(originalText:translation:)`
     /// — no network, never blocked by Railway being offline. A separate
     /// message (appended immediately after the turn's own, since reply
-    /// generation always finishes later — see `LiveTranslationService
+    /// generation always finishes later — see `AIConversationEngine
     /// .generateSuggestedReplies`) rather than an edit to the original
     /// one: SwiftData writes here are simple inserts, never updates, and
     /// a chat log reading as an ordered sequence of atomic entries (turn,

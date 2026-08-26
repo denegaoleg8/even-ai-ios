@@ -16,15 +16,15 @@ private func freshGlassesChatStore() -> LocalGlassesChatStore {
 
 /// Ambient G2-mic translation — the only Voice feature ("Dictate to Chat"
 /// was removed) — app-level, not owned by any screen (see
-/// `LiveTranslationService`'s doc comment). These tests exercise its
+/// `AIConversationEngine`'s doc comment). These tests exercise its
 /// decision pipeline (dedupe, empty/uncertain/Ukrainian filtering,
 /// translation dispatch, cleanup) and its app-level lifecycle (surviving
 /// construction independent of any view, stopping only on an explicit
 /// `stop()` or connection loss — never on navigation or `scenePhase`)
 /// entirely through fakes — no real `Speech`/`Translation`/PCM involved.
 @MainActor
-@Suite("LiveTranslationService")
-struct LiveTranslationServiceTests {
+@Suite("AIConversationEngine")
+struct AIConversationEngineTests {
     // Widened from 30ms: this suite now has ~30 tests, several running
     // real (fake-backed) async work concurrently under Swift Testing's
     // parallel scheduler — a 30ms budget was intermittently too tight
@@ -38,7 +38,7 @@ struct LiveTranslationServiceTests {
     @Test("a foreign-language final phrase is translated and sent to the glasses")
     func foreignPhraseIsTranslatedAndSent() async throws {
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт")
@@ -57,7 +57,7 @@ struct LiveTranslationServiceTests {
     @Test("Ukrainian speech is never translated or displayed")
     func ukrainianSpeechIsIgnored() async throws {
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["привіт, як справи"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["привіт, як справи": "uk"])
@@ -72,7 +72,7 @@ struct LiveTranslationServiceTests {
     @Test("uncertain language detection displays nothing rather than a guess")
     func uncertainDetectionDisplaysNothing() async throws {
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["mmm uh"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["mmm uh": nil])
@@ -87,7 +87,7 @@ struct LiveTranslationServiceTests {
     @Test("a duplicate final transcript is not translated or sent twice")
     func duplicateFinalTranscriptIsIgnored() async throws {
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["hello", "hello"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["hello": "en"], translation: "привіт")
@@ -105,7 +105,7 @@ struct LiveTranslationServiceTests {
     func translationFailureLeavesSessionAlive() async throws {
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag", "hello there"], autoFinish: false),
             translator: ThrowingLanguageTranslator(failingTexts: ["Guten Tag"], translation: "привіт"),
@@ -130,7 +130,7 @@ struct LiveTranslationServiceTests {
     /// block forever if the on-device `Translation` framework needs to
     /// present its own system UI at a moment another `.sheet` is already
     /// covering the view that hosts its `TranslationSession` — see
-    /// `LiveTranslationService.translateWithTimeout`'s doc comment. Before
+    /// `AIConversationEngine.translateWithTimeout`'s doc comment. Before
     /// the timeout existed, a stuck translation call would silently wedge
     /// `consume(_:)`'s sequential loop forever — every phrase after the
     /// stuck one would simply never be processed, with no error, no
@@ -139,7 +139,7 @@ struct LiveTranslationServiceTests {
     func translationTimeoutLeavesSessionAlive() async throws {
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag", "hello there"], autoFinish: false),
             translator: HangingLanguageTranslator(
@@ -165,7 +165,7 @@ struct LiveTranslationServiceTests {
     @Test("an empty (or whitespace-only) final transcript is ignored")
     func emptyFinalTranscriptIsIgnored() async throws {
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["   ", ""]),
             translator: ScriptedLanguageTranslator(languageCodes: [:])
@@ -180,7 +180,7 @@ struct LiveTranslationServiceTests {
     @Test("a recognized final phrase and its translation are exposed as observable state, for Chat to read")
     func recognizedPhraseAndTranslationAreObservable() async throws {
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт")
@@ -197,7 +197,7 @@ struct LiveTranslationServiceTests {
     func stopCleansUpMicrophoneAndRecognitionState() async throws {
         let spy = SpyGlassesTransport()
         let transcriber = ScriptedContinuousTranscriber(finals: [])
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: [:])
@@ -214,7 +214,7 @@ struct LiveTranslationServiceTests {
 
     @Test("a failure enabling the microphone surfaces a visible error, never a silent no-op")
     func microphoneFailureSurfacesError() async {
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: PairFailureGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:])
@@ -232,7 +232,7 @@ struct LiveTranslationServiceTests {
     func connectionLossStopsListening() async throws {
         let transport = ControllableGlassesTransport(initialState: .connected)
         let transcriber = ScriptedContinuousTranscriber(finals: [], autoFinish: false)
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: transport,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: [:])
@@ -253,7 +253,7 @@ struct LiveTranslationServiceTests {
     @Test("a connection change before Live Translation was ever started is a no-op")
     func connectionChangeBeforeStartIsIgnored() async throws {
         let transport = ControllableGlassesTransport(initialState: .connected)
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: transport,
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:])
@@ -268,7 +268,7 @@ struct LiveTranslationServiceTests {
     }
 
     /// Regression guard for the earlier foreground-only design:
-    /// `LiveTranslationService` has no `scenePhase`-reactive method at all
+    /// `AIConversationEngine` has no `scenePhase`-reactive method at all
     /// (`handleScenePhaseChange` was removed along with `RootView`'s
     /// `.onChange(of: scenePhase)` wiring) — there is no external signal
     /// for navigation or backgrounding to send it, so listening simply
@@ -280,7 +280,7 @@ struct LiveTranslationServiceTests {
     func keepsListeningWithNoExternalStopSignal() async throws {
         let spy = SpyGlassesTransport()
         let transcriber = ScriptedContinuousTranscriber(finals: [], autoFinish: false)
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: [:])
@@ -320,7 +320,7 @@ struct LiveTranslationServiceTests {
     )
     func shortValidUtterancesAreAccepted(word: String) async throws {
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: [word]),
             translator: ScriptedLanguageTranslator(languageCodes: [word: "en"], translation: "переклад")
@@ -337,7 +337,7 @@ struct LiveTranslationServiceTests {
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: ["hello": "en"], translation: "привіт"),
@@ -370,7 +370,7 @@ struct LiveTranslationServiceTests {
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: ["hello": "en"], translation: "привіт"),
@@ -395,7 +395,7 @@ struct LiveTranslationServiceTests {
         let spy = SpyGlassesTransport()
         let store = freshGlassesChatStore()
         let provider = GlassesChatProvider(localStore: store, defaults: UserDefaults(suiteName: "test.\(UUID().uuidString)")!)
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт"),
@@ -416,7 +416,7 @@ struct LiveTranslationServiceTests {
     @Test("when no ChatServicing/GlassesChatProvider is configured, Live Translation still works normally — Chat persistence is simply skipped")
     func noChatServiceConfiguredIsHarmless() async throws {
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт")
@@ -444,7 +444,7 @@ struct LiveTranslationServiceTests {
         let generator = GatedSuggestedReplyGenerator(repliesByOriginalText: [
             "phrase A": [SuggestedReply(originalLanguageText: "A-reply", ukrainianText: "А-відповідь", ordering: 0)],
         ])
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["phrase A", "phrase B"]),
             translator: ScriptedLanguageTranslator(
@@ -481,7 +481,7 @@ struct LiveTranslationServiceTests {
         let spy = SpyGlassesTransport()
         let store = freshGlassesChatStore()
         let provider = GlassesChatProvider(localStore: store, defaults: UserDefaults(suiteName: "test.\(UUID().uuidString)")!)
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["phrase A", "phrase B"]),
             translator: ScriptedLanguageTranslator(
@@ -510,13 +510,13 @@ struct LiveTranslationServiceTests {
     /// test in this file (including ones that never touch language mode
     /// at all and assume the `.auto` default).
     private func freshDefaults() -> UserDefaults {
-        UserDefaults(suiteName: "LiveTranslationServiceTests.\(UUID().uuidString)")!
+        UserDefaults(suiteName: "AIConversationEngineTests.\(UUID().uuidString)")!
     }
 
     @Test("explicit English mode bypasses auto language detection entirely — a translator that can never detect anything still succeeds")
     func explicitEnglishBypassesDetection() async throws {
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["some phrase"]),
             translator: ScriptedLanguageTranslator(languageCodes: [:], translation: "переклад"),
@@ -533,7 +533,7 @@ struct LiveTranslationServiceTests {
     @Test("explicit German mode bypasses auto language detection entirely — a translator that can never detect anything still succeeds")
     func explicitGermanBypassesDetection() async throws {
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["ein Satz"]),
             translator: ScriptedLanguageTranslator(languageCodes: [:], translation: "переклад"),
@@ -550,7 +550,7 @@ struct LiveTranslationServiceTests {
     @Test("explicit Polish mode bypasses auto language detection entirely — a translator that can never detect anything still succeeds")
     func explicitPolishBypassesDetection() async throws {
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["jakieś zdanie"]),
             translator: ScriptedLanguageTranslator(languageCodes: [:], translation: "переклад"),
@@ -564,10 +564,10 @@ struct LiveTranslationServiceTests {
         #expect(await spy.displayedPageSets == [["jakieś zdanie\n\nUA: переклад"]])
     }
 
-    @Test("the selected source language mode persists across LiveTranslationService instances, simulating an app relaunch")
+    @Test("the selected source language mode persists across AIConversationEngine instances, simulating an app relaunch")
     func sourceLanguageModePersists() async throws {
         let defaults = freshDefaults()
-        let service1 = LiveTranslationService(
+        let service1 = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -577,9 +577,9 @@ struct LiveTranslationServiceTests {
         service1.setSourceLanguageMode(.de)
 
         // A fresh instance reading the SAME defaults — stands in for the
-        // app relaunching, since LiveTranslationService is constructed
+        // app relaunching, since AIConversationEngine is constructed
         // once at app level in production.
-        let service2 = LiveTranslationService(
+        let service2 = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -593,7 +593,7 @@ struct LiveTranslationServiceTests {
     @Test("Auto detects and locks English from the first confidently-detected utterance")
     func autoLocksEnglish() async throws {
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "переклад"),
@@ -610,7 +610,7 @@ struct LiveTranslationServiceTests {
     @Test("Auto detects and locks German from the first confidently-detected utterance")
     func autoLocksGerman() async throws {
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "переклад"),
@@ -627,7 +627,7 @@ struct LiveTranslationServiceTests {
     @Test("Auto detects and locks Polish from the first confidently-detected utterance")
     func autoLocksPolish() async throws {
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["Dzień dobry"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Dzień dobry": "pl"], translation: "переклад"),
@@ -650,7 +650,7 @@ struct LiveTranslationServiceTests {
     @Test("Auto reuses the locked language for a short ambiguous phrase, even when detection alone would disagree")
     func autoReusesLockForShortAmbiguousPhraseDespiteConflictingDetection() async throws {
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag", "okay"], autoFinish: false),
             translator: ScriptedLanguageTranslator(
@@ -670,7 +670,7 @@ struct LiveTranslationServiceTests {
     @Test("Auto does not oscillate away from a locked language when a later, longer phrase confidently agrees with it")
     func autoDoesNotOscillateWhenDetectionAgrees() async throws {
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag", "Wie geht es dir heute"], autoFinish: false),
             translator: ScriptedLanguageTranslator(
@@ -690,7 +690,7 @@ struct LiveTranslationServiceTests {
     @Test("Auto switches the lock when a longer, later phrase confidently detects a genuinely different primary language")
     func autoSwitchesOnStrongEvidence() async throws {
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag", "How are you doing today"], autoFinish: false),
             translator: ScriptedLanguageTranslator(
@@ -711,7 +711,7 @@ struct LiveTranslationServiceTests {
     func newSessionResetsAutoLock() async throws {
         let store = AgentContextStore()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de", "okay": "en"], translation: "переклад"),
@@ -751,7 +751,7 @@ struct LiveTranslationServiceTests {
     func stuckTranslationDoesNotBlockLaterPhrase() async throws {
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["phrase A", "phrase B"], autoFinish: false),
             translator: HangingLanguageTranslator(
@@ -785,7 +785,7 @@ struct LiveTranslationServiceTests {
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
         let generator = GatedSuggestedReplyGenerator() // "phrase A" is never release()d
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["phrase A", "phrase B"], autoFinish: false),
             translator: ScriptedLanguageTranslator(
@@ -810,7 +810,7 @@ struct LiveTranslationServiceTests {
     func translationTimeoutCleansUpCleanly() async throws {
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["phrase A", "phrase B"], autoFinish: false),
             translator: HangingLanguageTranslator(
@@ -839,7 +839,7 @@ struct LiveTranslationServiceTests {
         let generator = GatedSuggestedReplyGenerator(repliesByOriginalText: [
             "phrase A": [SuggestedReply(originalLanguageText: "A-reply", ukrainianText: "А-відповідь", ordering: 0)],
         ]) // never release()d — the generator call itself never returns
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["phrase A"], autoFinish: false),
             translator: ScriptedLanguageTranslator(languageCodes: ["phrase A": "en"], translation: "переклад"),
@@ -879,7 +879,7 @@ struct LiveTranslationServiceTests {
             delays: ["phrase A": .milliseconds(120)],
             translations: ["phrase A": "А-переклад", "phrase B": "Б-переклад"]
         )
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["phrase A", "phrase B"], autoFinish: false),
             translator: translator,
@@ -909,7 +909,7 @@ struct LiveTranslationServiceTests {
     func partialTranscriptTriggersProvisionalTranslation() async throws {
         let spy = SpyGlassesTransport()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: ["Where are": "en"], translation: "Куди ви"),
@@ -937,7 +937,7 @@ struct LiveTranslationServiceTests {
     func newerPartialSupersedesOlderBeforeDebounce() async throws {
         let spy = SpyGlassesTransport()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(
@@ -981,7 +981,7 @@ struct LiveTranslationServiceTests {
             delays: ["Where": .milliseconds(1200)],
             translations: ["Where": "Де", "Where are you going": "Куди ви йдете?"]
         )
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: translator,
@@ -1018,7 +1018,7 @@ struct LiveTranslationServiceTests {
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(
@@ -1053,7 +1053,7 @@ struct LiveTranslationServiceTests {
     func partialsNeverCreateHistoryEntries() async throws {
         let store = AgentContextStore()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(
@@ -1087,7 +1087,7 @@ struct LiveTranslationServiceTests {
         let store = freshGlassesChatStore()
         let provider = GlassesChatProvider(localStore: store, defaults: UserDefaults(suiteName: "test.\(UUID().uuidString)")!)
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(
@@ -1121,7 +1121,7 @@ struct LiveTranslationServiceTests {
         let spy = SpyGlassesTransport()
         let generator = GatedSuggestedReplyGenerator() // never released — replies for "Guten Tag" hang forever
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(
@@ -1153,13 +1153,13 @@ struct LiveTranslationServiceTests {
     /// long sentence spoken continuously, word by word, must NOT produce
     /// one translation request per word — `AdaptiveStreamingTranslationBufferTests`
     /// covers the pure buffer logic in isolation; this proves the same
-    /// holds once it's wired into the real `LiveTranslationService`
+    /// holds once it's wired into the real `AIConversationEngine`
     /// pipeline (language resolution, translate call dispatch, display).
     @Test("a long sentence spoken as many rapid partials does not translate every fragment — far fewer, semantically fuller requests")
     func rapidWordByWordPartialsDoNotEachTranslate() async throws {
         let recorder = RecordingLanguageTranslator(translation: "переклад")
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: transcriber,
             translator: recorder,
@@ -1194,7 +1194,7 @@ struct LiveTranslationServiceTests {
     func continuousFastSpeechNeverQueuesUnboundedRequests() async throws {
         let recorder = RecordingLanguageTranslator(translation: "переклад")
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: transcriber,
             translator: recorder,
@@ -1230,7 +1230,7 @@ struct LiveTranslationServiceTests {
             SuggestedReply(originalLanguageText: "Sure", ukrainianText: "Так", ordering: 0),
         ])
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(
@@ -1259,7 +1259,7 @@ struct LiveTranslationServiceTests {
 
     /// Physical bug: selecting EN/DE/PL never actually reached the real
     /// on-device `TranslationSession` (only `RootView`'s own doc comment
-    /// and `LiveTranslationService.resolvedSourceLanguageCode`'s doc
+    /// and `AIConversationEngine.resolvedSourceLanguageCode`'s doc
     /// comment tell that full story — this file can't touch the real
     /// `TranslationSession` at all). What IS fully unit-testable, and
     /// what these tests pin down: `sourceLanguageMode` and
@@ -1268,7 +1268,7 @@ struct LiveTranslationServiceTests {
     /// restart, no async gap where a stale value could leak through.
     @Test("selecting EN updates the active service's mode and resolved language immediately")
     func selectingEnglishUpdatesImmediately() {
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -1281,7 +1281,7 @@ struct LiveTranslationServiceTests {
 
     @Test("selecting DE updates the active service's mode and resolved language immediately")
     func selectingGermanUpdatesImmediately() {
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -1294,7 +1294,7 @@ struct LiveTranslationServiceTests {
 
     @Test("selecting PL updates the active service's mode and resolved language immediately")
     func selectingPolishUpdatesImmediately() {
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -1312,7 +1312,7 @@ struct LiveTranslationServiceTests {
     func explicitPartialNeverInvokesDetection(mode: SourceLanguageMode) async throws {
         let recorder = RecordingLanguageTranslator(translation: "переклад")
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: transcriber,
             translator: recorder,
@@ -1336,7 +1336,7 @@ struct LiveTranslationServiceTests {
     )
     func explicitFinalNeverInvokesDetection(mode: SourceLanguageMode) async throws {
         let recorder = RecordingLanguageTranslator(translation: "переклад")
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["some phrase"]),
             translator: recorder,
@@ -1366,7 +1366,7 @@ struct LiveTranslationServiceTests {
         let recorder = RecordingLanguageTranslator(translation: "переклад") // detectionResult defaults to nil
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["some phrase"], autoFinish: false),
             translator: recorder,
@@ -1388,7 +1388,7 @@ struct LiveTranslationServiceTests {
     func switchingAutoToExplicitAffectsNextPartialImmediately() async throws {
         let recorder = RecordingLanguageTranslator(translation: "переклад")
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: transcriber,
             translator: recorder,
@@ -1410,7 +1410,7 @@ struct LiveTranslationServiceTests {
     func switchingExplicitLanguagesAffectsNextPartialImmediately() async throws {
         let recorder = RecordingLanguageTranslator(translation: "переклад")
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: transcriber,
             translator: recorder,
@@ -1438,7 +1438,7 @@ struct LiveTranslationServiceTests {
     @Test("an explicit selection survives multiple consecutive turns — every one resolves to the same language")
     func explicitSelectionSurvivesMultipleTurns() async throws {
         let recorder = RecordingLanguageTranslator(translation: "переклад")
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["one", "two", "three"], autoFinish: false),
             translator: recorder,
@@ -1461,7 +1461,7 @@ struct LiveTranslationServiceTests {
         let generator = FakeSuggestedReplyGenerator(defaultReplies: [
             SuggestedReply(originalLanguageText: "Sure", ukrainianText: "Так", ordering: 0),
         ])
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: recorder,
@@ -1482,7 +1482,7 @@ struct LiveTranslationServiceTests {
     func explicitSelectionSurvivesPartialToFinalTransition() async throws {
         let recorder = RecordingLanguageTranslator(translation: "переклад")
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: transcriber,
             translator: recorder,
@@ -1509,7 +1509,7 @@ struct LiveTranslationServiceTests {
     /// listening — it just drops that one phrase and keeps going.
     @Test("repeated Auto-mode detection failures never block listening or create any kind of prompt loop")
     func autoDetectionFailureNeverLoops() async throws {
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(
                 finals: ["mmm", "uhh", "hmm"], // none present in languageCodes below — all undetectable
@@ -1536,7 +1536,7 @@ struct LiveTranslationServiceTests {
         let recorder = RecordingLanguageTranslator(detectionResult: nil, translation: "переклад")
         let transcriber = ManualContinuousTranscriber()
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: transcriber,
             translator: recorder,
@@ -1564,7 +1564,7 @@ struct LiveTranslationServiceTests {
 
     @Test("a new session always starts with followLive true")
     func sessionStartsFollowingLive() async throws {
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -1578,7 +1578,7 @@ struct LiveTranslationServiceTests {
     func navigatingAwayDisablesFollowLive() async throws {
         let spy = SpyGlassesTransport()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: ["first phrase": "en", "second phrase": "en"], translation: "переклад"),
@@ -1605,7 +1605,7 @@ struct LiveTranslationServiceTests {
     func returningToPageZeroReenablesFollowLive() async throws {
         let spy = SpyGlassesTransport()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: ["first phrase": "en", "second phrase": "en"], translation: "переклад"),
@@ -1629,7 +1629,7 @@ struct LiveTranslationServiceTests {
     func doubleTapReenablesFollowLive() async throws {
         let spy = SpyGlassesTransport()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: ["first phrase": "en", "second phrase": "en"], translation: "переклад"),
@@ -1662,7 +1662,7 @@ struct LiveTranslationServiceTests {
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(
@@ -1725,7 +1725,7 @@ struct LiveTranslationServiceTests {
             SuggestedReply(originalLanguageText: "Sure", ukrainianText: "Так", ordering: 0),
             SuggestedReply(originalLanguageText: "No thanks", ukrainianText: "Ні, дякую", ordering: 1),
         ])
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(
@@ -1782,7 +1782,7 @@ struct LiveTranslationServiceTests {
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт"),
@@ -1811,7 +1811,7 @@ struct LiveTranslationServiceTests {
 
     @Test("audio source defaults to G2 mic")
     func audioSourceDefaultsToG2Mic() {
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -1823,7 +1823,7 @@ struct LiveTranslationServiceTests {
     @Test("starting a session applies the persisted audio source preference before enabling the mic")
     func startAppliesAudioSourcePreference() async throws {
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -1839,7 +1839,7 @@ struct LiveTranslationServiceTests {
     @Test("switching audio source mid-session propagates immediately, no restart required")
     func switchingAudioSourceMidSessionPropagatesImmediately() async throws {
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -1855,10 +1855,10 @@ struct LiveTranslationServiceTests {
         #expect(await spy.audioSourceCalls.last == .phoneMic)
     }
 
-    @Test("audio source selection survives across LiveTranslationService instances, simulating an app relaunch")
+    @Test("audio source selection survives across AIConversationEngine instances, simulating an app relaunch")
     func audioSourcePersistsAcrossRelaunch() {
         let defaults = freshDefaults()
-        let service1 = LiveTranslationService(
+        let service1 = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -1866,7 +1866,7 @@ struct LiveTranslationServiceTests {
         )
         service1.setAudioSource(.phoneMic)
 
-        let service2 = LiveTranslationService(
+        let service2 = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -1878,14 +1878,14 @@ struct LiveTranslationServiceTests {
     // MARK: - Conversation Mode: Meeting Mode (reply priority)
 
     @Test("conversation mode defaults to standard")
-    func conversationModeDefaultsToStandard() {
-        let service = LiveTranslationService(
+    func conversationProfileDefaultsToStandard() {
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
             defaults: freshDefaults()
         )
-        #expect(service.conversationMode == .standard)
+        #expect(service.conversationProfile == .conversation)
     }
 
     @Test("in Standard mode, suggested replies auto-display on G2 exactly as before")
@@ -1894,7 +1894,7 @@ struct LiveTranslationServiceTests {
             SuggestedReply(originalLanguageText: "Sure", ukrainianText: "Так", ordering: 0),
         ])
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
@@ -1925,7 +1925,7 @@ struct LiveTranslationServiceTests {
         ])
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
@@ -1933,7 +1933,7 @@ struct LiveTranslationServiceTests {
             replyGenerator: generator,
             defaults: freshDefaults()
         )
-        service.setConversationMode(.meeting)
+        service.setConversationProfile(.meeting)
 
         await service.start()
         try? await Task.sleep(for: .milliseconds(80))
@@ -1948,24 +1948,24 @@ struct LiveTranslationServiceTests {
         #expect(store.session.latestTurn?.suggestedReplies.map(\.originalLanguageText) == ["Sure"])
     }
 
-    @Test("conversation mode selection survives across LiveTranslationService instances, simulating an app relaunch")
-    func conversationModePersistsAcrossRelaunch() {
+    @Test("conversation mode selection survives across AIConversationEngine instances, simulating an app relaunch")
+    func conversationProfilePersistsAcrossRelaunch() {
         let defaults = freshDefaults()
-        let service1 = LiveTranslationService(
+        let service1 = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
             defaults: defaults
         )
-        service1.setConversationMode(.meeting)
+        service1.setConversationProfile(.meeting)
 
-        let service2 = LiveTranslationService(
+        let service2 = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
             defaults: defaults
         )
-        #expect(service2.conversationMode == .meeting)
+        #expect(service2.conversationProfile == .meeting)
     }
 
     // MARK: - Conversation Mode: explicit returnToLive()
@@ -1974,7 +1974,7 @@ struct LiveTranslationServiceTests {
     func explicitReturnToLiveWorks() async throws {
         let spy = SpyGlassesTransport()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: ["hi there": "en", "hello there": "en"], translation: "привіт"),

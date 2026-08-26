@@ -29,9 +29,9 @@ struct SettingsView: View {
 
                 Section {
                     NavigationLink {
-                        LiveTranslationView()
+                        AIConversationView()
                     } label: {
-                        Label("Voice", systemImage: "waveform")
+                        Label("AI Conversation", systemImage: "waveform")
                     }
                     NavigationLink {
                         VisionPlaceholderView()

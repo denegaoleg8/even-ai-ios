@@ -9,7 +9,7 @@ import Foundation
 /// "Dictate to Chat" feature — its other original caller — was removed:
 /// this separation isn't dictation-specific, and Live Translation's own
 /// read-only Chat overlay deliberately does *not* go through this path —
-/// see `LiveTranslationService`'s doc comment.)
+/// see `AIConversationEngine`'s doc comment.)
 protocol ChatMessageSending: Sendable {
     /// Streams `content` to `chatID` exactly as `ChatServicing.streamReply`
     /// does — every event is re-yielded unchanged, so a caller that renders

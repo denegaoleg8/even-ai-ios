@@ -2,9 +2,9 @@ import Testing
 import Foundation
 @testable import EvenAI
 
-/// Milestone 2: `LiveTranslationService`'s minimal integration with the
+/// Milestone 2: `AIConversationEngine`'s minimal integration with the
 /// shared `AgentContextSession` — entirely additive to the existing
-/// decision pipeline covered by `LiveTranslationServiceTests`, which is
+/// decision pipeline covered by `AIConversationEngineTests`, which is
 /// untouched. These tests prove: a foreign phrase is recorded as exactly
 /// one turn, Ukrainian speech never becomes a turn, the existing
 /// `GlassesTransport.sendText(_:)` call is unaffected by this recording,
@@ -13,14 +13,14 @@ import Foundation
 /// what "visible through the app environment" means outside of a SwiftUI
 /// hosting context.
 @MainActor
-@Suite("LiveTranslationService + AgentContextStore")
-struct LiveTranslationServiceAgentContextTests {
+@Suite("AIConversationEngine + AgentContextStore")
+struct AIConversationEngineAgentContextTests {
     private static let propagationDelay: Duration = .milliseconds(30)
 
     @Test("a finalized foreign-language phrase is appended to the shared session exactly once")
     func foreignPhraseIsAppendedOnce() async throws {
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт"),
@@ -42,7 +42,7 @@ struct LiveTranslationServiceAgentContextTests {
     @Test("Ukrainian speech never creates a live-conversation turn")
     func ukrainianSpeechDoesNotCreateATurn() async throws {
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["привіт, як справи"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["привіт, як справи": "uk"]),
@@ -59,7 +59,7 @@ struct LiveTranslationServiceAgentContextTests {
     func existingSendTextBehaviorIsUnchanged() async throws {
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт"),
@@ -69,7 +69,7 @@ struct LiveTranslationServiceAgentContextTests {
         await service.start()
         try? await Task.sleep(for: Self.propagationDelay)
 
-        // Same assertion as `LiveTranslationServiceTests.foreignPhraseIsTranslatedAndSent`,
+        // Same assertion as `AIConversationEngineTests.foreignPhraseIsTranslatedAndSent`,
         // which uses no `AgentContextStore` at all — proves the new
         // recording is purely additive to the existing display path.
         // Milestone 6: the translation reaches G2 via `displayPages(_:)`,
@@ -82,7 +82,7 @@ struct LiveTranslationServiceAgentContextTests {
     func redundantStartDoesNotDuplicateTurns() async throws {
         let store = AgentContextStore()
         let transcriber = ScriptedContinuousTranscriber(finals: ["hello there"], autoFinish: false)
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт"),
@@ -108,7 +108,7 @@ struct LiveTranslationServiceAgentContextTests {
         // phrase get recorded," which the other tests in this file
         // already cover individually.
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -132,10 +132,10 @@ struct LiveTranslationServiceAgentContextTests {
         #expect(store.session.turns.isEmpty)
     }
 
-    @Test("the AgentContextStore instance passed to LiveTranslationService is shared by identity, not copied")
+    @Test("the AgentContextStore instance passed to AIConversationEngine is shared by identity, not copied")
     func sameInstanceIsSharedByIdentity() async throws {
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт"),
@@ -143,7 +143,7 @@ struct LiveTranslationServiceAgentContextTests {
         )
 
         // `store` here stands in for the same instance `EvenAIApp` both
-        // constructs `LiveTranslationService` with AND injects via
+        // constructs `AIConversationEngine` with AND injects via
         // `.environment(agentContextStore)` — a mutation the service
         // makes must be visible through this exact external reference,
         // not a copy, for that to actually mean anything.

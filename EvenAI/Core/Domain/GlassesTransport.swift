@@ -1,7 +1,7 @@
 import Foundation
 
 /// A user-visible navigation event originating from G2's own touchpad —
-/// surfaced so `LiveTranslationService` can know when the user has
+/// surfaced so `AIConversationEngine` can know when the user has
 /// manually navigated away from (or explicitly back to) the "live" page
 /// of the conversation timeline, without owning any BLE/pagination
 /// detail itself. See `MentraGlassesTransport`'s doc comment on

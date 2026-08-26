@@ -17,9 +17,14 @@ enum AudioSource: String, CaseIterable, Codable, Sendable {
     case g2Mic
     case phoneMic
 
+    /// AI Conversation consolidation pass: "Glasses Mic"/"Phone Mic" —
+    /// matches the product's own user-facing wording exactly ("Glasses
+    /// Mic: G2 microphone → iPhone processing"). Deliberately says
+    /// "Glasses," not "G2": which mic captures audio is a concept every
+    /// user needs; the specific hardware model name is not.
     var displayLabel: String {
         switch self {
-        case .g2Mic: "G2 Mic"
+        case .g2Mic: "Glasses Mic"
         case .phoneMic: "Phone Mic"
         }
     }

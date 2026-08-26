@@ -1,14 +1,23 @@
 import SwiftUI
 
-/// Thin control surface over the app-level `LiveTranslationService` — this
-/// view owns no state of its own and does not stop the service on
-/// disappear/navigation; the whole point of the app-level service is that
-/// Live Translation keeps running when the user leaves this screen. See
-/// `LiveTranslationService`'s doc comment for where it actually starts,
-/// stops, and hosts the `Translation` framework session.
-struct LiveTranslationView: View {
-    @Environment(LiveTranslationService.self) private var liveTranslation
+/// AI Conversation's main screen — thin control surface over the
+/// app-level `AIConversationEngine`. This view owns no state of its own
+/// and does not stop the engine on disappear/navigation; the whole point
+/// of the app-level engine is that AI Conversation keeps running when the
+/// user leaves this screen. See `AIConversationEngine`'s doc comment for
+/// where it actually starts, stops, and hosts the `Translation` framework
+/// session.
+///
+/// Deliberately hides STT-provider/Railway/FoundationModels/local-vs-cloud
+/// internals from the main controls (§5/§21 of the AI Conversation
+/// consolidation pass): a normal user only ever sees Profile/Language/
+/// Audio/Start-Stop. Provider diagnostics remain available, but pushed
+/// into the collapsed `advancedSection` — present for troubleshooting,
+/// never required to use the product.
+struct AIConversationView: View {
+    @Environment(AIConversationEngine.self) private var liveTranslation
     @Environment(AppState.self) private var appState
+    @State private var isAdvancedExpanded = false
 
     var body: some View {
         VStack(spacing: AppMetrics.Spacing.lg) {
@@ -24,11 +33,9 @@ struct LiveTranslationView: View {
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, AppMetrics.Spacing.lg)
 
-            sourceLanguagePicker
-            audioSourcePicker
-            conversationModePicker
-            transcriptionProviderPicker
-            activeProviderLabel
+            labeledPicker(title: "Profile") { conversationProfilePicker }
+            labeledPicker(title: "Language") { sourceLanguagePicker }
+            labeledPicker(title: "Audio") { audioSourcePicker }
 
             if !liveTranslation.followLive {
                 returnToLiveIndicator
@@ -41,6 +48,26 @@ struct LiveTranslationView: View {
                     .background(AppColor.secondaryBackground)
                     .clipShape(RoundedRectangle(cornerRadius: AppMetrics.Radius.medium))
                     .padding(.horizontal, AppMetrics.Spacing.lg)
+            }
+
+            // Truthful, plain-language status notices — never mentions
+            // Railway/session/auth internals, only what actually changed
+            // for the user (see each property's own doc comment).
+            if let notice = liveTranslation.cloudFallbackNotice {
+                Text(notice)
+                    .font(.caption)
+                    .foregroundStyle(AppColor.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, AppMetrics.Spacing.lg)
+                    .accessibilityIdentifier("liveTranslation.cloudFallbackNotice")
+            }
+            if let reason = liveTranslation.repliesUnavailableReason {
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(AppColor.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, AppMetrics.Spacing.lg)
+                    .accessibilityIdentifier("liveTranslation.repliesUnavailableNotice")
             }
 
             if case let .error(message) = liveTranslation.state {
@@ -57,7 +84,7 @@ struct LiveTranslationView: View {
                         await liveTranslation.stop()
                     } else {
                         // This screen is only reachable by pushing through
-                        // Settings' own `.sheet`. `LiveTranslationService`'s
+                        // Settings' own `.sheet`. `AIConversationEngine`'s
                         // one app-level `TranslationSession` is hosted on
                         // `RootView` (see its doc comment); the FIRST time
                         // the on-device Translation framework needs to show
@@ -69,7 +96,7 @@ struct LiveTranslationView: View {
                         // supported"), so that translation call hangs
                         // forever waiting for an interaction the user can
                         // never make. Dismissing Settings here costs
-                        // nothing — Live Translation is explicitly designed
+                        // nothing — AI Conversation is explicitly designed
                         // to keep running once you leave this screen.
                         appState.isSettingsPresented = false
                         await liveTranslation.start()
@@ -77,27 +104,42 @@ struct LiveTranslationView: View {
                 }
             }
             .frame(maxWidth: 260)
+            .accessibilityIdentifier("aiConversation.startStopButton")
 
             if liveTranslation.state == .listening {
-                Text("Live Translation keeps running if you leave this screen.")
+                Text("AI Conversation keeps running if you leave this screen.")
                     .font(.footnote)
                     .foregroundStyle(AppColor.textSecondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, AppMetrics.Spacing.lg)
             }
 
+            advancedSection
+
             Spacer()
         }
         .padding(AppMetrics.Spacing.lg)
-        .navigationTitle("Live Translation")
+        .navigationTitle("AI Conversation")
         .navigationBarTitleDisplayMode(.inline)
+    }
+
+    /// A consistent small caption above each of the three main pickers —
+    /// "Profile"/"Language"/"Audio" — so the compact button rows read
+    /// clearly without needing a modal picker or a full settings screen.
+    private func labeledPicker(title: String, @ViewBuilder content: () -> some View) -> some View {
+        VStack(spacing: AppMetrics.Spacing.xs) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(AppColor.textSecondary)
+            content()
+        }
     }
 
     /// Source-language selector — "Auto | EN | DE | PL", per the product
     /// requirement: quick to use, no modal sheet (a plain inline row of
     /// toggle buttons, always visible on this screen — nothing here
     /// presents anything, so there's no risk of the sheet-presentation
-    /// conflict `LiveTranslationView`'s own Settings-dismiss fix already
+    /// conflict `AIConversationView`'s own Settings-dismiss fix already
     /// deals with elsewhere), clearly visible selected state, works while
     /// a session is already listening (switching mid-session is exactly
     /// when glasses-use makes a modal picker impractical).
@@ -124,9 +166,11 @@ struct LiveTranslationView: View {
         }
     }
 
-    /// Audio source selector — "G2 Mic | Phone Mic", same non-modal
+    /// Audio source selector — "Glasses Mic | Phone Mic", same non-modal
     /// inline pattern as `sourceLanguagePicker`. See `AudioSource`'s own
-    /// doc comment for the SDK capability this exposes.
+    /// doc comment for the SDK capability this exposes — deliberately NOT
+    /// to be confused with local/cloud STT processing (§7): this only
+    /// picks which microphone captures audio, never how it's processed.
     private var audioSourcePicker: some View {
         HStack(spacing: AppMetrics.Spacing.sm) {
             ForEach(AudioSource.allCases, id: \.self) { source in
@@ -148,14 +192,15 @@ struct LiveTranslationView: View {
         }
     }
 
-    /// Conversation Mode selector — "Standard | Meeting". See
-    /// `ConversationMode`'s own doc comment.
-    private var conversationModePicker: some View {
+    /// Behavior-profile selector — "Auto | Conversation | Meeting". See
+    /// `ConversationProfile`'s own doc comment: these are PRESENTATION
+    /// profiles over the exact same engine, never separate pipelines.
+    private var conversationProfilePicker: some View {
         HStack(spacing: AppMetrics.Spacing.sm) {
-            ForEach(ConversationMode.allCases, id: \.self) { mode in
-                let isSelected = liveTranslation.conversationMode == mode
+            ForEach(ConversationProfile.allCases, id: \.self) { mode in
+                let isSelected = liveTranslation.conversationProfile == mode
                 Button {
-                    liveTranslation.setConversationMode(mode)
+                    liveTranslation.setConversationProfile(mode)
                 } label: {
                     Text(mode.displayLabel)
                         .font(AppTypography.chatPreview.weight(isSelected ? .semibold : .regular))
@@ -165,19 +210,38 @@ struct LiveTranslationView: View {
                         .foregroundStyle(isSelected ? Color.white : AppColor.textPrimary)
                         .clipShape(RoundedRectangle(cornerRadius: AppMetrics.Radius.medium))
                 }
-                .accessibilityIdentifier("liveTranslation.conversationMode.\(mode.rawValue)")
+                .accessibilityIdentifier("liveTranslation.conversationProfile.\(mode.rawValue)")
                 .accessibilityAddTraits(isSelected ? [.isSelected] : [])
             }
         }
     }
 
-    /// Transcription provider selector — "Auto | On-device | Cloud", per
-    /// the local-first architecture pass's §7/§16 requirements: a simple,
-    /// always-visible setting (no modal sheet, matching the other three
-    /// pickers on this screen) and clear provider labeling. `.onDevice`
-    /// NEVER silently falls back to cloud (see `TranscriptionProviderRouter`'s
-    /// own doc comment) — selecting it is a hard privacy commitment, not
-    /// just a preference.
+    /// Everything a normal user never needs to see or think about —
+    /// transcription-provider choice (local/cloud) and which provider
+    /// actually ran the current/most recent session. Collapsed by
+    /// default; exists for troubleshooting/diagnostics only (§21: "Do NOT
+    /// put Local/Cloud/Railway/provider jargon on the main screen.
+    /// Advanced settings may expose provider controls for diagnostics").
+    private var advancedSection: some View {
+        DisclosureGroup("Advanced", isExpanded: $isAdvancedExpanded) {
+            VStack(spacing: AppMetrics.Spacing.sm) {
+                transcriptionProviderPicker
+                activeProviderLabel
+            }
+            .padding(.top, AppMetrics.Spacing.sm)
+        }
+        .font(.caption)
+        .foregroundStyle(AppColor.textSecondary)
+        .padding(.horizontal, AppMetrics.Spacing.lg)
+        .accessibilityIdentifier("aiConversation.advancedSection")
+    }
+
+    /// Transcription provider selector — "Auto | On-device | Cloud".
+    /// `.onDevice` NEVER silently falls back to cloud (see
+    /// `TranscriptionProviderRouter`'s own doc comment) — selecting it is
+    /// a hard privacy commitment, not just a preference. Lives inside
+    /// `advancedSection` — see that property's own doc comment for why
+    /// this doesn't belong on the main screen.
     private var transcriptionProviderPicker: some View {
         HStack(spacing: AppMetrics.Spacing.sm) {
             ForEach(TranscriptionProviderMode.allCases, id: \.self) { mode in
@@ -199,7 +263,7 @@ struct LiveTranslationView: View {
         }
     }
 
-    /// "Clear provider labeling" (§16): which STT provider actually
+    /// "Clear provider labeling" — which STT provider actually
     /// transcribed the current/most recent session — on-device audio never
     /// leaves the phone; cloud audio is sent to this app's backend/OpenAI.
     /// Shown only once known (after a session has actually started at
@@ -214,34 +278,6 @@ struct LiveTranslationView: View {
                 .font(.caption)
                 .foregroundStyle(AppColor.textSecondary)
                 .accessibilityIdentifier("liveTranslation.activeProviderLabel")
-        }
-        // Cloud-mode production-safety fix: shown whenever the user
-        // selected Cloud but the session is actually running on-device
-        // because cloud failed (Railway unreachable, most commonly) —
-        // truthful and non-alarming; never implies a G2/auth/session
-        // problem, since there isn't one. Live Translation keeps
-        // listening/translating/displaying on G2 throughout — this is
-        // purely informational.
-        if let notice = liveTranslation.cloudFallbackNotice {
-            Text(notice)
-                .font(.caption)
-                .foregroundStyle(AppColor.textSecondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, AppMetrics.Spacing.lg)
-                .accessibilityIdentifier("liveTranslation.cloudFallbackNotice")
-        }
-        // Suggested-replies restoration pass: shown whenever the local
-        // (on-device) reply provider itself isn't usable right now —
-        // truthful and non-alarming, never implies a bug. Translation
-        // keeps working exactly the same either way; this is purely
-        // informational, matching `cloudFallbackNotice`'s own pattern.
-        if let reason = liveTranslation.repliesUnavailableReason {
-            Text(reason)
-                .font(.caption)
-                .foregroundStyle(AppColor.textSecondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, AppMetrics.Spacing.lg)
-                .accessibilityIdentifier("liveTranslation.repliesUnavailableNotice")
         }
     }
 
@@ -265,22 +301,22 @@ struct LiveTranslationView: View {
 
     private var statusText: String {
         switch liveTranslation.state {
-        case .idle: "Start Live Translation to see foreign phrases translated on your glasses"
+        case .idle: "Start AI Conversation to see foreign phrases translated on your glasses"
         case .listening: "Listening..."
         case .error: "Something went wrong"
         }
     }
 
     private var buttonTitle: String {
-        liveTranslation.state == .listening ? "Stop" : "Start Live Translation"
+        liveTranslation.state == .listening ? "Stop" : "Start AI Conversation"
     }
 }
 
 #Preview {
     NavigationStack {
-        LiveTranslationView()
+        AIConversationView()
             .environment(
-                LiveTranslationService(
+                AIConversationEngine(
                     glassesTransport: MockGlassesTransport(),
                     transcriber: GlassesSpeechTranscriber(),
                     translator: AppleLanguageTranslator()

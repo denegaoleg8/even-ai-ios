@@ -6,7 +6,7 @@ import SwiftUI
 struct RootView: View {
     @Environment(AppState.self) private var appState
     @Environment(AuthState.self) private var authState
-    @Environment(LiveTranslationService.self) private var liveTranslation
+    @Environment(AIConversationEngine.self) private var liveTranslation
     @Environment(\.languageTranslator) private var languageTranslator
     @Environment(\.chatService) private var chatService
     @Environment(\.glassesTransport) private var glassesTransport
@@ -36,7 +36,7 @@ struct RootView: View {
         .task {
             await authState.restoreSession()
         }
-        // `LiveTranslationService` is app-level and must outlive any one
+        // `AIConversationEngine` is app-level and must outlive any one
         // screen, but the `Translation` framework only vends a usable
         // `TranslationSession` through this exact SwiftUI modifier — this
         // is the highest, always-present place in the hierarchy to host
@@ -72,10 +72,10 @@ struct RootView: View {
 
     /// The one place `translationConfiguration` is ever written — keeps
     /// the real `TranslationSession`'s `source` equal to whatever
-    /// `LiveTranslationService` currently considers authoritative
+    /// `AIConversationEngine` currently considers authoritative
     /// (explicit selection, or the current Auto lock; `nil` only while
     /// Auto hasn't locked onto anything yet this session). See
-    /// `LiveTranslationService.resolvedSourceLanguageCode`'s doc comment
+    /// `AIConversationEngine.resolvedSourceLanguageCode`'s doc comment
     /// for the full root-cause explanation this fixes.
     private func syncTranslationConfiguration() {
         let sourceCode = liveTranslation.resolvedSourceLanguageCode
@@ -107,7 +107,7 @@ struct RootView: View {
         .environment(AppState())
         .environment(AuthState())
         .environment(
-            LiveTranslationService(
+            AIConversationEngine(
                 glassesTransport: MockGlassesTransport(),
                 transcriber: GlassesSpeechTranscriber(),
                 translator: AppleLanguageTranslator()

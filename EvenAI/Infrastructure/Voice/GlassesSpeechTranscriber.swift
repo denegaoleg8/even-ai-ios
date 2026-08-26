@@ -41,10 +41,10 @@ import Speech
 /// hardware I/O here), but because iOS's `audio` background execution
 /// grant is tied to a genuinely active audio session, not merely a
 /// declared background mode. Deliberately kept here rather than in
-/// `LiveTranslationService`: this is the one place in the Live
+/// `AIConversationEngine`: this is the one place in the Live
 /// Translation feature that already imports `AVFoundation`/`Speech`, and
-/// keeping it here means `LiveTranslationServiceTests` (which exercises
-/// `LiveTranslationService` through the `ScriptedContinuousTranscriber`
+/// keeping it here means `AIConversationEngineTests` (which exercises
+/// `AIConversationEngine` through the `ScriptedContinuousTranscriber`
 /// fake, never this class) never touches a real system audio API — this
 /// class isn't unit-tested directly for that same reason.
 /// `.record`/`.default`, no `.mixWithOthers`: the closest honest
@@ -100,9 +100,31 @@ final class GlassesSpeechTranscriber: OnDeviceTranscribing, @unchecked Sendable 
     /// until `beginNewSession()` replaces it — `append(_:format:)` must not
     /// feed a request that has already been told no more audio is coming
     /// (invalid per `SFSpeechAudioBufferRecognitionRequest`). G2's mic keeps
-    /// streaming through this gap (never stopped for rollover), so those
-    /// few buffers are simply dropped.
+    /// streaming through this gap (never stopped for rollover); PCM
+    /// arriving during it is queued in `pendingBuffersDuringFinalization`
+    /// (word-loss hardening pass) rather than dropped — see that
+    /// property's own doc comment for why this specific gap is worth
+    /// closing.
     private var isFinalizingUtterance = false
+    /// Word-loss hardening pass: PCM chunks that arrive while
+    /// `isFinalizingUtterance` is true are queued here instead of being
+    /// silently discarded, then fed into the NEW request the instant
+    /// `beginNewSession(recognizer:)` creates one — closing the one real
+    /// audio-loss window this class has (confirmed by code audit; every
+    /// OTHER transition in this file is atomic on the main actor, with no
+    /// gap for a concurrent `append` to observe). This specific gap is a
+    /// genuine round trip to the recognizer (`endAudio()` → waiting for
+    /// its actual final result to arrive asynchronously), not a
+    /// synchronous step, so it can span a meaningfully long window if the
+    /// user starts their NEXT utterance right as the previous one is
+    /// finalizing — exactly the "occasionally misses a couple of words"
+    /// symptom this pass exists to reduce. Capped defensively (see
+    /// `maxPendingBuffersDuringFinalization`) — in practice this queue
+    /// holds at most a few hundred milliseconds of 16kHz mono audio
+    /// (a handful of chunks), never enough to matter memory-wise; the cap
+    /// only guards against a pathological recognizer stall.
+    private var pendingBuffersDuringFinalization: [AVAudioPCMBuffer] = []
+    private static let maxPendingBuffersDuringFinalization = 64
 
     /// `locale` defaults to `en-US` — the same default production always
     /// used before this type became locale-configurable. Real callers
@@ -118,7 +140,7 @@ final class GlassesSpeechTranscriber: OnDeviceTranscribing, @unchecked Sendable 
     // touched from `deinit` (nonisolated even on a `@MainActor` class) —
     // only the `Task<Void, Never>` handles, which are `Sendable`, are
     // cancelled here. In practice this type is owned for the app's
-    // lifetime (see `LiveTranslationService`), so `deinit` is a belt-and-
+    // lifetime (see `AIConversationEngine`), so `deinit` is a belt-and-
     // suspenders safeguard, not a path any real session relies on;
     // `stopInternal()` is what actually cancels `task` during normal use.
     deinit {
@@ -127,7 +149,7 @@ final class GlassesSpeechTranscriber: OnDeviceTranscribing, @unchecked Sendable 
     }
 
     /// Changes which locale the on-device recognizer uses — called by
-    /// `LiveTranslationService.setSourceLanguageMode(_:)` (via
+    /// `AIConversationEngine.setSourceLanguageMode(_:)` (via
     /// `TranscriptionProviderRouter`) so an explicit EN/DE/PL switch takes
     /// effect immediately, mirroring how `AppleLanguageTranslator`'s real
     /// `TranslationSession` is already reconfigured live on the same
@@ -210,6 +232,18 @@ final class GlassesSpeechTranscriber: OnDeviceTranscribing, @unchecked Sendable 
         }
         request = newRequest
 
+        // Word-loss hardening pass: replay whatever PCM arrived while the
+        // PREVIOUS request was finalizing — see `pendingBuffersDuringFinalization`'s
+        // own doc comment. Oldest-first, so word order is preserved
+        // exactly as G2's mic produced it.
+        if !pendingBuffersDuringFinalization.isEmpty {
+            DiagnosticTrace.log("LOCAL_STT_REPLAYED_PENDING_AUDIO", "count=\(pendingBuffersDuringFinalization.count)")
+            for buffer in pendingBuffersDuringFinalization {
+                newRequest.append(buffer)
+            }
+            pendingBuffersDuringFinalization.removeAll()
+        }
+
         let sessionID = UUID()
         currentSessionID = sessionID
         task = recognizer.recognitionTask(with: newRequest) { [weak self] result, error in
@@ -286,18 +320,28 @@ final class GlassesSpeechTranscriber: OnDeviceTranscribing, @unchecked Sendable 
     }
 
     private func append(_ pcm: Data, format: AVAudioFormat) {
-        // Dropped while the current request is winding down after
-        // `endAudio()` — appending after that point is invalid, and a
-        // fresh request (from `beginNewSession(recognizer:)`) takes over
-        // moments later once the forced final lands. G2's mic is never
-        // stopped for this, so it's a few buffers lost, not a gap in
-        // capture readiness.
-        guard !isFinalizingUtterance else { return }
         // A `nil` here means a malformed/empty PCM chunk was silently
         // dropped — kept visible rather than swallowed entirely, since
         // there's no other signal anywhere that this happened.
         guard let buffer = Self.pcmBuffer(from: pcm, format: format) else {
             DiagnosticTrace.log("LIVE_TRACE", "append(_:format:) — pcmBuffer(from:format:) returned nil, dropping \(pcm.count) bytes")
+            return
+        }
+        // Word-loss hardening pass: the CURRENT request is winding down
+        // after `endAudio()` — appending to it directly is invalid — but
+        // G2's mic is never stopped for this, so real speech can still be
+        // arriving. Queue it; `beginNewSession(recognizer:)` replays the
+        // whole queue into the NEXT request the moment it exists, instead
+        // of this audio being lost. Capped defensively against a
+        // pathological recognizer stall — if the cap is ever hit, the
+        // OLDEST queued audio is dropped first (bounded loss, never
+        // unbounded growth), matching this queue's own "at most a few
+        // hundred milliseconds" expected size.
+        guard !isFinalizingUtterance else {
+            if pendingBuffersDuringFinalization.count >= Self.maxPendingBuffersDuringFinalization {
+                pendingBuffersDuringFinalization.removeFirst()
+            }
+            pendingBuffersDuringFinalization.append(buffer)
             return
         }
         request?.append(buffer)
@@ -309,6 +353,7 @@ final class GlassesSpeechTranscriber: OnDeviceTranscribing, @unchecked Sendable 
         finalizationTask?.cancel()
         finalizationTask = nil
         isFinalizingUtterance = false
+        pendingBuffersDuringFinalization.removeAll()
         pcmConsumerTask?.cancel()
         pcmConsumerTask = nil
         request?.endAudio()

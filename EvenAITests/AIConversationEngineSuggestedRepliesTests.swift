@@ -2,14 +2,14 @@ import Testing
 import Foundation
 @testable import EvenAI
 
-/// Milestone 4: `LiveTranslationService`'s integration with
+/// Milestone 4: `AIConversationEngine`'s integration with
 /// `SuggestedReplyGenerating` — entirely additive to the existing
 /// decision pipeline and to Milestone 2/3's turn-recording behavior,
 /// which stay covered by their own test files. No real AI provider is
 /// involved anywhere here — only `FakeSuggestedReplyGenerator`.
 @MainActor
-@Suite("LiveTranslationService + SuggestedReplyGenerating")
-struct LiveTranslationServiceSuggestedRepliesTests {
+@Suite("AIConversationEngine + SuggestedReplyGenerating")
+struct AIConversationEngineSuggestedRepliesTests {
     private static let propagationDelay: Duration = .milliseconds(220)
 
     private static func reply(_ original: String, _ ukrainian: String, ordering: Int) -> SuggestedReply {
@@ -20,7 +20,7 @@ struct LiveTranslationServiceSuggestedRepliesTests {
     func foreignTurnGetsGenerationRequest() async throws {
         let generator = FakeSuggestedReplyGenerator()
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
@@ -42,7 +42,7 @@ struct LiveTranslationServiceSuggestedRepliesTests {
     func ukrainianTurnIsSkipped() async throws {
         let generator = FakeSuggestedReplyGenerator()
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["привіт, як справи"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["привіт, як справи": "uk"]),
@@ -69,7 +69,7 @@ struct LiveTranslationServiceSuggestedRepliesTests {
         )
         store.appendTurn(priorTurn)
 
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
@@ -96,7 +96,7 @@ struct LiveTranslationServiceSuggestedRepliesTests {
         ]
         let generator = FakeSuggestedReplyGenerator(defaultReplies: replies)
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
@@ -122,7 +122,7 @@ struct LiveTranslationServiceSuggestedRepliesTests {
         let generator = FakeSuggestedReplyGenerator(error: FakeSuggestedReplyGenerationError(message: "boom"))
         let store = AgentContextStore()
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
@@ -151,7 +151,7 @@ struct LiveTranslationServiceSuggestedRepliesTests {
             "second phrase": secondReplies,
         ])
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["first phrase", "second phrase"]),
             translator: ScriptedLanguageTranslator(
@@ -176,7 +176,7 @@ struct LiveTranslationServiceSuggestedRepliesTests {
     func existingChatBehaviorRemainsUnchanged() async throws {
         let generator = FakeSuggestedReplyGenerator(defaultReplies: [Self.reply("Sure", "Так", ordering: 0)])
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),

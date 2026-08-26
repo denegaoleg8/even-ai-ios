@@ -81,7 +81,7 @@ struct LocalSuggestedReplyGeneratorTests {
             // defect in this call site's own explicit check. Either way,
             // the call completes with a thrown `Error` — never a crash,
             // never a hang — which is exactly what
-            // `LiveTranslationService.generateSuggestedReplies`'s own
+            // `AIConversationEngine.generateSuggestedReplies`'s own
             // generic catch-all already handles correctly regardless of
             // the error's concrete type.
             #expect(Bool(true), "completed with a non-LocalReplyUnavailableError failure (\(type(of: error))): \(error) — acceptable, see this test's own comment")

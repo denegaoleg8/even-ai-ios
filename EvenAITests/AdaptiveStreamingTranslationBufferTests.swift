@@ -4,7 +4,7 @@ import Foundation
 
 /// Pure tests for `AdaptiveStreamingTranslationBuffer` — entirely driven
 /// by explicit `now:` timestamps, no real async waiting, no
-/// `LiveTranslationService` involved. See that type's own doc comment
+/// `AIConversationEngine` involved. See that type's own doc comment
 /// for the full chunk-boundary design this verifies.
 @Suite("AdaptiveStreamingTranslationBuffer")
 struct AdaptiveStreamingTranslationBufferTests {

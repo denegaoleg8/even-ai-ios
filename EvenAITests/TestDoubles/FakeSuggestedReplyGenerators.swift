@@ -3,7 +3,7 @@ import Foundation
 
 /// Records every call it receives (the turn + context passed in) and
 /// returns a scripted result — lets a test both assert on what
-/// `LiveTranslationService` sent in, and control what comes back
+/// `AIConversationEngine` sent in, and control what comes back
 /// (replies, or a thrown error).
 actor FakeSuggestedReplyGenerator: SuggestedReplyGenerating {
     struct Call {
@@ -46,7 +46,7 @@ struct FakeSuggestedReplyGenerationError: Error, Equatable {
 /// suspends until the test explicitly calls `release(_:)` — lets a test
 /// deterministically construct "turn A's reply generation is still in
 /// flight when turn B arrives and finishes first," which is what actually
-/// exercises `LiveTranslationService`'s "newest turn always wins on G2"
+/// exercises `AIConversationEngine`'s "newest turn always wins on G2"
 /// guard (see `generateSuggestedReplies(for:)`). Calling `release(_:)`
 /// before the call ever starts is safe — it's recorded and the call
 /// returns immediately once it does start.

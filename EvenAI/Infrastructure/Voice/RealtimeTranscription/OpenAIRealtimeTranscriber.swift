@@ -4,9 +4,9 @@ import Foundation
 /// app's own backend (`src/realtimeTranscription/`), which in turn talks
 /// to OpenAI's `gpt-live-transcribe` realtime model — see the Milestone 8
 /// architecture audit. **Not wired into `EvenAIApp`/production
-/// `LiveTranslationService` yet** — `GlassesSpeechTranscriber` remains the
+/// `AIConversationEngine` yet** — `GlassesSpeechTranscriber` remains the
 /// live implementation until Milestone 8b makes the one-line switch (see
-/// that milestone's own scope). Nothing about `LiveTranslationService`'s
+/// that milestone's own scope). Nothing about `AIConversationEngine`'s
 /// integration needs to change to do that: this type conforms to the
 /// exact same `ContinuousTranscribing` protocol, unchanged.
 ///
@@ -21,7 +21,7 @@ import Foundation
 ///
 /// Ukrainian-vs-foreign filtering is deliberately NOT here: this class
 /// only reports whatever text the backend finalizes, exactly like
-/// `GlassesSpeechTranscriber` does today. `LiveTranslationService` (via
+/// `GlassesSpeechTranscriber` does today. `AIConversationEngine` (via
 /// the existing, unchanged `LanguageTranslating.detectedLanguageCode(for:)`)
 /// remains the one place that decides whether a given final becomes a
 /// live-conversation `ConversationTurn`.

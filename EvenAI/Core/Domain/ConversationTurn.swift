@@ -72,7 +72,7 @@ extension ConversationTurn {
     /// comparison is implemented, so every consumer (this file's own
     /// `liveConversationTurn(...)` below, and later the G2 Presentation
     /// Layer and the live pipeline) agrees on what "Ukrainian" means.
-    /// Mirrors `LiveTranslationService`'s existing equivalent check —
+    /// Mirrors `AIConversationEngine`'s existing equivalent check —
     /// this is a new, independent helper for future turn-construction
     /// call sites, not a change to that service.
     static func isUkrainian(languageCode: String?) -> Bool {

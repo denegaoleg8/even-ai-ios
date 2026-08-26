@@ -15,7 +15,7 @@ enum RealtimeTranscriptionEvent: Equatable, Sendable {
     /// `OpenAIRealtimeTranscriber`'s doc comment on why this is captured
     /// but not currently surfaced through `ContinuousTranscribing`
     /// (Ukrainian-vs-foreign filtering stays entirely in
-    /// `LiveTranslationService`, unchanged).
+    /// `AIConversationEngine`, unchanged).
     case languageInfo([String])
     case providerError(String)
     case closed(reason: String?)

@@ -3,7 +3,7 @@ import Foundation
 @testable import EvenAI
 
 /// Group-meeting reliability scenarios (Section 20) not already covered
-/// by `LiveTranslationServiceTests`'s own focused tests, plus the
+/// by `AIConversationEngineTests`'s own focused tests, plus the
 /// 100-turn deterministic soak/simulation test (Section 21, extended per
 /// the follow-up reply-browsing/history-browsing/audio-instrumentation
 /// pass). Scenarios D, E, G (stale provisional revisions, slow replies
@@ -17,17 +17,17 @@ import Foundation
 /// `newSpeechDuringReplyBrowsingReturnsToLive` — not duplicated here.
 /// Scenario K (history survives app restart) is a Chat/backend-
 /// persistence claim, covered by `ChatViewModelTests
-/// .loadPreservesOrderAndStableIDs`, not a `LiveTranslationService`
+/// .loadPreservesOrderAndStableIDs`, not a `AIConversationEngine`
 /// concern. Scenario L (Chat scrolling never alters G2's viewport) has
 /// no shared state to exercise — `ChatAutoScrollState`/`ChatView` never
-/// reference `LiveTranslationService.followLive` or
+/// reference `AIConversationEngine.followLive` or
 /// `MentraGlassesTransport` pagination at all; the absence of that
 /// coupling is the proof, verifiable by inspection, not a runtime test.
 @MainActor
-@Suite("LiveTranslationService — meeting reliability scenarios and soak test")
-struct LiveTranslationServiceSoakTests {
+@Suite("AIConversationEngine — meeting reliability scenarios and soak test")
+struct AIConversationEngineSoakTests {
     private func freshDefaults() -> UserDefaults {
-        UserDefaults(suiteName: "LiveTranslationServiceSoakTests.\(UUID().uuidString)")!
+        UserDefaults(suiteName: "AIConversationEngineSoakTests.\(UUID().uuidString)")!
     }
 
     // MARK: - Scenario A: 20 sequential turns, none wedges the session
@@ -38,7 +38,7 @@ struct LiveTranslationServiceSoakTests {
         let words = (1...20).map { "phrase\($0)" }
         var languageCodes: [String: String?] = [:]
         for word in words { languageCodes[word] = "en" }
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: words, autoFinish: false),
             translator: ScriptedLanguageTranslator(languageCodes: languageCodes, translation: "переклад"),
@@ -59,7 +59,7 @@ struct LiveTranslationServiceSoakTests {
     @Test("Scenario B: rapid back-to-back A/B/C finals all become ordered, un-mixed history")
     func rapidBackToBackFinalsBecomeOrderedHistory() async throws {
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["A phrase", "B phrase", "C phrase"], autoFinish: false),
             translator: ScriptedLanguageTranslator(
@@ -86,7 +86,7 @@ struct LiveTranslationServiceSoakTests {
             delays: ["A phrase": .seconds(3600)], // effectively unbounded for this test's lifetime
             translations: ["A phrase": "А", "B phrase": "Б", "C phrase": "В"]
         )
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["A phrase", "B phrase", "C phrase"], autoFinish: false),
             translator: translator,
@@ -113,7 +113,7 @@ struct LiveTranslationServiceSoakTests {
     func explicitModeThroughTwentyTurnsNeverDetects() async throws {
         let words = (1...20).map { "phrase\($0)" }
         let recorder = RecordingLanguageTranslator(translation: "переклад")
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: words, autoFinish: false),
             translator: recorder,
@@ -136,7 +136,7 @@ struct LiveTranslationServiceSoakTests {
     func sttTemporaryDisconnectRecoversAndNextTurnPersists() async throws {
         let factory = FakeRealtimeTranscriptionSocketFactory()
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: OpenAIRealtimeTranscriber(makeSocket: { await factory.makeSocket() }),
             translator: ScriptedLanguageTranslator(languageCodes: ["recovered phrase": "en"], translation: "переклад"),
@@ -186,7 +186,7 @@ struct LiveTranslationServiceSoakTests {
         let generator = GatedSuggestedReplyGenerator(repliesByOriginalText: [
             "turn A": [SuggestedReply(originalLanguageText: "Sure", ukrainianText: "Так", ordering: 0)],
         ])
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(
@@ -274,7 +274,7 @@ struct LiveTranslationServiceSoakTests {
             languageCodes["A-\(i)"] = "en"
             languageCodes["B-\(i)"] = "en"
         }
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: languageCodes, translation: "переклад"),
@@ -387,7 +387,7 @@ struct LiveTranslationServiceSoakTests {
             translations: translations
         )
 
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: translator,
@@ -402,7 +402,7 @@ struct LiveTranslationServiceSoakTests {
 
         // Simulated audio-arrival timing gaps: a handful of tightly-
         // spaced chunks, then a deliberate large gap — exercises
-        // `LiveTranslationService`'s audio-reliability instrumentation
+        // `AIConversationEngine`'s audio-reliability instrumentation
         // (chunk/gap counting) under a genuinely irregular arrival
         // pattern, proving it doesn't crash or stall the pipeline. (The
         // exact gap-detection math has its own honest-limitations note
@@ -425,7 +425,7 @@ struct LiveTranslationServiceSoakTests {
             // `OpenAIRealtimeTranscriber` reconnects on its own; the
             // session must keep going, and subsequent phrases must
             // continue arriving through the NEW socket with no restart
-            // from `LiveTranslationService`'s side.
+            // from `AIConversationEngine`'s side.
             if index == 40 {
                 try? await Task.sleep(for: .milliseconds(30))
                 await currentSocket.emit(.closed(reason: "simulated blip"))

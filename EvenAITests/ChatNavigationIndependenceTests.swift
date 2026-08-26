@@ -5,7 +5,7 @@ import SwiftData
 
 /// Physical-device regression investigation ("the AI Chat screen also
 /// does not open"). Structural audit found `ChatView`/`ChatViewModel`
-/// have NO reference to `GlassesChatProvider` or `LiveTranslationService`
+/// have NO reference to `GlassesChatProvider` or `AIConversationEngine`
 /// at all: `ChatListView.openGlassesChat()` is the ONLY caller of
 /// `GlassesChatProvider.findOrCreateGlassesChat()` anywhere in the app,
 /// and its own failure path never touches `appState.selectedChatID` —
@@ -85,14 +85,14 @@ struct ChatNavigationIndependenceTests {
 
     // MARK: - 12: Chat navigation does not depend on Live Translation state
 
-    @Test("12: normal AI Chat loads with no LiveTranslationService reference anywhere in its construction or load path")
-    func chatLoadNeverReferencesLiveTranslationService() async throws {
+    @Test("12: normal AI Chat loads with no AIConversationEngine reference anywhere in its construction or load path")
+    func chatLoadNeverReferencesAIConversationEngine() async throws {
         // `ChatViewModel`'s own initializer accepts `chatID`/`chatService`/
-        // `glassesTransport` — there is no `LiveTranslationService`
+        // `glassesTransport` — there is no `AIConversationEngine`
         // parameter to even wire up, and `load()` only ever calls
         // `chatService.fetchChat`/`fetchMessages`. This test exercises
         // that real code path end-to-end and is itself the regression
-        // guard: if a future change added a LiveTranslationService
+        // guard: if a future change added a AIConversationEngine
         // dependency to this path, this test's construction would need
         // to change to accommodate it.
         let chatService = MockChatService(modelContainer: freshModelContainer())

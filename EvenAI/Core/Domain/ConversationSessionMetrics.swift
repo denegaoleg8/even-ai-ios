@@ -2,11 +2,11 @@ import Foundation
 
 /// Plain, directly-testable accumulator for one Live Translation
 /// session's audio/STT/display reliability counters (Conversation Mode
-/// follow-up, Section 6). `LiveTranslationService` owns one instance and
+/// follow-up, Section 6). `AIConversationEngine` owns one instance and
 /// mutates its fields directly as events happen; `DiagnosticTrace` only
 /// ever *renders* a snapshot of it into `CONVERSATION_SESSION_METRICS` —
 /// it is never the primary way this data gets verified. Tests call
-/// `LiveTranslationService.currentSessionMetrics()` and assert on these
+/// `AIConversationEngine.currentSessionMetrics()` and assert on these
 /// fields directly, with no need to intercept console output (this
 /// codebase's `DiagnosticTrace` has no test-capture hook, and inventing
 /// one just to verify counters would be solving the wrong problem — the
@@ -21,14 +21,14 @@ struct ConversationSessionMetrics: Sendable, Equatable {
     var audioByteCount = 0
     var audioGapCount = 0
     var audioMaxGapMs = 0
-    /// A SUSPECTED-drop estimate only — see `LiveTranslationService
+    /// A SUSPECTED-drop estimate only — see `AIConversationEngine
     /// .recordAudioChunk(_:)`'s own doc comment for why an exact count
     /// is structurally impossible given what the SDK provides (no
     /// per-chunk sequence number or embedded capture timestamp).
     var audioSuspectedDroppedChunks = 0
     /// Filled in from `ContinuousTranscribing.reconnectCount` (an
     /// `async` property) only at snapshot time — see
-    /// `LiveTranslationService.currentSessionMetrics()`. Stays `0` on
+    /// `AIConversationEngine.currentSessionMetrics()`. Stays `0` on
     /// any snapshot taken before that fill-in happens.
     var sttReconnectCount = 0
     var utteranceCount = 0

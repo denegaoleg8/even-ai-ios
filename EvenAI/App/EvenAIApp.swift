@@ -14,14 +14,14 @@ struct EvenAIApp: App {
     /// App-level, constructed here rather than through `AppContainer` —
     /// mirrors `appState`/`authState`, not `chatService`/`glassesTransport`
     /// — because it's stateful, observable, app-lifetime state, not a
-    /// swappable dependency. See `LiveTranslationService`'s doc comment.
-    @State private var liveTranslation: LiveTranslationService
+    /// swappable dependency. See `AIConversationEngine`'s doc comment.
+    @State private var liveTranslation: AIConversationEngine
     /// Milestone 2: the ONE shared conversation/session record — see
     /// `AgentContextStore`'s doc comment. Constructed here (same
     /// app-level pattern as `appState`/`authState`/`liveTranslation`) and
     /// handed to `liveTranslation` below *and* injected into the
     /// environment, so every future consumer (Chat, etc.) shares the
-    /// exact same instance `LiveTranslationService` is already writing
+    /// exact same instance `AIConversationEngine` is already writing
     /// into — never a second, independent session.
     @State private var agentContextStore = AgentContextStore()
     /// "Glasses Chat" — the one persistent conversation every G2/Live
@@ -61,10 +61,10 @@ struct EvenAIApp: App {
         // straight through and terminate the whole session; Cloud now
         // transparently falls back to on-device instead).
         //
-        // Held as a named local (not inline in the `LiveTranslationService`
+        // Held as a named local (not inline in the `AIConversationEngine`
         // initializer below) specifically so `onCloudFallback` can be wired
         // up right after `liveTranslation` is constructed — the router has
-        // to exist before `LiveTranslationService` does (it's one of that
+        // to exist before `AIConversationEngine` does (it's one of that
         // type's own init parameters), so it can't reference
         // `liveTranslation` at construction time.
         let transcriberRouter = TranscriptionProviderRouter(
@@ -73,7 +73,7 @@ struct EvenAIApp: App {
             mode: { Self.resolveTranscriptionProviderMode(defaults: .standard) },
             resolveLocale: { Self.resolveOnDeviceLocale(sourceLanguageModeDefaults: .standard) }
         )
-        let liveTranslation = LiveTranslationService(
+        let liveTranslation = AIConversationEngine(
             glassesTransport: AppContainer.live.glassesTransport,
             transcriber: transcriberRouter,
             translator: translator,
@@ -90,7 +90,7 @@ struct EvenAIApp: App {
             // itself is untouched and still fully available for an
             // explicit, opt-in cloud-replies wiring in the future; it's
             // simply no longer the default. Failures of either kind never
-            // reach here either way — `LiveTranslationService
+            // reach here either way — `AIConversationEngine
             // .generateSuggestedReplies` catches everything and simply
             // skips display; translation is a completely independent,
             // higher-priority pipeline (§4/§8 of this pass's own
@@ -105,11 +105,11 @@ struct EvenAIApp: App {
     }
 
     /// Reads the SAME persisted `sourceLanguageMode` UserDefaults key
-    /// `LiveTranslationService` itself owns (`com.evenai.liveTranslation.sourceLanguageMode`)
-    /// directly, rather than threading a `LiveTranslationService`
+    /// `AIConversationEngine` itself owns (`com.evenai.liveTranslation.sourceLanguageMode`)
+    /// directly, rather than threading a `AIConversationEngine`
     /// reference into `TranscriptionProviderRouter` — avoids a circular
     /// construction dependency (the router has to exist before
-    /// `LiveTranslationService` does, since it's one of that type's own
+    /// `AIConversationEngine` does, since it's one of that type's own
     /// init parameters). `.auto`'s on-device locale defaults to the
     /// device's own current region if it's one of the three primary
     /// source languages, else `en-US` — see `SourceLanguageMode
@@ -131,7 +131,7 @@ struct EvenAIApp: App {
     }
 
     /// Reads the SAME persisted `transcriptionProviderMode` key
-    /// `LiveTranslationService` owns, for the same circular-dependency
+    /// `AIConversationEngine` owns, for the same circular-dependency
     /// reason as `resolveOnDeviceLocale(sourceLanguageModeDefaults:)`
     /// above. `static` (not an instance method) deliberately — this
     /// closure is captured inside `init()`, before `self` is fully

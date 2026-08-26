@@ -2,7 +2,7 @@ import Foundation
 @testable import EvenAI
 
 /// Yields a caller-scripted sequence of "final" transcripts — lets a test
-/// drive `LiveTranslationService`'s consume loop without a real `Speech`/
+/// drive `AIConversationEngine`'s consume loop without a real `Speech`/
 /// PCM pipeline. `startTranscribing(pcmUpdates:)` ignores the PCM stream
 /// entirely; only `finals` matters for these tests.
 ///
@@ -12,7 +12,7 @@ import Foundation
 /// session that only ends when `stopTranscribing()` is called — needed by
 /// any test that must observe `.listening` before triggering a stop (e.g.
 /// a connection-loss or backgrounding test), since a stream that finishes
-/// immediately lets `LiveTranslationService.consume(_:)` flip back to
+/// immediately lets `AIConversationEngine.consume(_:)` flip back to
 /// `.idle` on its own before the test ever gets to look.
 actor ScriptedContinuousTranscriber: ContinuousTranscribing {
     private let finals: [String]
@@ -106,7 +106,7 @@ actor ManualContinuousTranscriber: ContinuousTranscribing {
 /// .startTranscribing` call that fails outright (e.g. session recovery
 /// failing inside `URLSessionRealtimeTranscriptionSocket.connect()`,
 /// which `OpenAIRealtimeTranscriber.startTranscribing` propagates the
-/// same way). Used to verify `LiveTranslationService.start()`'s
+/// same way). Used to verify `AIConversationEngine.start()`'s
 /// `LiveTranslationStartError` classification for auth/backend/STT
 /// failures, which a script-based fake (no way to inject an arbitrary
 /// thrown error type) can't exercise.
@@ -131,7 +131,7 @@ actor ThrowingStartContinuousTranscriber: ContinuousTranscribing {
 /// handshake that fails ASYNCHRONOUSLY, moments after `connect()` already
 /// returned (see `URLSessionRealtimeTranscriptionSocket.connect()`'s own
 /// doc comment on why that return doesn't prove the handshake succeeded)
-/// — the scenario `LiveTranslationService.consume(_:)`'s own
+/// — the scenario `AIConversationEngine.consume(_:)`'s own
 /// `hasReceivedAnyUpdateThisSession` reclassification exists to still
 /// report truthfully, not as the generic "stopped unexpectedly".
 actor HandshakeFailingContinuousTranscriber: ContinuousTranscribing {

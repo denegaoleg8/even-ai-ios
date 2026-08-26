@@ -3,16 +3,16 @@ import Foundation
 /// Thrown by a local (on-device) `SuggestedReplyGenerating` implementation
 /// specifically when the underlying capability itself isn't usable right
 /// now — distinct from a generic/transient failure (a single bad
-/// generation, cancellation), which `LiveTranslationService
+/// generation, cancellation), which `AIConversationEngine
 /// .generateSuggestedReplies(for:sequence:turnStartTime:)` already treats
 /// identically either way ("skip this turn's replies, translation stays
 /// visible"). This ONE error type additionally drives
-/// `LiveTranslationService.repliesUnavailableReason`, so the Live
+/// `AIConversationEngine.repliesUnavailableReason`, so the Live
 /// Translation UI can truthfully explain WHY replies aren't appearing at
 /// all, rather than every turn silently having none for no visible
 /// reason. Deliberately lives in `Core/Domain` (not `Infrastructure`,
 /// where the real `FoundationModels`-based generator that throws it
-/// lives) so `LiveTranslationService` can catch/inspect it without
+/// lives) so `AIConversationEngine` can catch/inspect it without
 /// importing anything Apple-Intelligence-specific.
 struct LocalReplyUnavailableError: Error, Equatable, Sendable {
     enum Reason: Equatable, Sendable {

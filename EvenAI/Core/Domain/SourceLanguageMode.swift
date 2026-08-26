@@ -1,7 +1,7 @@
 import Foundation
 
 /// Live Translation's source-language selector. `.auto` runs on-device
-/// language detection (see `LiveTranslationService`'s Auto-lock/hysteresis
+/// language detection (see `AIConversationEngine`'s Auto-lock/hysteresis
 /// behavior); `.en`/`.de`/`.pl` are explicit — the user has told the app
 /// what language they're speaking, so no detection runs at all for every
 /// utterance while that mode is selected. Stable, backend-matching codes
@@ -15,7 +15,7 @@ enum SourceLanguageMode: String, CaseIterable, Codable, Sendable {
     case pl
 
     /// Short, glasses-usable label for the selector UI — see
-    /// `LiveTranslationView`'s "Auto | EN | DE | PL" control.
+    /// `AIConversationView`'s "Auto | EN | DE | PL" control.
     var displayLabel: String {
         switch self {
         case .auto: "Auto"

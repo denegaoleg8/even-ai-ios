@@ -8,7 +8,7 @@ import SwiftData
 /// Root cause of the reported "suggested mini replies are missing": the
 /// only production `SuggestedReplyGenerating` was `NetworkSuggestedReplyGenerator`,
 /// which requires the (now-unavailable) Railway backend's `/suggested-replies`
-/// endpoint — every attempt failed, and `LiveTranslationService
+/// endpoint — every attempt failed, and `AIConversationEngine
 /// .generateSuggestedReplies` already correctly swallowed that failure
 /// (translation kept working, exactly as designed), which is EXACTLY why
 /// replies silently disappeared rather than the app crashing or erroring
@@ -40,7 +40,7 @@ struct SuggestedRepliesLocalFirstTests {
             SuggestedReply(originalLanguageText: "Yes, I'd love to.", ukrainianText: "Так, із задоволенням.", ordering: 0),
             SuggestedReply(originalLanguageText: "What time?", ukrainianText: "О котрій?", ordering: 1),
         ])
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["Do you want to come with us tomorrow?"]),
             translator: ScriptedLanguageTranslator(
@@ -69,14 +69,14 @@ struct SuggestedRepliesLocalFirstTests {
         let generator = FakeSuggestedReplyGenerator(defaultReplies: [
             SuggestedReply(originalLanguageText: "Sure", ukrainianText: "Так", ordering: 0),
         ])
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
             replyGenerator: generator,
             defaults: freshDefaults()
         )
-        service.setConversationMode(.meeting)
+        service.setConversationProfile(.meeting)
 
         await service.start()
         try? await Task.sleep(for: Self.propagationDelay)
@@ -99,7 +99,7 @@ struct SuggestedRepliesLocalFirstTests {
         let generator = FakeSuggestedReplyGenerator(defaultReplies: [
             SuggestedReply(originalLanguageText: "Sure", ukrainianText: "Так", ordering: 0),
         ])
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
@@ -107,7 +107,7 @@ struct SuggestedRepliesLocalFirstTests {
             replyGenerator: generator,
             defaults: freshDefaults()
         )
-        service.setConversationMode(.meeting)
+        service.setConversationProfile(.meeting)
 
         await service.start()
         try? await Task.sleep(for: Self.propagationDelay)
@@ -124,7 +124,7 @@ struct SuggestedRepliesLocalFirstTests {
         let generator = FakeSuggestedReplyGenerator(defaultReplies: [
             SuggestedReply(originalLanguageText: "reply", ukrainianText: "відповідь", ordering: 0),
         ])
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["first phrase", "second phrase"]),
             translator: ScriptedLanguageTranslator(
@@ -159,7 +159,7 @@ struct SuggestedRepliesLocalFirstTests {
             SuggestedReply(originalLanguageText: "Sorry, I can't tomorrow.", ukrainianText: "Вибач, завтра я не можу.", ordering: 2),
         ])
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["Do you want to come with us tomorrow?"]),
             translator: ScriptedLanguageTranslator(
@@ -188,7 +188,7 @@ struct SuggestedRepliesLocalFirstTests {
     func modelUnavailableSetsNoticeAndKeepsTranslating() async throws {
         let spy = SpyGlassesTransport()
         let generator = FakeSuggestedReplyGenerator(error: LocalReplyUnavailableError(reason: .appleIntelligenceNotEnabled))
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт"),
@@ -222,7 +222,7 @@ struct SuggestedRepliesLocalFirstTests {
             ],
             error: nil
         )
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["second"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["second": "en"], translation: "переклад"),
@@ -235,7 +235,7 @@ struct SuggestedRepliesLocalFirstTests {
         #expect(service.repliesUnavailableReason == nil) // this generator never fails, so it's already nil — the real assertion is below
         // A second service using a FAILING generator sets the notice...
         let failingGenerator = FakeSuggestedReplyGenerator(error: LocalReplyUnavailableError(reason: .modelNotReady))
-        let service2 = LiveTranslationService(
+        let service2 = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["x"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["x": "en"], translation: "y"),
@@ -256,7 +256,7 @@ struct SuggestedRepliesLocalFirstTests {
         let generator = GatedSuggestedReplyGenerator(repliesByOriginalText: [
             "phrase A": [SuggestedReply(originalLanguageText: "A-reply", ukrainianText: "А-відповідь", ordering: 0)],
         ])
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["phrase A", "phrase B"]),
             translator: ScriptedLanguageTranslator(
@@ -298,7 +298,7 @@ struct SuggestedRepliesLocalFirstTests {
             SuggestedReply(originalLanguageText: "reply two", ukrainianText: "відповідь два", ordering: 1),
         ])
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: ["first": "en", "second": "en"], translation: "переклад"),
@@ -330,7 +330,7 @@ struct SuggestedRepliesLocalFirstTests {
         let spy = SpyGlassesTransport()
         struct SomeFailure: Error {}
         let generator = FakeSuggestedReplyGenerator(error: SomeFailure())
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт"),
@@ -363,7 +363,7 @@ struct SuggestedRepliesLocalFirstTests {
             SuggestedReply(originalLanguageText: "Yes, I'd love to.", ukrainianText: "Так, із задоволенням.", ordering: 0),
             SuggestedReply(originalLanguageText: "What time?", ukrainianText: "О котрій?", ordering: 1),
         ])
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["Do you want to come with us tomorrow?"]),
             translator: ScriptedLanguageTranslator(
@@ -394,7 +394,7 @@ struct SuggestedRepliesLocalFirstTests {
         let spy = SpyGlassesTransport()
         let store = freshGlassesChatStore()
         let glassesChatProvider = GlassesChatProvider(localStore: store, defaults: freshDefaults())
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["hello there"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт"),
@@ -424,7 +424,7 @@ struct SuggestedRepliesLocalFirstTests {
         let spy = SpyGlassesTransport()
         let store = freshGlassesChatStore()
         let glassesChatProvider = GlassesChatProvider(localStore: store, defaults: freshDefaults())
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: FakeOnDeviceTranscriber(finals: ["hello there"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт"),

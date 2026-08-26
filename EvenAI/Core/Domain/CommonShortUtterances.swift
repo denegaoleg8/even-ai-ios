@@ -7,10 +7,10 @@ import Foundation
 /// English, its actual language; "no"/"goodbye" score even lower and get
 /// assigned to entirely wrong languages) and, for the same underlying
 /// reason, for Auto-mode session language-*locking* hysteresis (see
-/// `LiveTranslationService.resolveSourceLanguage(for:)`).
+/// `AIConversationEngine.resolveSourceLanguage(for:)`).
 ///
 /// One shared definition so `AppleLanguageTranslator` (detection) and
-/// `LiveTranslationService` (lock hysteresis) always agree on exactly
+/// `AIConversationEngine` (lock hysteresis) always agree on exactly
 /// which utterances are "ambiguous," rather than two independently
 /// maintained lists silently drifting apart.
 ///
@@ -64,7 +64,7 @@ enum CommonShortUtterances {
     }
 
     /// Whether `text` is one of these known-ambiguous utterances — the
-    /// signal `LiveTranslationService` uses to decide "too weak to switch
+    /// signal `AIConversationEngine` uses to decide "too weak to switch
     /// an already-locked Auto session's language."
     static func isAmbiguous(_ text: String) -> Bool {
         languageByWord[normalize(text)] != nil

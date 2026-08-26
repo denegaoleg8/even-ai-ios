@@ -2,10 +2,10 @@ import Testing
 import Foundation
 @testable import EvenAI
 
-/// Milestone 8b: proves `LiveTranslationService` behaves correctly when
+/// Milestone 8b: proves `AIConversationEngine` behaves correctly when
 /// wired to the *real* production transcriber (`OpenAIRealtimeTranscriber`),
 /// not just `ScriptedContinuousTranscriber` — the one thing
-/// `LiveTranslationServiceTests`/`OpenAIRealtimeTranscriberTests` (Milestone
+/// `AIConversationEngineTests`/`OpenAIRealtimeTranscriberTests` (Milestone
 /// 8a) couldn't prove on their own, since neither exercises both types
 /// together. Still entirely fake-driven: `FakeRealtimeTranscriptionSocket`
 /// stands in for the WebSocket connection — no real network call anywhere
@@ -15,11 +15,11 @@ import Foundation
 /// entirely on the backend (see `openaiClient.js`'s `SUPPORTED_LANGUAGES`)
 /// — nothing here configures a language; these tests only prove that
 /// whatever text the transcription layer reports, in whatever language,
-/// flows correctly through `LiveTranslationService`'s existing (unchanged)
+/// flows correctly through `AIConversationEngine`'s existing (unchanged)
 /// detect → filter-Ukrainian → translate → display pipeline.
 @MainActor
-@Suite("LiveTranslationService + OpenAIRealtimeTranscriber (production wiring)")
-struct LiveTranslationServiceOpenAIRealtimeTranscriberTests {
+@Suite("AIConversationEngine + OpenAIRealtimeTranscriber (production wiring)")
+struct AIConversationEngineOpenAIRealtimeTranscriberTests {
     private static let propagationDelay: Duration = .milliseconds(100)
 
     private func makeService(
@@ -30,8 +30,8 @@ struct LiveTranslationServiceOpenAIRealtimeTranscriberTests {
         translation: String = "переклад",
         maxConsecutiveReconnectAttempts: Int = 5,
         reconnectBackoffSchedule: [Duration] = [.zero, .milliseconds(20), .milliseconds(20), .milliseconds(20), .milliseconds(20)]
-    ) -> LiveTranslationService {
-        LiveTranslationService(
+    ) -> AIConversationEngine {
+        AIConversationEngine(
             glassesTransport: spy,
             transcriber: OpenAIRealtimeTranscriber(
                 makeSocket: { await factory.makeSocket() },
@@ -207,7 +207,7 @@ struct LiveTranslationServiceOpenAIRealtimeTranscriberTests {
         await (await factory.createdSockets[2]).emit(.closed(reason: "drop 3"))
         try? await Task.sleep(for: Self.propagationDelay)
 
-        // Ends cleanly (LiveTranslationService's existing "stream errored"
+        // Ends cleanly (AIConversationEngine's existing "stream errored"
         // path: state -> .error, terminateSession disables the mic) —
         // no fourth connection ever attempted once the budget of 2
         // reconnect attempts is exhausted, i.e. no retry storm.

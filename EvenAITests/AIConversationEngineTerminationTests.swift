@@ -10,8 +10,8 @@ import Foundation
 /// fatal audio/STT/session failure may stop listening — holds for every
 /// one of those four failure classes, each with an explicit
 /// `service.state == .listening` assertion (not just "did the turn look
-/// right," which `LiveTranslationServiceTests`/
-/// `LiveTranslationServiceSuggestedRepliesTests` already separately
+/// right," which `AIConversationEngineTests`/
+/// `AIConversationEngineSuggestedRepliesTests` already separately
 /// verify for translation/reply failures specifically). Also covers
 /// explicit-stop classification, task-cancellation classification,
 /// Conversation Mode navigation isolation, and AudioSource-switch
@@ -22,13 +22,13 @@ import Foundation
 /// socket close reconnects and continues; a failed reconnect only
 /// terminates after the bounded retry policy is exhausted) lives in
 /// `OpenAIRealtimeTranscriberTests`/
-/// `LiveTranslationServiceOpenAIRealtimeTranscriberTests` — not
+/// `AIConversationEngineOpenAIRealtimeTranscriberTests` — not
 /// duplicated here.
 @MainActor
-@Suite("LiveTranslationService — termination diagnostics & failure isolation")
-struct LiveTranslationServiceTerminationTests {
+@Suite("AIConversationEngine — termination diagnostics & failure isolation")
+struct AIConversationEngineTerminationTests {
     private func freshDefaults() -> UserDefaults {
-        UserDefaults(suiteName: "LiveTranslationServiceTerminationTests.\(UUID().uuidString)")!
+        UserDefaults(suiteName: "AIConversationEngineTerminationTests.\(UUID().uuidString)")!
     }
 
     // MARK: - 1-4: isolated failures never terminate the session
@@ -36,7 +36,7 @@ struct LiveTranslationServiceTerminationTests {
     @Test("1: a translation failure never sets state to .error — session stays .listening")
     func translationFailureNeverTerminatesSession() async throws {
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag", "hello there"], autoFinish: false),
             translator: ThrowingLanguageTranslator(failingTexts: ["Guten Tag"], translation: "привіт"),
@@ -54,7 +54,7 @@ struct LiveTranslationServiceTerminationTests {
     func replyFailureNeverTerminatesSession() async throws {
         let generator = FakeSuggestedReplyGenerator(error: FakeSuggestedReplyGenerationError(message: "boom"))
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"], autoFinish: false),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
@@ -73,7 +73,7 @@ struct LiveTranslationServiceTerminationTests {
     func displayFailureNeverTerminatesSession() async throws {
         let transport = DisplayFailingGlassesTransport()
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: transport,
             transcriber: ScriptedContinuousTranscriber(finals: ["first phrase", "second phrase"], autoFinish: false),
             translator: ScriptedLanguageTranslator(
@@ -98,7 +98,7 @@ struct LiveTranslationServiceTerminationTests {
     func provisionalTranslationFailureNeverTerminatesSession() async throws {
         let store = AgentContextStore()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: transcriber,
             translator: HangingLanguageTranslator(
@@ -128,7 +128,7 @@ struct LiveTranslationServiceTerminationTests {
 
     @Test("7: an explicit user Stop terminates cleanly — state becomes .idle, never the 'stopped unexpectedly' error")
     func explicitStopTerminatesCleanly() async throws {
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ManualContinuousTranscriber(),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -151,7 +151,7 @@ struct LiveTranslationServiceTerminationTests {
     func taskCancellationFromStopIsClassifiedCleanly() async throws {
         let transcriber = ManualContinuousTranscriber()
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: ["hello": "en"], translation: "привіт"),
@@ -186,7 +186,7 @@ struct LiveTranslationServiceTerminationTests {
         let spy = SpyGlassesTransport()
         let store = AgentContextStore()
         let transcriber = ManualContinuousTranscriber()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(
@@ -226,7 +226,7 @@ struct LiveTranslationServiceTerminationTests {
         let spy = SpyGlassesTransport()
         let transcriber = ManualContinuousTranscriber()
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: transcriber,
             translator: ScriptedLanguageTranslator(languageCodes: ["hello": "en"], translation: "переклад"),

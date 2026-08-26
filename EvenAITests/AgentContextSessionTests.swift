@@ -3,8 +3,8 @@ import Testing
 @testable import EvenAI
 
 /// Pure domain-model tests for the shared conversation/session/context
-/// object — no Speech/Azure/OpenAI/G2/SwiftUI, no `LiveTranslationService`,
-/// no networking. `LiveTranslationService` and Chat are untouched by this
+/// object — no Speech/Azure/OpenAI/G2/SwiftUI, no `AIConversationEngine`,
+/// no networking. `AIConversationEngine` and Chat are untouched by this
 /// milestone; these tests only cover the new shared model in isolation.
 @Suite("AgentContextSession")
 struct AgentContextSessionTests {

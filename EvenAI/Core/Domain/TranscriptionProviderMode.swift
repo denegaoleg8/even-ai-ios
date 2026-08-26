@@ -14,8 +14,8 @@ import Foundation
 /// silent fallback mid-session once a provider has started successfully.
 ///
 /// Persisted the same way `SourceLanguageMode`/`AudioSource`/
-/// `ConversationMode` already are (`UserDefaults`, via
-/// `LiveTranslationService`), so the choice survives relaunch.
+/// `ConversationProfile` already are (`UserDefaults`, via
+/// `AIConversationEngine`), so the choice survives relaunch.
 enum TranscriptionProviderMode: String, CaseIterable, Codable, Sendable {
     case auto
     case onDevice

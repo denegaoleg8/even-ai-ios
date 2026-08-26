@@ -15,7 +15,7 @@ import Foundation
 ///
 /// Every failure mode (offline, HTTP error, malformed response body) is a
 /// plain `throw` — nothing here ever produces a partial or best-guess
-/// result. `LiveTranslationService.generateSuggestedReplies(for:)` is the
+/// result. `AIConversationEngine.generateSuggestedReplies(for:)` is the
 /// one place that decides what a thrown error means for the live
 /// session (leave `suggestedReplies` empty, keep the translation turn
 /// exactly as already displayed), so this type doesn't need its own

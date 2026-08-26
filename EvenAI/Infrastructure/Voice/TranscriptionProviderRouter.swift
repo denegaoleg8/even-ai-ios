@@ -9,7 +9,7 @@ import Foundation
 /// call). This type wraps both a local (`GlassesSpeechTranscriber`) and a
 /// cloud (`OpenAIRealtimeTranscriber`) transcriber behind the same
 /// `ContinuousTranscribing` protocol and decides, per `startTranscribing`
-/// call, which one actually runs — `LiveTranslationService` itself has no
+/// call, which one actually runs — `AIConversationEngine` itself has no
 /// idea which provider is active, exactly as it had no idea before this
 /// type existed.
 ///
@@ -33,7 +33,7 @@ import Foundation
 ///   Translation, regardless of which provider setting is selected. Only
 ///   if BOTH `cloud` and the subsequent `local` fallback fail does this
 ///   throw. `onCloudFallback` is invoked (main-actor) exactly when this
-///   happens, so `LiveTranslationService` can surface a truthful,
+///   happens, so `AIConversationEngine` can surface a truthful,
 ///   non-blocking notice instead of a misleading auth/G2 error.
 /// - `.auto` (default): tries `local` first; only if `local.startTranscribing`
 ///   throws (i.e. can't even begin — never mid-stream, since a stream that
@@ -45,7 +45,7 @@ import Foundation
 ///   (`STT_PROVIDER_FALLBACK`) either way so which path actually ran is
 ///   always traceable.
 ///
-/// `lastActiveProvider` is the one piece of state `LiveTranslationService`
+/// `lastActiveProvider` is the one piece of state `AIConversationEngine`
 /// (and the Settings/Live Translation UI, per the product's "clear
 /// provider labeling" requirement) reads back — never inferred, always set
 /// at the exact moment a provider's `startTranscribing` call is about to
@@ -59,7 +59,7 @@ final class TranscriptionProviderRouter: ContinuousTranscribing, @unchecked Send
     /// Resolves the on-device locale `local` should use for the CURRENT
     /// source-language setting — re-read every time a session (re)starts
     /// or `applyCurrentLocale()` is called, never cached, so it always
-    /// reflects whatever `LiveTranslationService.sourceLanguageMode` is
+    /// reflects whatever `AIConversationEngine.sourceLanguageMode` is
     /// right now. Defaulted to `Locale.autoupdatingCurrent`-driven Auto
     /// resolution; overridable for tests.
     private let resolveLocale: @MainActor () -> Locale
@@ -80,11 +80,11 @@ final class TranscriptionProviderRouter: ContinuousTranscribing, @unchecked Send
     private(set) var lastCloudFailureReason: Error?
     /// Invoked on the main actor exactly when an explicit-Cloud session
     /// falls back to on-device — at start time or mid-session — so
-    /// `LiveTranslationService` can surface a truthful, immediate notice
+    /// `AIConversationEngine` can surface a truthful, immediate notice
     /// ("Cloud transcription is currently unavailable. Using on-device
     /// transcription.") without polling. Settable post-construction (not
     /// an init parameter): `EvenAIApp` constructs this router before
-    /// `LiveTranslationService` exists (this router is one of that type's
+    /// `AIConversationEngine` exists (this router is one of that type's
     /// own init parameters), so the callback is wired up right after.
     var onCloudFallback: (@MainActor (Error) -> Void)?
 
@@ -112,7 +112,7 @@ final class TranscriptionProviderRouter: ContinuousTranscribing, @unchecked Send
     }
 
     /// Pushes the current `resolveLocale()` result into `local` — called by
-    /// `LiveTranslationService.setSourceLanguageMode(_:)` so an explicit
+    /// `AIConversationEngine.setSourceLanguageMode(_:)` so an explicit
     /// EN/DE/PL switch (or a switch back to Auto) takes effect immediately
     /// on an already-listening on-device session, mirroring how the real
     /// `TranslationSession` is already reconfigured live on the same
@@ -163,7 +163,7 @@ final class TranscriptionProviderRouter: ContinuousTranscribing, @unchecked Send
     /// (the initial `try await cloud.startTranscribing` AND the
     /// subsequent `for try await` over its stream) in one `do` block.
     ///
-    /// Returns ONE continuous outward stream — `LiveTranslationService`
+    /// Returns ONE continuous outward stream — `AIConversationEngine`
     /// never sees a "provider changed" event, exactly like it never sees
     /// `OpenAIRealtimeTranscriber`'s own internal reconnects or
     /// `GlassesSpeechTranscriber`'s own internal session-duration-limit

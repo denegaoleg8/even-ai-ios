@@ -4,7 +4,7 @@ import Foundation
 
 /// Milestone 7: `NetworkSuggestedReplyGenerator`'s own contract — request
 /// shape and response parsing — entirely independent of
-/// `LiveTranslationServiceSuggestedRepliesTests`, which already covers the
+/// `AIConversationEngineSuggestedRepliesTests`, which already covers the
 /// generic `SuggestedReplyGenerating` integration contract via
 /// `FakeSuggestedReplyGenerator` and stays unchanged. No real network call
 /// is made anywhere here — `StubURLProtocol` intercepts every request,
@@ -242,11 +242,11 @@ struct NetworkSuggestedReplyGeneratorTests {
         }
     }
 
-    // MARK: - End-to-end through LiveTranslationService (no real network)
+    // MARK: - End-to-end through AIConversationEngine (no real network)
 
     @MainActor
-    @Test("wired into LiveTranslationService, a stubbed backend response becomes the turn's suggested replies")
-    func integratesWithLiveTranslationService() async throws {
+    @Test("wired into AIConversationEngine, a stubbed backend response becomes the turn's suggested replies")
+    func integratesWithAIConversationEngine() async throws {
         let (generator, _) = makeGenerator()
         StubURLProtocol.handler = { _ in
             Self.jsonResponse(200, [
@@ -254,7 +254,7 @@ struct NetworkSuggestedReplyGeneratorTests {
             ])
         }
         let store = AgentContextStore()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),
@@ -271,13 +271,13 @@ struct NetworkSuggestedReplyGeneratorTests {
     }
 
     @MainActor
-    @Test("wired into LiveTranslationService, a backend failure leaves the translation turn valid with empty replies")
-    func integratesWithLiveTranslationServiceOnFailure() async throws {
+    @Test("wired into AIConversationEngine, a backend failure leaves the translation turn valid with empty replies")
+    func integratesWithAIConversationEngineOnFailure() async throws {
         let (generator, _) = makeGenerator()
         StubURLProtocol.handler = { _ in Self.jsonResponse(502, ["error": ["code": "UPSTREAM_LLM_ERROR", "message": "boom"]]) }
         let store = AgentContextStore()
         let spy = SpyGlassesTransport()
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: ScriptedContinuousTranscriber(finals: ["Guten Tag"]),
             translator: ScriptedLanguageTranslator(languageCodes: ["Guten Tag": "de"], translation: "Добрий день"),

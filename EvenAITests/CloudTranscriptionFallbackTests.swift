@@ -14,7 +14,7 @@ import SwiftData
 /// `URLSessionRealtimeTranscriptionSocket.connect()` →
 /// `OpenAIRealtimeTranscriber.startTranscribing` →
 /// `TranscriptionProviderRouter`'s (then-unguarded) `.cloud` case →
-/// `LiveTranslationService.start()`'s catch block, which classified it as
+/// `AIConversationEngine.start()`'s catch block, which classified it as
 /// `.authenticationFailed` (a MISLEADING message — nothing about the
 /// user's session was actually wrong) and called `terminateSession(...)`,
 /// tearing down the whole Live Translation session (mic disabled,
@@ -25,7 +25,7 @@ import SwiftData
 /// back to `local` on ANY cloud failure — at start time or mid-session —
 /// via `startCloudWithLocalFallback(pcmUpdates:)`. These tests prove that
 /// fallback end-to-end, at both the router level (precise, fast,
-/// scripted providers) and the full `LiveTranslationService` level
+/// scripted providers) and the full `AIConversationEngine` level
 /// (translation/G2 display/history/Glasses Chat all keep working).
 /// Collects `TranscriptionUpdate`s from a background consuming `Task` —
 /// an `actor` so appending from that task and reading back from the
@@ -72,7 +72,7 @@ struct CloudTranscriptionFallbackTests {
         // `FakeOnDeviceTranscriber`'s here. Draining it with an unbounded
         // `for try await` would hang forever; consume in the background,
         // give it a moment, then stop — the same pattern
-        // `LiveTranslationService` itself uses in production.
+        // `AIConversationEngine` itself uses in production.
         let stream = try await router.startTranscribing(pcmUpdates: AsyncStream { $0.finish() })
         let received = Received()
         let consumeTask = Task {
@@ -200,7 +200,7 @@ struct CloudTranscriptionFallbackTests {
 
     @Test("Repeated taps on the Cloud picker (mode already .cloud) are pure no-ops — no extra defaults writes, no router state change")
     func repeatedCloudModeSelectionIsANoOp() async throws {
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: SpyGlassesTransport(),
             transcriber: ScriptedContinuousTranscriber(finals: []),
             translator: ScriptedLanguageTranslator(languageCodes: [:]),
@@ -215,7 +215,7 @@ struct CloudTranscriptionFallbackTests {
         #expect(service.transcriptionProviderMode == .cloud)
     }
 
-    // MARK: - LiveTranslationService-level: full pipeline
+    // MARK: - AIConversationEngine-level: full pipeline
 
     @Test("Local → Cloud selection → start(): cloud unavailable → automatic fallback to local → translation continues → G2 keeps receiving → session never terminates")
     func fullPipelineCloudUnavailableFallsBackAndKeepsTranslating() async throws {
@@ -229,7 +229,7 @@ struct CloudTranscriptionFallbackTests {
             mode: { .cloud },
             resolveLocale: { Locale(identifier: "en-US") }
         )
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: router,
             translator: ScriptedLanguageTranslator(
@@ -269,7 +269,7 @@ struct CloudTranscriptionFallbackTests {
         )
         let chatStore = freshGlassesChatStore()
         let glassesChatProvider = GlassesChatProvider(localStore: chatStore, defaults: freshDefaults())
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: router,
             translator: ScriptedLanguageTranslator(
@@ -311,7 +311,7 @@ struct CloudTranscriptionFallbackTests {
             mode: { .cloud },
             resolveLocale: { Locale(identifier: "en-US") }
         )
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: router,
             translator: ScriptedLanguageTranslator(
@@ -381,7 +381,7 @@ struct CloudTranscriptionFallbackTests {
             mode: { .cloud },
             resolveLocale: { Locale(identifier: "en-US") }
         )
-        let service = LiveTranslationService(
+        let service = AIConversationEngine(
             glassesTransport: spy,
             transcriber: router,
             translator: ScriptedLanguageTranslator(languageCodes: ["hello there": "en"], translation: "привіт"),
