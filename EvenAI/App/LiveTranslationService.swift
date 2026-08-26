@@ -294,6 +294,21 @@ final class LiveTranslationService {
     /// fresh chance) and whenever the user switches away from `.cloud`
     /// mode (the notice would otherwise be stale/irrelevant).
     private(set) var cloudFallbackNotice: String?
+    /// Non-`nil` exactly when the MOST RECENT reply-generation attempt
+    /// failed specifically because the local (on-device) provider itself
+    /// isn't usable right now — device ineligible, Apple Intelligence
+    /// disabled, model not ready, or (pre-iOS 26) not supported at all —
+    /// see `LocalReplyUnavailableError`. Deliberately distinct from every
+    /// OTHER reply-generation failure (a timeout, a cancellation, a
+    /// single bad generation): those are treated as transient and never
+    /// touch this property, since flashing an "unavailable" notice for a
+    /// one-off blip would be misleading. Never treated as a session error
+    /// either way: translation/G2 display/listening are completely
+    /// unaffected by any reply failure, local-unavailable or otherwise.
+    /// Cleared the moment a reply generation attempt actually succeeds
+    /// (the capability recovered — e.g. the model finished downloading)
+    /// and at the start of every new `start()` call.
+    private(set) var repliesUnavailableReason: String?
     /// Conversation Mode: see `DisplayMode`'s own doc comment.
     /// Listening/translation/history recording are NEVER gated on this —
     /// only the act of actually pushing a new display update to G2 is
@@ -729,6 +744,10 @@ final class LiveTranslationService {
         // PREVIOUS session must never carry over — this session gets its
         // own fresh attempt (Railway/cloud connectivity may have changed).
         cloudFallbackNotice = nil
+        // Same reasoning for a stale "replies unavailable" notice — a
+        // fresh session re-checks local-reply availability on its own
+        // first turn.
+        repliesUnavailableReason = nil
         // "Reset the Auto language lock when a new Live Translation
         // session begins" — a lock from a previous session (possibly a
         // different speaker/language entirely) must never carry over.
@@ -2085,6 +2104,18 @@ final class LiveTranslationService {
             DiagnosticTrace.log("REPLIES_GENERATION_FINISHED", "turnID=\(turnID) reason=timeout")
             DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=repliesTimeout")
             return
+        } catch let unavailable as LocalReplyUnavailableError {
+            // Distinct from every other failure below: the local
+            // provider itself isn't usable right now (device ineligible,
+            // Apple Intelligence disabled, model not ready, or — pre-iOS
+            // 26 — not supported at all). Never a session error, never a
+            // fallback to any backend — just a truthful UI notice, and
+            // this turn simply has no replies.
+            repliesUnavailableReason = unavailable.userFacingMessage
+            DiagnosticTrace.log("REPLIES_LOCAL_PROVIDER_UNAVAILABLE", "turnID=\(turnID) reason=\(unavailable.reason)")
+            DiagnosticTrace.log("REPLIES_GENERATION_FINISHED", "turnID=\(turnID) reason=localUnavailable")
+            DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=repliesLocalUnavailable")
+            return
         } catch {
             DiagnosticTrace.log("LIVE_TRACE", "suggested-reply generation failed: \(error)")
             DiagnosticTrace.log("REAL_TURN_TRACE", "REPLIES failed turnID=\(turnID) error=\(error)")
@@ -2099,6 +2130,11 @@ final class LiveTranslationService {
             DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=repliesCancelledAfterCompletion")
             return
         }
+        // A successful generation proves the local provider IS usable
+        // right now — clears any stale "unavailable" notice from an
+        // earlier turn this session (e.g. the model finished downloading
+        // mid-session).
+        repliesUnavailableReason = nil
 
         var updatedTurn = turn
         // Capped here regardless of what the generator returned — G2's
@@ -2124,23 +2160,45 @@ final class LiveTranslationService {
             DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=noRepliesToShow")
             return
         }
-        let replyPages = GlassesPresentationLayer.conversationPages(
-            for: updatedTurn,
-            previousTurn: previousTurn(before: turnID)
-        )
-        DiagnosticTrace.log("REAL_TURN_TRACE", "PAGES stage=withReplies turnID=\(turnID) count=\(replyPages.count)")
+
+        // "Glasses Chat" — persists the replies alongside their turn,
+        // local-first exactly like the turn's own translation (see
+        // `GlassesChatProvider.appendReplies(originalText:replies:)`):
+        // never awaited by this pipeline, never gated on G2
+        // staleness/followLive below (those guards are about what's
+        // ACTIVELY shown, not about history), no network involved.
+        // `glassesChatProvider` being `nil` (e.g. in a test) simply means
+        // this is never attempted, same as the turn-append in `processTurn`.
+        if let glassesChatProvider {
+            let repliesForChat = updatedTurn.suggestedReplies
+            let originalTextForChat = updatedTurn.originalText
+            Task {
+                do {
+                    DiagnosticTrace.log("GLASSES_CHAT_TRACE", "APPEND_REPLIES_START turnID=\(turnID)")
+                    _ = try await glassesChatProvider.appendReplies(originalText: originalTextForChat, replies: repliesForChat)
+                    DiagnosticTrace.log("GLASSES_CHAT_TRACE", "APPEND_REPLIES_DONE turnID=\(turnID)")
+                } catch {
+                    DiagnosticTrace.log("GLASSES_CHAT_TRACE", "APPEND_REPLIES_FAILED turnID=\(turnID) error=\(error)")
+                }
+            }
+        }
+
+        // Meeting Mode restoration: replies must ALSO reach G2 — never
+        // fully suppressed the way they used to be — but Meeting Mode's
+        // own priority order ("live speech > translation/history >
+        // replies") means they must never REPLACE what's actively shown.
+        // `meetingConversationPages(for:previousTurn:)` keeps page 0 as
+        // the plain header/transcript (identical to what's already on
+        // screen), with reply pages appended afterward as additional,
+        // swipeable — but not auto-shown — content. Standard Mode is
+        // unchanged: `conversationPages(for:previousTurn:)` merges the
+        // first reply directly onto page 0, so it's shown immediately.
+        let replyPages = conversationMode == .meeting
+            ? GlassesPresentationLayer.meetingConversationPages(for: updatedTurn, previousTurn: previousTurn(before: turnID))
+            : GlassesPresentationLayer.conversationPages(for: updatedTurn, previousTurn: previousTurn(before: turnID))
+        DiagnosticTrace.log("REAL_TURN_TRACE", "PAGES stage=withReplies turnID=\(turnID) count=\(replyPages.count) mode=\(conversationMode.rawValue)")
         DiagnosticTrace.log("SUGGESTED_REPLIES_PAGES_CREATED", "id=\(turnID) count=\(replyPages.count)")
         let replyDisplayStart = Date()
-        // Meeting Mode: replies are lower priority — generated and
-        // recorded (already done above) exactly as in Standard mode, but
-        // never auto-displayed on G2, keeping the screen dedicated to
-        // the conversation transcript. Fully visible in Glasses Chat on
-        // the phone either way.
-        guard conversationMode != .meeting else {
-            DiagnosticTrace.log("MEETING_MODE_REPLY_DISPLAY_SUPPRESSED", "turnID=\(turnID)")
-            DiagnosticTrace.log("TURN_PIPELINE_RELEASED", "id=\(turnID) reason=meetingModeRepliesSuppressed")
-            return
-        }
         // Conversation Mode: never overwrite what the user is manually
         // reviewing. The reply is still recorded in history above
         // (`agentContextStore.updateTurn(updatedTurn)`) — only the G2

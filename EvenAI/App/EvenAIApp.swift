@@ -78,14 +78,24 @@ struct EvenAIApp: App {
             transcriber: transcriberRouter,
             translator: translator,
             agentContextStore: agentContextStore,
-            // Milestone 7: real, backend-calling generator — shares
-            // `AppContainer.live.apiClient` with Chat/Auth, same
-            // "one client, one session" rule those already follow.
-            // Optional-online-enhancement layer only (§8 of the
-            // local-first architecture pass): its failures never
-            // reach here — `LiveTranslationService.generateSuggestedReplies`
-            // catches everything and simply skips display.
-            replyGenerator: NetworkSuggestedReplyGenerator(apiClient: AppContainer.live.apiClient),
+            // Suggested-replies restoration pass: local-first, exactly
+            // like the transcriber above — `LocalSuggestedReplyGenerator`
+            // prefers Apple's on-device `FoundationModels` framework
+            // (iOS 26+, Apple Intelligence) and NEVER falls back to
+            // Railway/`NetworkSuggestedReplyGenerator` automatically when
+            // it's unavailable (device ineligible, Apple Intelligence
+            // off, model not ready, or a pre-iOS-26 device) — that would
+            // silently reintroduce the exact backend dependency this
+            // whole architecture pass removes. `NetworkSuggestedReplyGenerator`
+            // itself is untouched and still fully available for an
+            // explicit, opt-in cloud-replies wiring in the future; it's
+            // simply no longer the default. Failures of either kind never
+            // reach here either way — `LiveTranslationService
+            // .generateSuggestedReplies` catches everything and simply
+            // skips display; translation is a completely independent,
+            // higher-priority pipeline (§4/§8 of this pass's own
+            // requirements).
+            replyGenerator: LocalSuggestedReplyGenerator(),
             glassesChatProvider: glassesChatProvider
         )
         transcriberRouter.onCloudFallback = { [weak liveTranslation] error in

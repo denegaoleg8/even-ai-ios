@@ -1907,10 +1907,18 @@ struct LiveTranslationServiceTests {
         #expect(await spy.displayedPageSets.count == 2) // translation, then +replies
     }
 
-    /// Meeting Mode's core guarantee: replies are still generated and
-    /// recorded (Chat/history unaffected) but never auto-pushed to G2 —
-    /// the screen stays dedicated to the conversation transcript.
-    @Test("in Meeting mode, suggested replies are generated and recorded but never auto-displayed on G2")
+    /// Meeting Mode's core guarantee — UPDATED by the suggested-replies
+    /// local-first restoration pass: replies are still generated and
+    /// recorded (Chat/history unaffected) and now ALSO reach G2 (no
+    /// longer fully suppressed — see `GlassesPresentationLayer
+    /// .meetingConversationPages(for:previousTurn:)`), but never REPLACE
+    /// what's actively shown — page 0 stays the plain transcript, with
+    /// the reply reachable as an additional, swipeable page afterward.
+    /// See `SuggestedRepliesLocalFirstTests` for the dedicated Meeting
+    /// Mode reply-restoration test suite; this one stays here as the
+    /// original regression guard, updated to the new contract rather
+    /// than deleted.
+    @Test("in Meeting mode, suggested replies are generated, recorded, AND reach G2 as an additional page — without replacing the active transcript page")
     func meetingModeSuppressesReplyAutoDisplay() async throws {
         let generator = FakeSuggestedReplyGenerator(defaultReplies: [
             SuggestedReply(originalLanguageText: "Sure", ukrainianText: "Так", ordering: 0),
@@ -1930,10 +1938,13 @@ struct LiveTranslationServiceTests {
         await service.start()
         try? await Task.sleep(for: .milliseconds(80))
 
-        // Only the translation was ever pushed to G2 — no second,
-        // reply-carrying display call.
-        #expect(await spy.displayedPageSets.count == 1)
-        // But the reply itself is still recorded, for Glasses Chat/history.
+        // The reply update DOES reach G2 now (translation, then the
+        // reply-inclusive set) — but the ACTIVE page (index 0) is
+        // unchanged, still the plain header, never replaced by the reply.
+        let displayed = await spy.displayedPageSets
+        #expect(displayed.count == 2)
+        #expect(displayed.last?.first == "Guten Tag\n\nUA: Добрий день")
+        // The reply itself is recorded, for Glasses Chat/history.
         #expect(store.session.latestTurn?.suggestedReplies.map(\.originalLanguageText) == ["Sure"])
     }
 

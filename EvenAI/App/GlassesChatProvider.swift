@@ -104,6 +104,36 @@ final class GlassesChatProvider {
         )
     }
 
+    /// Persists a finalized turn's suggested replies as a follow-up
+    /// Glasses Chat message, local-first exactly like `appendTurn(originalText:translation:)`
+    /// — no network, never blocked by Railway being offline. A separate
+    /// message (appended immediately after the turn's own, since reply
+    /// generation always finishes later — see `LiveTranslationService
+    /// .generateSuggestedReplies`) rather than an edit to the original
+    /// one: SwiftData writes here are simple inserts, never updates, and
+    /// a chat log reading as an ordered sequence of atomic entries (turn,
+    /// then its replies once ready) is both simpler to implement
+    /// correctly and a more honest transcript than silently rewriting an
+    /// earlier entry after the fact. `role: .assistant` — these are
+    /// AI-generated suggestions, not something the other speaker said.
+    /// A no-op (returns `nil`, no chat resolved/created) when `replies`
+    /// is empty — nothing meaningful to persist.
+    @discardableResult
+    func appendReplies(originalText: String, replies: [SuggestedReply]) async throws -> Message? {
+        guard !replies.isEmpty else { return nil }
+        let chat = try await findOrCreateGlassesChat()
+        let repliesText = replies
+            .sorted { $0.ordering < $1.ordering }
+            .enumerated()
+            .map { index, reply in "\(index + 1). \(reply.originalLanguageText)\n   \(reply.ukrainianText)" }
+            .joined(separator: "\n")
+        return await localStore.appendMessage(
+            chatID: chat.id,
+            role: .assistant,
+            content: "Suggested replies for: \"\(originalText)\"\n\(repliesText)"
+        )
+    }
+
     /// Call after anything that could have invalidated the in-memory
     /// resolution (not required for correctness — the persisted id and
     /// underlying local chat are untouched by account changes, see this

@@ -230,6 +230,19 @@ struct LiveTranslationView: View {
                 .padding(.horizontal, AppMetrics.Spacing.lg)
                 .accessibilityIdentifier("liveTranslation.cloudFallbackNotice")
         }
+        // Suggested-replies restoration pass: shown whenever the local
+        // (on-device) reply provider itself isn't usable right now —
+        // truthful and non-alarming, never implies a bug. Translation
+        // keeps working exactly the same either way; this is purely
+        // informational, matching `cloudFallbackNotice`'s own pattern.
+        if let reason = liveTranslation.repliesUnavailableReason {
+            Text(reason)
+                .font(.caption)
+                .foregroundStyle(AppColor.textSecondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, AppMetrics.Spacing.lg)
+                .accessibilityIdentifier("liveTranslation.repliesUnavailableNotice")
+        }
     }
 
     /// "↓ LIVE" — shown only once the user has manually navigated G2 away

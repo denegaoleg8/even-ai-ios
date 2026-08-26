@@ -120,6 +120,78 @@ enum GlassesPresentationLayer {
         return result
     }
 
+    /// Meeting Mode's variant of `pages(for:)` — restores "replies must
+    /// ALSO exist" for Meeting Mode without violating its own priority
+    /// order ("live speech > translation/history > replies"): unlike
+    /// `pages(for:)`, where a reply is merged directly onto page 0 (so it
+    /// becomes what's immediately, automatically shown), here page 0 is
+    /// ALWAYS the plain header alone — identical to what was already on
+    /// screen before replies existed — with reply pages appended
+    /// AFTERWARD as additional, swipeable content. Since
+    /// `GlassesTransport.displayPages(_:)` resets to page 0 of whatever
+    /// set it's given, redisplaying this set never changes what's
+    /// actively shown; it only makes the replies newly REACHABLE by
+    /// swiping past the header, exactly the "show compact suggested
+    /// replies without replacing conversation history" requirement.
+    /// `[]` under the same "no translation yet" condition as `pages(for:)`.
+    static func meetingPages(
+        for turn: ConversationTurn,
+        maxCharactersPerPage: Int = GlassesTextPaginator.defaultMaxCharactersPerPage
+    ) -> [String] {
+        guard let translation = turn.ukrainianTranslation?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !translation.isEmpty
+        else {
+            return []
+        }
+        let header = conversationHeader(originalText: turn.originalText, translation: translation)
+        let headerPages = GlassesTextPaginator.pages(for: header, maxCharactersPerPage: maxCharactersPerPage)
+        let validReplies = validSortedReplies(for: turn)
+        guard !validReplies.isEmpty else { return headerPages }
+        let replyPages = self.replyPages(header: header, validReplies: validReplies, maxCharactersPerPage: maxCharactersPerPage)
+        return headerPages + replyPages
+    }
+
+    /// Meeting Mode's counterpart to `conversationPages(for:previousTurn:)`
+    /// — `meetingPages(for:)`'s output (header page(s) first, unchanged by
+    /// replies existing; then reply pages, if any) with the same one
+    /// bounded page of look-back context appended at the end.
+    static func meetingConversationPages(
+        for currentTurn: ConversationTurn,
+        previousTurn: ConversationTurn?,
+        maxCharactersPerPage: Int = GlassesTextPaginator.defaultMaxCharactersPerPage
+    ) -> [String] {
+        var result = meetingPages(for: currentTurn, maxCharactersPerPage: maxCharactersPerPage)
+        guard !result.isEmpty else { return result }
+        if let previousTurn, let contextPage = historyViewportPage(for: previousTurn, maxCharactersPerPage: maxCharactersPerPage) {
+            result.append(contextPage)
+        }
+        return result
+    }
+
+    /// Shared by both `pages(for:)` and `meetingPages(for:)`: at most 3
+    /// replies, sorted by `ordering`, with empty-text ones dropped —
+    /// see `pages(for:)`'s own doc comment for why this exact rule.
+    private static func validSortedReplies(for turn: ConversationTurn) -> [SuggestedReply] {
+        Array(
+            turn.suggestedReplies
+                .sorted { $0.ordering < $1.ordering }
+                .prefix(3)
+                .filter { !$0.originalLanguageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        )
+    }
+
+    /// Shared by both `pages(for:)` and `meetingPages(for:)`: one page per
+    /// reply, each still carrying the full header (see `pages(for:)`'s own
+    /// doc comment on why every page repeats it).
+    private static func replyPages(header: String, validReplies: [SuggestedReply], maxCharactersPerPage: Int) -> [String] {
+        validReplies.enumerated().flatMap { index, reply -> [String] in
+            let replyBlock = "Reply \(index + 1):\n\(reply.originalLanguageText)\nUA: \(reply.ukrainianText)"
+            let combined = header + "\n\n" + replyBlock
+            guard combined.count > maxCharactersPerPage else { return [combined] }
+            return GlassesTextPaginator.pages(for: combined, maxCharactersPerPage: maxCharactersPerPage, overlapWordCount: 0)
+        }
+    }
+
     /// A single dedicated page for one turn's history-viewport content —
     /// used both by `conversationPages(for:previousTurn:)` (to append the
     /// live turn's trailing look-back page) AND, on demand, directly by
