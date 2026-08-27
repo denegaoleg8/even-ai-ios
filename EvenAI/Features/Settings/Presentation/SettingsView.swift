@@ -29,6 +29,16 @@ struct SettingsView: View {
 
                 Section {
                     NavigationLink {
+                        PersonalAIView()
+                    } label: {
+                        Label("Personal AI", systemImage: "brain.head.profile")
+                    }
+                } header: {
+                    SectionHeader(title: "Personal AI")
+                }
+
+                Section {
+                    NavigationLink {
                         AIConversationView()
                     } label: {
                         Label("AI Conversation", systemImage: "waveform")

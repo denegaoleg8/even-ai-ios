@@ -32,6 +32,12 @@ struct EvenAIApp: App {
     /// Translation is writing into — never two independent instances that
     /// could each create their own chat.
     @State private var glassesChatProvider: GlassesChatProvider
+    /// Phase 1 Personal AI. App-level, same pattern as `agentContextStore` /
+    /// `glassesChatProvider` — constructed once here, injected into the
+    /// environment. Deliberately independent of `liveTranslation`
+    /// (`AIConversationEngine`): the two never reference each other, so a
+    /// Personal AI failure cannot reach the proven AI Conversation core.
+    @State private var personalAI: PersonalAIService
 
     init() {
         let translator = AppleLanguageTranslator()
@@ -43,6 +49,7 @@ struct EvenAIApp: App {
         _languageTranslator = State(initialValue: translator)
         _agentContextStore = State(initialValue: agentContextStore)
         _glassesChatProvider = State(initialValue: glassesChatProvider)
+        _personalAI = State(initialValue: PersonalAIContainer.live.makeService())
         // Local-first architecture pass: Milestone 8b hardcoded
         // OpenAIRealtimeTranscriber as THE production transcriber
         // (abandoning GlassesSpeechTranscriber specifically because it
@@ -152,6 +159,7 @@ struct EvenAIApp: App {
                 .environment(liveTranslation)
                 .environment(agentContextStore)
                 .environment(glassesChatProvider)
+                .environment(personalAI)
                 .environment(\.languageTranslator, languageTranslator)
                 .environment(\.chatService, AppContainer.live.chatService)
                 .environment(\.glassesTransport, AppContainer.live.glassesTransport)
