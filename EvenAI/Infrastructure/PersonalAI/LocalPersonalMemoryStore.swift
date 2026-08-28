@@ -15,6 +15,7 @@ actor LocalPersonalMemoryStore: PersonalMemoryStore {
 
     private let fileURL: URL
     private let ownerID: String?
+    private let fileStore: DocumentFileStoring
     private var document: PersonalMemoryDocument
     private var loaded = false
 
@@ -22,12 +23,16 @@ actor LocalPersonalMemoryStore: PersonalMemoryStore {
     ///   - directory: where the document lives. Defaults to Application
     ///     Support. Tests pass a temp dir.
     ///   - ownerID: namespaces the file (`personal-memory-<owner>.json`) so
-    ///     per-user isolation is real even in Phase 1's single-user world.
-    init(directory: URL? = nil, ownerID: String? = nil) {
+    ///     per-user isolation is real even in the single-user world.
+    ///   - fileStore: how bytes reach disk. `PlaintextDocumentFile` by
+    ///     default; `PersonalAIContainer` injects `EncryptedDocumentFile`
+    ///     in production (§27).
+    init(directory: URL? = nil, ownerID: String? = nil, fileStore: DocumentFileStoring = PlaintextDocumentFile()) {
         let base = directory ?? Self.defaultDirectory()
         let name = ownerID.map { "personal-memory-\($0).json" } ?? "personal-memory.json"
         self.fileURL = base.appendingPathComponent(name)
         self.ownerID = ownerID
+        self.fileStore = fileStore
         self.document = .empty
     }
 
@@ -45,8 +50,10 @@ actor LocalPersonalMemoryStore: PersonalMemoryStore {
     private func ensureLoaded() {
         guard !loaded else { return }
         loaded = true
-        guard let data = try? Data(contentsOf: fileURL) else { return }
-        guard let decoded = try? JSONDecoder.personalAI.decode(PersonalMemoryDocument.self, from: data) else {
+        let bytes: Data?
+        do { bytes = try fileStore.read(from: fileURL) } catch { bytes = nil }
+        guard let bytes else { return }
+        guard let decoded = try? JSONDecoder.personalAI.decode(PersonalMemoryDocument.self, from: bytes) else {
             DiagnosticTrace.log("PERSONAL_AI_MEMORY", "load failed: document unreadable, starting empty")
             return
         }
@@ -60,7 +67,7 @@ actor LocalPersonalMemoryStore: PersonalMemoryStore {
         document.updatedAt = Date()
         guard let data = try? JSONEncoder.personalAI.encode(document) else { return }
         do {
-            try data.write(to: fileURL, options: [.atomic])
+            try fileStore.write(data, to: fileURL)
         } catch {
             DiagnosticTrace.log("PERSONAL_AI_MEMORY", "persist failed: \(type(of: error))")
         }
@@ -205,6 +212,48 @@ actor LocalPersonalMemoryStore: PersonalMemoryStore {
         loaded = true
         self.document = document
         persist()
+    }
+
+    // MARK: - Phase 2: sync state & revisions
+
+    func loadSyncState() async -> PersonalSyncState {
+        ensureLoaded()
+        return document.syncState
+    }
+
+    func saveSyncState(_ state: PersonalSyncState) async {
+        ensureLoaded()
+        document.syncState = state
+        persist()
+    }
+
+    func appendRevision(_ revision: RecordRevision) async {
+        ensureLoaded()
+        document.revisions.append(revision)
+        pruneRevisions(recordID: revision.recordID)
+        persist()
+    }
+
+    func revisions(recordID: UUID) async -> [RecordRevision] {
+        ensureLoaded()
+        return document.revisions.filter { $0.recordID == recordID }.sorted { $0.changedAt < $1.changedAt }
+    }
+
+    func allRevisions() async -> [RecordRevision] {
+        ensureLoaded()
+        return document.revisions
+    }
+
+    /// Bound history growth: full retention for a `userConfirmed` memory,
+    /// last-N for anything inferred (see `RecordRevision` retention rules).
+    private func pruneRevisions(recordID: UUID) {
+        let isConfirmed = document.records.first(where: { $0.id == recordID })?.userConfirmed ?? false
+        guard !isConfirmed else { return }
+        let forRecord = document.revisions.enumerated().filter { $0.element.recordID == recordID }
+        guard forRecord.count > RecordRevision.inferredRetention else { return }
+        let dropCount = forRecord.count - RecordRevision.inferredRetention
+        let indicesToDrop = Set(forRecord.sorted { $0.element.changedAt < $1.element.changedAt }.prefix(dropCount).map { $0.offset })
+        document.revisions = document.revisions.enumerated().filter { !indicesToDrop.contains($0.offset) }.map { $0.element }
     }
 
     // MARK: - Helpers

@@ -123,6 +123,16 @@ actor InMemoryPersonalMemoryStore: PersonalMemoryStore {
         self.document = document
     }
 
+    // MARK: Phase 2: sync state & revisions
+
+    func loadSyncState() async -> PersonalSyncState { document.syncState }
+    func saveSyncState(_ state: PersonalSyncState) async { document.syncState = state; bump() }
+    func appendRevision(_ revision: RecordRevision) async { document.revisions.append(revision); bump() }
+    func revisions(recordID: UUID) async -> [RecordRevision] {
+        document.revisions.filter { $0.recordID == recordID }.sorted { $0.changedAt < $1.changedAt }
+    }
+    func allRevisions() async -> [RecordRevision] { document.revisions }
+
     // MARK: - Helpers
 
     private func mutateRecord(_ id: UUID, _ transform: (inout MemoryRecord) -> Void) {

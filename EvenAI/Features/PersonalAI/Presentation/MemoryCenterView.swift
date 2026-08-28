@@ -119,6 +119,21 @@ final class MemoryCenterViewModel {
     }
 }
 
+/// The four sync states a memory can be in, from the Memory Center list.
+struct SyncBadge: View {
+    let state: MemorySyncState
+    var body: some View {
+        switch state {
+        case .synced:
+            Image(systemName: "checkmark.icloud").font(.caption2).foregroundStyle(.green)
+        case .pendingPush, .pendingPull, .conflict:
+            Image(systemName: "arrow.triangle.2.circlepath.icloud").font(.caption2).foregroundStyle(.orange)
+        case .localOnly:
+            Image(systemName: "iphone").font(.caption2).foregroundStyle(.secondary)
+        }
+    }
+}
+
 private struct MemoryRow: View {
     let record: MemoryRecord
 
@@ -132,6 +147,7 @@ private struct MemoryRow: View {
                     .font(.caption2.weight(.medium))
                     .padding(.horizontal, 6).padding(.vertical, 2)
                     .background(.quaternary, in: Capsule())
+                SyncBadge(state: record.syncState)
                 if record.pinned { Image(systemName: "pin.fill").font(.caption2).foregroundStyle(.orange) }
                 if record.userConfirmed { Image(systemName: "checkmark.seal.fill").font(.caption2).foregroundStyle(.green) }
                 if record.status == .superseded { Text("superseded").font(.caption2).foregroundStyle(.secondary) }

@@ -77,6 +77,10 @@ struct Rule: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
+extension Rule: PersonalCloudSyncable {
+    static var recordKind: PersonalRecordKind { .rule }
+}
+
 extension Rule {
     func isActive(now: Date = .now, surface: PersonalAISurface) -> Bool {
         guard enabled, deletedAt == nil, scope.appliesTo(surface: surface) else { return false }

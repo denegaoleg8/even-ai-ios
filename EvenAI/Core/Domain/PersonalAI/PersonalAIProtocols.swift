@@ -37,4 +37,23 @@ protocol PersonalAIConversationStore: Sendable {
     /// AI Chat "always opens".
     func currentConversationID() async -> UUID
     func startNewConversation() async -> UUID
+
+    // MARK: Phase 2 — sync / backup / restore awareness
+
+    /// All conversation-level records (metadata + `doNotRemember` flag).
+    func allConversations() async -> [PersonalAIConversation]
+    /// All messages across all conversations, including tombstones.
+    func allMessages() async -> [PersonalAIChatMessage]
+    /// Insert or replace a conversation record (from sync / restore).
+    func upsertConversation(_ conversation: PersonalAIConversation) async
+    /// Insert or replace messages by `id` (from sync / restore) — never
+    /// duplicates, honours `deletedAt`.
+    func upsertMessages(_ messages: [PersonalAIChatMessage]) async
+    /// Mark a conversation "do not remember"; also flags its messages
+    /// ineligible and excludes them from upload/export.
+    func setDoNotRemember(_ conversationID: UUID, _ value: Bool) async
+    /// Replace the entire conversation dataset (restore `.replaceAll`).
+    func replaceAllConversations(_ conversations: [PersonalAIConversation], messages: [PersonalAIChatMessage]) async
+    /// Remove every conversation and message (account deletion).
+    func wipe() async
 }

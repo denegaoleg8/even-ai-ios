@@ -8,6 +8,7 @@ struct MemoryDetailView: View {
     @Environment(PersonalAIService.self) private var personalAI
     @Environment(\.dismiss) private var dismiss
     @State private var isEditing = false
+    @State private var revisions: [RecordRevision] = []
 
     var body: some View {
         List {
@@ -53,9 +54,34 @@ struct MemoryDetailView: View {
                 LabeledContent("Sync state", value: record.syncState.rawValue)
                 LabeledContent("Revision", value: "\(record.revision)")
             }
+
+            if !revisions.isEmpty {
+                Section("Version History") {
+                    ForEach(revisions) { rev in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(Self.previewText(rev.previousPayloadJSON))
+                                .font(.footnote)
+                                .lineLimit(2)
+                            Text("\(rev.reason) · \(rev.changedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .swipeActions {
+                            Button("Restore") {
+                                Task {
+                                    _ = await personalAI.restoreMemoryRevision(rev.id)
+                                    await model.reload(personalAI)
+                                    dismiss()
+                                }
+                            }.tint(.blue)
+                        }
+                    }
+                }
+            }
         }
         .navigationTitle("Memory")
         .navigationBarTitleDisplayMode(.inline)
+        .task { revisions = await personalAI.revisions(recordID: record.id).reversed() }
         .sheet(isPresented: $isEditing) {
             MemoryEditorView(mode: .edit(record)) { content, category in
                 _ = await personalAI.updateMemoryContent(id: record.id, content: content, category: category)
@@ -63,6 +89,13 @@ struct MemoryDetailView: View {
                 dismiss()
             }
         }
+    }
+
+    static func previewText(_ json: String) -> String {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = obj["canonicalContent"] as? String else { return "(earlier version)" }
+        return content
     }
 
     private func binding(_ keyPath: KeyPath<MemoryRecord, Bool>, _ apply: @escaping (Bool) async -> Void) -> Binding<Bool> {

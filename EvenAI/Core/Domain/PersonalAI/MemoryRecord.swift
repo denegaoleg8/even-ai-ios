@@ -84,6 +84,14 @@ struct MemoryRecord: Identifiable, Codable, Hashable, Sendable {
     /// This record was replaced by `supersededByID`.
     var supersededByID: UUID?
 
+    // MARK: Derived-data metadata (Phase 2)
+    /// The `EmbeddingProviding.modelIdentifier` that produced this record's
+    /// semantic vector, if any. Purely metadata — the canonical memory is
+    /// `canonicalContent`; a lost or stale vector is rebuilt, never a data
+    /// loss. `nil` when no embedding exists (the Phase 2 default). Optional
+    /// so Phase 1 JSON without this key still decodes.
+    var embeddingModelVersion: String?
+
     init(
         id: UUID = UUID(),
         remoteID: String? = nil,
@@ -109,10 +117,12 @@ struct MemoryRecord: Identifiable, Codable, Hashable, Sendable {
         sourceConversationIDs: [UUID] = [],
         sourceMessageIDs: [UUID] = [],
         supersedesID: UUID? = nil,
-        supersededByID: UUID? = nil
+        supersededByID: UUID? = nil,
+        embeddingModelVersion: String? = nil
     ) {
         self.id = id
         self.remoteID = remoteID
+        self.embeddingModelVersion = embeddingModelVersion
         self.revision = revision
         self.syncState = syncState
         self.deletedAt = deletedAt
@@ -137,6 +147,10 @@ struct MemoryRecord: Identifiable, Codable, Hashable, Sendable {
         self.supersedesID = supersedesID
         self.supersededByID = supersededByID
     }
+}
+
+extension MemoryRecord: PersonalCloudSyncable {
+    static var recordKind: PersonalRecordKind { .memory }
 }
 
 extension MemoryRecord {

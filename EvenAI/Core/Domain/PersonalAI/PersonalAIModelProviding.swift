@@ -55,23 +55,102 @@ struct PersonalAIGenerationResult: Hashable, Sendable {
 /// One message in a Personal AI conversation. Separate from Chat's `Message`
 /// (which carries `chatID`, `status`, streaming state) — this is the minimal
 /// shape the model provider and archive need.
-struct PersonalAIChatMessage: Identifiable, Codable, Hashable, Sendable {
+///
+/// Phase 2 adds the `PersonalCloudSyncable` fields (`conversationID`,
+/// `revision`, `syncState`, `deletedAt`, `ownerID`, `remoteID`) so messages
+/// sync and restore alongside memories. All new keys decode with a fallback,
+/// so a Phase 1 conversation file still loads.
+struct PersonalAIChatMessage: PersonalCloudSyncable, Hashable {
+    static var recordKind: PersonalRecordKind { .message }
+
     enum Role: String, Codable, Hashable, Sendable { case user, assistant, system }
 
     let id: UUID
+    /// The conversation this message belongs to. Phase 1 tracked this only
+    /// as the store's dictionary key; Phase 2 makes it explicit on the
+    /// record so a message is self-describing for sync / export.
+    var conversationID: UUID
     var role: Role
     var text: String
     var timestamp: Date
     /// Set false for a message the user marked (or whose conversation was
-    /// marked) "do not remember" — the extractor skips it.
+    /// marked) "do not remember" — the extractor skips it, and it is
+    /// excluded from upload and export.
     var eligibleForMemory: Bool
 
-    init(id: UUID = UUID(), role: Role, text: String, timestamp: Date = .now, eligibleForMemory: Bool = true) {
+    // Sync fields (PersonalCloudSyncable)
+    var remoteID: String?
+    var revision: Int
+    var syncState: MemorySyncState
+    var deletedAt: Date?
+    var ownerID: String?
+    /// For messages (append-only history) this tracks tombstone / sync
+    /// bookkeeping time; it starts equal to `timestamp`.
+    var updatedAt: Date
+
+    init(
+        id: UUID = UUID(),
+        conversationID: UUID = UUID(),
+        role: Role,
+        text: String,
+        timestamp: Date = .now,
+        eligibleForMemory: Bool = true,
+        remoteID: String? = nil,
+        revision: Int = 0,
+        syncState: MemorySyncState = .localOnly,
+        deletedAt: Date? = nil,
+        ownerID: String? = nil,
+        updatedAt: Date? = nil
+    ) {
         self.id = id
+        self.conversationID = conversationID
         self.role = role
         self.text = text
         self.timestamp = timestamp
         self.eligibleForMemory = eligibleForMemory
+        self.remoteID = remoteID
+        self.revision = revision
+        self.syncState = syncState
+        self.deletedAt = deletedAt
+        self.ownerID = ownerID
+        self.updatedAt = updatedAt ?? timestamp
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, conversationID, role, text, timestamp, eligibleForMemory
+        case remoteID, revision, syncState, deletedAt, ownerID, updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        conversationID = try c.decodeIfPresent(UUID.self, forKey: .conversationID) ?? UUID()
+        role = try c.decode(Role.self, forKey: .role)
+        text = try c.decode(String.self, forKey: .text)
+        timestamp = try c.decode(Date.self, forKey: .timestamp)
+        eligibleForMemory = try c.decodeIfPresent(Bool.self, forKey: .eligibleForMemory) ?? true
+        remoteID = try c.decodeIfPresent(String.self, forKey: .remoteID)
+        revision = try c.decodeIfPresent(Int.self, forKey: .revision) ?? 0
+        syncState = try c.decodeIfPresent(MemorySyncState.self, forKey: .syncState) ?? .localOnly
+        deletedAt = try c.decodeIfPresent(Date.self, forKey: .deletedAt)
+        ownerID = try c.decodeIfPresent(String.self, forKey: .ownerID)
+        updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? timestamp
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(conversationID, forKey: .conversationID)
+        try c.encode(role, forKey: .role)
+        try c.encode(text, forKey: .text)
+        try c.encode(timestamp, forKey: .timestamp)
+        try c.encode(eligibleForMemory, forKey: .eligibleForMemory)
+        try c.encodeIfPresent(remoteID, forKey: .remoteID)
+        try c.encode(revision, forKey: .revision)
+        try c.encode(syncState, forKey: .syncState)
+        try c.encodeIfPresent(deletedAt, forKey: .deletedAt)
+        try c.encodeIfPresent(ownerID, forKey: .ownerID)
+        try c.encode(updatedAt, forKey: .updatedAt)
     }
 }
 

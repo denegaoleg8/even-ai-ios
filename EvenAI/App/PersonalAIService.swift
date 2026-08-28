@@ -39,6 +39,24 @@ final class PersonalAIService {
     /// The tier that answered the last turn — surfaced as a small caption.
     private(set) var lastProvider: PersonalAIGenerationResult.Provider?
 
+    // MARK: Phase 2 — cloud sync / backup observable state
+    /// Which kind of cloud is actually wired. `.notConfigured` in a shipping
+    /// build today — the UI must not imply cross-device durability unless
+    /// this is `.connected`.
+    private(set) var cloudEnvironment: PersonalCloudEnvironment = .notConfigured
+    private(set) var cloudSyncEnabled = false
+    private(set) var syncStatus: PersonalCloudOperationStatus = .idle
+    private(set) var backupStatus: PersonalCloudOperationStatus = .idle
+    private(set) var lastSyncedAt: Date?
+    private(set) var lastBackupAt: Date?
+    private(set) var pendingSyncCount = 0
+    private(set) var isAuthenticated = false
+
+    /// True only when memory genuinely survives loss of this device.
+    var cloudProvidesDurability: Bool { cloudEnvironment.providesDurability }
+    /// Whether a real or simulated cloud service exists to sync against.
+    private var hasCloudService: Bool { cloud?.cloudService != nil }
+
     private let store: any PersonalMemoryStore
     private let contextBuilder: any PersonalAIContextBuilding
     private let modelProvider: any PersonalAIModelProviding
@@ -47,6 +65,10 @@ final class PersonalAIService {
     private let extractor: any MemoryExtracting
     private let merger: MemoryMerger
     private let styleLearner: StyleProfileLearner
+    /// Phase 2 cloud dependencies. `nil` for tests / previews that don't
+    /// exercise sync — the whole Phase 1 chat + memory path works unchanged
+    /// without it.
+    private let cloud: PersonalAICloudBundle?
 
     private(set) var conversationID: UUID?
 
@@ -58,7 +80,8 @@ final class PersonalAIService {
         commandProcessor: MemoryCommandProcessor = MemoryCommandProcessor(),
         extractor: any MemoryExtracting = HeuristicMemoryExtractor(),
         merger: MemoryMerger = MemoryMerger(),
-        styleLearner: StyleProfileLearner = StyleProfileLearner()
+        styleLearner: StyleProfileLearner = StyleProfileLearner(),
+        cloud: PersonalAICloudBundle? = nil
     ) {
         self.store = store
         self.contextBuilder = contextBuilder ?? DefaultPersonalAIContextBuilder(store: store)
@@ -68,6 +91,8 @@ final class PersonalAIService {
         self.extractor = extractor
         self.merger = merger
         self.styleLearner = styleLearner
+        self.cloud = cloud
+        self.cloudEnvironment = cloud?.environment ?? .notConfigured
     }
 
     // MARK: - Lifecycle
@@ -75,11 +100,53 @@ final class PersonalAIService {
     /// Loads (or opens) the persistent Personal AI conversation. Personal AI
     /// Chat "always opens".
     func open() async {
+        if let cloud {
+            let state = await cloud.dataStore.syncState()
+            // With no cloud service wired, sync is impossible — never let a
+            // stale persisted `cloudSyncEnabled` flag imply otherwise.
+            cloudSyncEnabled = hasCloudService && state.cloudSyncEnabled
+            lastSyncedAt = state.lastSyncSucceededAt
+            lastBackupAt = state.lastBackupSucceededAt
+            pendingSyncCount = state.pendingMutationCount
+            isAuthenticated = cloud.ownerBox.ownerID != nil
+            // A device that authenticated but has no local data yet → pull
+            // the whole Personal AI down before showing an empty chat.
+            if state.needsCloudRestore, isAuthenticated, cloudSyncEnabled, hasCloudService {
+                await restoreFromCloud()
+            }
+        }
         let id = await conversationStore.currentConversationID()
         conversationID = id
         messages = await conversationStore.loadConversation(id: id)
         memoryEnabled = await store.isMemoryEnabledGlobally()
         conversationDoNotRemember = await store.isConversationExcluded(id)
+        triggerBackgroundSync()
+    }
+
+    /// Wire the signed-in identity through to the cloud engines. Called from
+    /// the view layer on `authState.currentUser` changes. Signing out keeps
+    /// **all** local data — it only stops uploading.
+    func updateOwner(_ ownerID: String?) async {
+        guard let cloud else { return }
+        let previous = cloud.ownerBox.ownerID
+        guard previous != ownerID else { return }
+        cloud.ownerBox.ownerID = ownerID
+        isAuthenticated = ownerID != nil
+
+        if ownerID == nil {
+            // Signed out — freeze sync, keep local data.
+            return
+        }
+        // Newly signed in. If there is nothing local, mark for a restore on
+        // the next open(); otherwise just resume syncing.
+        let localMemories = await store.allMemories()
+        let localMessages = await conversationStore.allMessages()
+        let hasLocal = !localMemories.isEmpty || !localMessages.isEmpty
+        await cloud.dataStore.updateSyncState { $0.needsCloudRestore = !hasLocal }
+        if cloudSyncEnabled {
+            if !hasLocal { await restoreFromCloud() }
+            triggerBackgroundSync()
+        }
     }
 
     func startNewConversation() async {
@@ -101,6 +168,158 @@ final class PersonalAIService {
         conversationDoNotRemember = value
         guard let conversationID else { return }
         await store.markConversationDoNotRemember(conversationID, value)
+        await conversationStore.setDoNotRemember(conversationID, value)
+    }
+
+    // MARK: - Phase 2 cloud controls
+
+    func setCloudSyncEnabled(_ enabled: Bool) async {
+        // Cannot enable sync with no cloud service wired.
+        let effective = enabled && hasCloudService
+        cloudSyncEnabled = effective
+        guard let cloud else { return }
+        await cloud.dataStore.updateSyncState { $0.cloudSyncEnabled = effective }
+        if effective { triggerBackgroundSync() }
+    }
+
+    @discardableResult
+    func syncNow() async -> SyncOutcome {
+        guard let cloud else { return .skipped(reason: .noCloudService) }
+        syncStatus = .running
+        let outcome = await cloud.syncEngine.sync()
+        let state = await cloud.dataStore.syncState()
+        lastSyncedAt = state.lastSyncSucceededAt
+        pendingSyncCount = state.pendingMutationCount
+        switch outcome {
+        case .completed:
+            syncStatus = .succeeded(at: state.lastSyncSucceededAt ?? Date())
+        case .skipped:
+            syncStatus = .idle
+        case .failedRetryable(let code), .failedFatal(let code):
+            syncStatus = .failed(code: code)
+        }
+        return outcome
+    }
+
+    @discardableResult
+    func restoreFromCloud() async -> PersonalAICloudRestoreCoordinator.Outcome {
+        guard let cloud, let ownerID = cloud.ownerBox.ownerID else {
+            return .init(source: .none, result: .failed)
+        }
+        let outcome = await cloud.restoreCoordinator.restore(ownerID: ownerID)
+        if outcome.succeeded {
+            // Reload the visible chat from the restored store.
+            let id = await conversationStore.currentConversationID()
+            conversationID = id
+            messages = await conversationStore.loadConversation(id: id)
+            memoryEnabled = await store.isMemoryEnabledGlobally()
+        }
+        return outcome
+    }
+
+    @discardableResult
+    func backupNow() async -> PersonalAIBackupCoordinator.Outcome? {
+        guard let cloud else { return nil }
+        backupStatus = .running
+        let outcome = await cloud.backupCoordinator.backup(tier: .daily)
+        let state = await cloud.dataStore.syncState()
+        lastBackupAt = state.lastBackupSucceededAt
+        backupStatus = outcome.succeeded
+            ? .succeeded(at: state.lastBackupSucceededAt ?? Date())
+            : .failed(code: outcome.errorCode ?? "backup")
+        return outcome
+    }
+
+    /// Write a portable export to a temp file and return its URL (for the
+    /// share sheet). `nil` when the cloud stack isn't wired.
+    func exportData(_ selection: ExportSelection) async -> URL? {
+        guard let cloud else { return nil }
+        let state = await cloud.dataStore.syncState()
+        let bundle = await cloud.dataStore.exportBundle(selection: selection, bundleVersion: state.lastBackupVersion + 1)
+        let name = "EvenAI-PersonalAI-\(selection.rawValue)-\(Int(Date().timeIntervalSince1970)).json"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        do {
+            try PersonalDataExporter.write(bundle, to: url)
+            return url
+        } catch {
+            DiagnosticTrace.log("PERSONAL_AI_EXPORT", "write failed: \(type(of: error))")
+            return nil
+        }
+    }
+
+    func importBackup(from url: URL, strategy: ImportStrategy = .merge) async -> Result<ImportResult, ImportError> {
+        guard let cloud else { return .failure(.unreadable) }
+        let didAccess = url.startAccessingSecurityScopedResource()
+        defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
+        guard let data = try? Data(contentsOf: url) else { return .failure(.unreadable) }
+        switch PersonalDataImporter.validate(data) {
+        case .failure(let error):
+            DiagnosticTrace.log("PERSONAL_AI_IMPORT", "rejected code=\(error.code)")
+            return .failure(error)
+        case .success(let bundle):
+            let result = await cloud.dataStore.importBundle(bundle, strategy: strategy)
+            if result.succeeded {
+                let id = await conversationStore.currentConversationID()
+                conversationID = id
+                messages = await conversationStore.loadConversation(id: id)
+                memoryEnabled = await store.isMemoryEnabledGlobally()
+                triggerBackgroundSync()
+            }
+            return .success(result)
+        }
+    }
+
+    /// §26 — remove server-side data, keep local (a distinct action from
+    /// deleting the whole Personal AI account). No-op when no cloud service
+    /// is wired (there is nothing server-side to delete).
+    func deleteCloudData() async {
+        guard hasCloudService, let cloud, let ownerID = cloud.ownerBox.ownerID else { return }
+        try? await cloud.cloudDeleteAllData(ownerID: ownerID)
+        await cloud.dataStore.updateSyncState {
+            $0.cursor = nil
+            $0.pendingMutationCount = 0
+            $0.lastSyncSucceededAt = nil
+        }
+        cloudSyncEnabled = false
+        await cloud.dataStore.updateSyncState { $0.cloudSyncEnabled = false }
+    }
+
+    /// §26 — true account deletion: server data (if any), local cache,
+    /// conversations, style, and the local encryption key. Wipes local data
+    /// **unconditionally** — even with no cloud wired.
+    func deletePersonalAIAccount() async {
+        if let cloud, let ownerID = cloud.ownerBox.ownerID {
+            try? await cloud.cloudDeleteAllData(ownerID: ownerID)
+        }
+        await store.replaceAll(with: .empty)
+        await conversationStore.wipe()
+        try? cloud?.keyStore.destroy()
+        messages = []
+        conversationID = nil
+        cloudSyncEnabled = false
+        lastSyncedAt = nil
+        lastBackupAt = nil
+        pendingSyncCount = 0
+    }
+
+    // MARK: - Background sync trigger
+
+    private func triggerBackgroundSync() {
+        guard let cloud, cloudSyncEnabled, cloud.ownerBox.ownerID != nil else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            _ = await self.syncNow()
+            _ = await self.cloud?.backupCoordinator.runIfDue()
+            await self.refreshCloudStatus()
+        }
+    }
+
+    private func refreshCloudStatus() async {
+        guard let cloud else { return }
+        let state = await cloud.dataStore.syncState()
+        lastSyncedAt = state.lastSyncSucceededAt
+        lastBackupAt = state.lastBackupSucceededAt
+        pendingSyncCount = state.pendingMutationCount
     }
 
     // MARK: - Send a turn
@@ -158,11 +377,15 @@ final class PersonalAIService {
             lastProvider = result.provider
             status = .idle
 
-            // 4. Passive extraction — only for eligible turns.
+            // 4. Passive extraction — only for eligible turns. This runs
+            //    after the response is already visible (Phase 1 ordering),
+            //    and cloud sync fires only after extraction, so neither ever
+            //    delays the chat (§22/§24).
             if userMessage.eligibleForMemory {
                 await extractAndMerge(userMessage: userMessage, assistantMessage: assistantMessage, conversationID: conversationID)
                 await learnStyle(from: text)
             }
+            triggerBackgroundSync()
         } catch let error as PersonalAIError {
             status = .failed(error.userFacingMessage)
             DiagnosticTrace.log("PERSONAL_AI_CHAT", "generation failed: \(error)")
@@ -232,6 +455,27 @@ final class PersonalAIService {
 
     func setRuleEnabled(id: UUID, enabled: Bool) async { await store.setRuleEnabled(id: id, enabled: enabled) }
     func deleteRule(id: UUID) async { await store.deleteRule(id: id) }
+
+    /// Version history for one memory (§7).
+    func revisions(recordID: UUID) async -> [RecordRevision] { await store.revisions(recordID: recordID) }
+
+    /// Restore a memory to a prior revision (§7 user-facing undo).
+    @discardableResult
+    func restoreMemoryRevision(_ revisionID: UUID) async -> Bool {
+        guard let cloud else {
+            // No cloud stack (tests) — do a direct restore from the store's log.
+            let all = await store.allRevisions()
+            guard let rev = all.first(where: { $0.id == revisionID }),
+                  rev.recordKind == .memory,
+                  let data = rev.previousPayloadJSON.data(using: .utf8),
+                  var record = try? JSONDecoder.personalAI.decode(MemoryRecord.self, from: data)
+            else { return false }
+            record = record.touched()
+            await store.upsert([record])
+            return true
+        }
+        return await cloud.dataStore.restoreRevision(revisionID)
+    }
 
     func exportDocument() async -> PersonalMemoryDocument { await store.export() }
 

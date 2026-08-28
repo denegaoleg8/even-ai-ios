@@ -20,6 +20,11 @@ struct PersonalAIView: View {
                 } label: {
                     Label("Memory", systemImage: "tray.full")
                 }
+                NavigationLink {
+                    PersonalAIDataBackupView()
+                } label: {
+                    Label("Data & Backup", systemImage: "externaldrive.badge.icloud")
+                }
             } footer: {
                 Text("Your Personal AI remembers useful things you tell it and connects new questions to relevant past context. Everything it remembers is visible and editable in Memory.")
             }

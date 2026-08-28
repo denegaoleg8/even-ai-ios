@@ -43,4 +43,32 @@ protocol PersonalMemoryStore: Sendable {
     // Backup / portability seam (usable now, essential for Phase 2)
     func export() async -> PersonalMemoryDocument
     func replaceAll(with document: PersonalMemoryDocument) async
+
+    // MARK: Phase 2 — sync state & version history
+    func loadSyncState() async -> PersonalSyncState
+    func saveSyncState(_ state: PersonalSyncState) async
+    func appendRevision(_ revision: RecordRevision) async
+    func revisions(recordID: UUID) async -> [RecordRevision]
+    func allRevisions() async -> [RecordRevision]
+}
+
+extension PersonalMemoryStore {
+    /// Default: derive from `export()`. `LocalPersonalMemoryStore` /
+    /// `InMemoryPersonalMemoryStore` override with a direct read for
+    /// efficiency, but any conformer works unchanged.
+    func loadSyncState() async -> PersonalSyncState { await export().syncState }
+    func saveSyncState(_ state: PersonalSyncState) async {
+        var doc = await export()
+        doc.syncState = state
+        await replaceAll(with: doc)
+    }
+    func appendRevision(_ revision: RecordRevision) async {
+        var doc = await export()
+        doc.revisions.append(revision)
+        await replaceAll(with: doc)
+    }
+    func revisions(recordID: UUID) async -> [RecordRevision] {
+        await export().revisions.filter { $0.recordID == recordID }.sorted { $0.changedAt < $1.changedAt }
+    }
+    func allRevisions() async -> [RecordRevision] { await export().revisions }
 }

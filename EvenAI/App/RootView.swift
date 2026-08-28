@@ -6,6 +6,7 @@ import SwiftUI
 struct RootView: View {
     @Environment(AppState.self) private var appState
     @Environment(AuthState.self) private var authState
+    @Environment(PersonalAIService.self) private var personalAI
     @Environment(AIConversationEngine.self) private var liveTranslation
     @Environment(\.languageTranslator) private var languageTranslator
     @Environment(\.chatService) private var chatService
@@ -35,6 +36,13 @@ struct RootView: View {
         // loading screen), just the bootstrapping call itself.
         .task {
             await authState.restoreSession()
+        }
+        // Keep Personal AI Cloud's owner identity in step with auth. This is
+        // the ONLY coupling between the two — a pure, one-way identity
+        // handoff; a Personal AI failure still cannot reach auth or the AI
+        // Conversation core.
+        .task(id: authState.currentUser?.id) {
+            await personalAI.updateOwner(authState.currentUser?.id.uuidString)
         }
         // `AIConversationEngine` is app-level and must outlive any one
         // screen, but the `Translation` framework only vends a usable
