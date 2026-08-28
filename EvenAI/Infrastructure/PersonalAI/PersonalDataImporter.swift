@@ -79,8 +79,19 @@ struct PersonalDataImporter: Sendable {
         memoryStore: any PersonalMemoryStore,
         conversationStore: any PersonalAIConversationStore
     ) async -> ImportResult {
+        // `PersonalSyncState` is this device's local runtime/config state —
+        // the cloud-sync *preference*, the sync cursor, per-record sync
+        // bookkeeping, and backup history. None of it is canonical user data,
+        // and a restored bundle's copy is meaningless on this device (a
+        // backup's cursor points at another device's watermark; its
+        // `cloudSyncEnabled` reflects wherever the backup was taken). A data
+        // restore must not silently mutate the user's operational sync
+        // preference — preserve whatever this device already has. The restore
+        // coordinator re-derives `cursor` / `needsCloudRestore` afterwards.
+        let preservedSyncState = await memoryStore.loadSyncState()
         var doc = bundle.memory
         doc.revisions = bundle.revisions
+        doc.syncState = preservedSyncState
         await memoryStore.replaceAll(with: doc)
         await conversationStore.replaceAllConversations(bundle.conversations, messages: bundle.messages)
         return ImportResult(
