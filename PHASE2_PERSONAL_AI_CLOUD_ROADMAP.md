@@ -203,6 +203,23 @@ through the Apple Developer portal during this check — no portal changes and
 no real CloudKit configuration were made. This is an Apple account /
 provisioning prerequisite, **not** a repository/code blocker.
 
+**Manual unlock procedure (not yet executed):** the full future sequence for
+lifting this block is documented in
+**`PHASE2_APPLE_DEVELOPER_CLOUDKIT_UNLOCK_CHECKLIST.md`** — an operator
+runbook to be followed **when a paid Apple Developer Program team becomes
+available**. It covers, in order: verifying paid Apple Developer Program team
+availability; verifying Xcode signing / team identity; App ID + CloudKit
+container (`iCloud.com.evenai.app`) setup; restoring the shelved Step 2
+configuration from `stash@{0}`; validating signing and the *signed-app*
+entitlements; a minimal Development CloudKit CRUD test; Personal AI sync
+validation against the real transport; fresh-install / new-device recovery;
+independent R2 recovery (a separate workstream); explicit Production-schema
+approval; a rollback plan; and nine Go / No-Go gates (A–I). **None of those
+steps has been executed** — the checklist is planning only, and every status
+in this document stands unchanged: CloudKit Step 2 remains SHELVED / BLOCKED,
+real CloudKit is not configured, real CloudKit CRUD / restore are not
+verified, and no Apple portal action has occurred.
+
 ---
 
 ## NOT YET CONFIGURED
