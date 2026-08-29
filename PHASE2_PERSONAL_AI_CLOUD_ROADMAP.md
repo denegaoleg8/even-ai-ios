@@ -145,10 +145,12 @@ all unchanged.
 
 ## SHELVED / BLOCKED
 
-**Reason: a paid Apple Developer Program team is currently unavailable.** The
-only Apple team on this machine is a free Personal Team
-(`isFreeProvisioningTeam = 1`), and CloudKit is not available on a free
-Personal Team.
+**Reason: the local Xcode signing environment is a Personal Team /
+free-provisioning setup, which cannot enable the CloudKit capability or
+create a CloudKit container.** The only Apple team visible on this machine is
+a free Personal Team (`isFreeProvisioningTeam = 1`). Paid Apple Developer
+Program membership itself was **not** independently verified through the
+Apple Developer portal — only the local signing environment was inspected.
 
 - **Apple CloudKit entitlements / container setup** — the `EvenAI.entitlements`
   file, `project.yml` `CODE_SIGN_ENTITLEMENTS` wiring, iCloud capability, and
@@ -179,12 +181,27 @@ the stash. The temporary worktree was removed; `stash@{0}`,
 unchanged afterward. **This only means the configuration stash is technically
 compatible with the current baseline — there is no repository code-drift
 blocker to restoring Step 2 later.** CloudKit Step 2 **remains SHELVED /
-BLOCKED**: restoration is still blocked by the unavailable paid Apple
-Developer Program team, not by repository drift. The stash can be reapplied
-once that Apple prerequisite is available, and **real CloudKit verification
-must still happen after restoration and configuration** — nothing here makes
-CloudKit active, configured, or available, and no real cloud durability is
-verified.
+BLOCKED**: restoration is blocked by the Apple provisioning prerequisite
+(a signing environment that can enable the CloudKit capability), not by
+repository drift. The stash can be reapplied once that prerequisite is
+available, and **real CloudKit verification must still happen after
+restoration and configuration** — nothing here makes CloudKit active,
+configured, or available, and no real cloud durability is verified.
+
+**Local Apple signing check (2026-08-29, baseline `48457983`,
+`HEAD == origin/main`):** read-only inspection (`security find-identity`,
+decoded provisioning profile, `xcodebuild -showBuildSettings`) confirms the
+current local Xcode signing is still a **Personal Team / free-provisioning
+environment** — one `Apple Development` identity, a single Xcode-managed
+7-day `iOS Team Provisioning Profile` with a personal `TeamName` and no
+iCloud/CloudKit entitlements. The checked-in EvenAI project still has **no
+active `CODE_SIGN_ENTITLEMENTS` and no CloudKit entitlements**; `project.yml`
+leaves `DEVELOPMENT_TEAM` unpinned. That environment is **insufficient** for
+the shelved CloudKit Step 2 entitlement/container configuration. Paid Apple
+Developer Program membership itself was **not** independently verified
+through the Apple Developer portal during this check — no portal changes and
+no real CloudKit configuration were made. This is an Apple account /
+provisioning prerequisite, **not** a repository/code blocker.
 
 ---
 
