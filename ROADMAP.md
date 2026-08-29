@@ -58,6 +58,36 @@ Research phase compared three transport options against current official Even Re
 ## 🔜 Milestone 6 — Vision (not started — awaiting approval)
 - Image upload, multimodal prompts, backend integration.
 
+## Personal AI Cloud (parallel track — software foundations complete, real provider durability pending)
+
+An on-device Personal AI memory system plus the software foundations for making it durable off-device. **The software foundations are complete; real off-device cloud durability has not been verified.** Personal AI cloud storage is **not** live, "R2 production backup" is **not** complete, and a shipping build wires no cloud (`PersonalAIContainer.live` reports `.notConfigured`). Detailed status and the implementation roadmap live in **`PHASE2_PERSONAL_AI_CLOUD_ROADMAP.md`**.
+
+**Complete (built, committed, tested locally):**
+- Personal AI local memory foundation
+- provider-independent sync / cloud architecture
+- CloudKit pure-Swift adapter foundation
+- encrypted independent-backup foundation
+- backup / restore validation
+- portable export / import foundation
+
+**Blocked / shelved** — *reason: a paid Apple Developer Program team is currently unavailable:*
+- CloudKit Apple entitlements / container configuration
+- real private CloudKit verification
+
+**Not yet configured:**
+- production CloudKit
+- real Cloudflare R2 bucket
+- real encrypted off-device R2 backup
+- production R2 auth / upload / download path
+- real new-iPhone recovery test
+
+**Future (in order):**
+- enable real CloudKit when a paid Apple Developer team is available
+- configure a secure R2 backup path without embedding provider credentials in the app
+- perform real backup / restore and disaster-recovery testing
+- verify new-iPhone restoration
+- only then proceed to Personal AI → G2 Phase 3 integration
+
 ## Known gaps carried forward (tracked, not blocking)
 
 - No local offline cache for the production (`NetworkChatService`) path — the app is fully backend-dependent today. SwiftData persistence exists but is currently only exercised by `MockChatService`.
