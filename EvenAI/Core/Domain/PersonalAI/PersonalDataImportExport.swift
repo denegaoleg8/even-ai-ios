@@ -56,6 +56,9 @@ enum ImportError: Error, Equatable, Sendable {
     case countMismatch(kind: String, manifest: Int, actual: Int)
     case missingRequiredField(String)
     case corrupt(String)
+    /// The backup belongs to a different Personal AI user id — never restore
+    /// another account's data onto this device.
+    case ownerMismatch
 
     var code: String {
         switch self {
@@ -67,6 +70,7 @@ enum ImportError: Error, Equatable, Sendable {
         case .countMismatch: return "count-mismatch"
         case .missingRequiredField: return "missing-field"
         case .corrupt: return "corrupt"
+        case .ownerMismatch: return "owner-mismatch"
         }
     }
 
@@ -82,6 +86,8 @@ enum ImportError: Error, Equatable, Sendable {
             return "This backup is corrupted and was not restored. Your existing data is unchanged."
         case .countMismatch, .missingRequiredField:
             return "This backup is incomplete and was not restored. Your existing data is unchanged."
+        case .ownerMismatch:
+            return "This backup belongs to a different account and was not restored."
         }
     }
 }
