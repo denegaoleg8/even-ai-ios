@@ -162,8 +162,29 @@ Personal Team.
 **Where the shelved work lives (do not modify):**
 
 - git stash: `stash@{0}` — `cloudkit-step2-apple-config-pending-paid-team`
+  (stash commit `7efa6d4869353833e4ca02c6ae3baf315b0d9598`)
 - backup copy: `~/Desktop/cloudkit-step2.patch`
   (md5 `a80809f705cf73ad24cdf513e41b673a`)
+
+**Stash compatibility check (2026-08-29, verified on baseline `d7cb67a`,
+`HEAD == origin/main`):** the stash was applied in a temporary detached
+worktree — `git stash apply` completed cleanly, **zero merge conflicts, zero
+rejected hunks**; the expected Step 2 files were all present (entitlements,
+`project.yml` `CODE_SIGN_ENTITLEMENTS`, `PersistenceController` +
+10 test `cloudKitDatabase: .none` build fixes, `PersonalAIContainer` dev-flag
+gating, `PHASE2_CLOUDKIT_STEP2_CONFIG.md`) with no unexpected files;
+`EvenAITests/ProductionEndpointContractTests.swift` was **not** introduced by
+the stash. The temporary worktree was removed; `stash@{0}`,
+`~/Desktop/cloudkit-step2.patch`, and the real main worktree were all
+unchanged afterward. **This only means the configuration stash is technically
+compatible with the current baseline — there is no repository code-drift
+blocker to restoring Step 2 later.** CloudKit Step 2 **remains SHELVED /
+BLOCKED**: restoration is still blocked by the unavailable paid Apple
+Developer Program team, not by repository drift. The stash can be reapplied
+once that Apple prerequisite is available, and **real CloudKit verification
+must still happen after restoration and configuration** — nothing here makes
+CloudKit active, configured, or available, and no real cloud durability is
+verified.
 
 ---
 
