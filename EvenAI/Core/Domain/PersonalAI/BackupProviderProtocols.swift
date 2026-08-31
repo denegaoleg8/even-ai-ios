@@ -93,7 +93,7 @@ enum BackupTransportError: Error, Equatable, Sendable {
 
 // MARK: - Credential seam (how the app is allowed to touch the store)
 
-enum BackupObjectOperation: String, Sendable, CaseIterable {
+enum BackupObjectOperation: String, Codable, Sendable, CaseIterable {
     case put, get, delete, head, list
 }
 
@@ -103,7 +103,39 @@ struct PresignedBackupRequest: Sendable {
     var url: URL
     var headers: [String: String]
     var expiresAt: Date
+    /// Opaque id the authorizer stamped on this grant (also embedded in the
+    /// signed URL). Lets a store / test detect a replayed grant. `nil` for a
+    /// legacy provider that does not issue one.
+    var grantID: String?
+    /// What this grant actually permits — one operation on one key. When
+    /// present, `BackupAuthorizationClient` refuses to use the grant for
+    /// anything else. `nil` for a legacy provider.
+    var scope: BackupAuthorizationScope?
+
+    init(
+        url: URL,
+        headers: [String: String],
+        expiresAt: Date,
+        grantID: String? = nil,
+        scope: BackupAuthorizationScope? = nil
+    ) {
+        self.url = url
+        self.headers = headers
+        self.expiresAt = expiresAt
+        self.grantID = grantID
+        self.scope = scope
+    }
+
     var isExpired: Bool { Date() >= expiresAt }
+
+    /// True when this grant's `scope` covers exactly `operation` on `key`
+    /// under `ownerTag`. Returns `false` when `scope` is `nil` — a production
+    /// grant must carry its scope (`BackupAuthorizationClient` refuses one
+    /// that does not).
+    func covers(_ operation: BackupObjectOperation, key: String, ownerTag: String) -> Bool {
+        guard let scope else { return false }
+        return scope.authorizes(operation, key: key, ownerTag: ownerTag)
+    }
 }
 
 /// **The security boundary.** A production iPhone app must never embed a
@@ -129,6 +161,13 @@ enum BackupCredentialError: Error, Equatable, Sendable {
     case unauthorized
     case keyOutsideOwnerScope
     case network
+    /// The authorizer returned a grant that is already past its expiry.
+    case expired
+    /// The authorizer rejected the request as a replay (nonce / grant reused).
+    case replayed
+    /// A production provider returned a grant with **no `scope`** — the
+    /// client cannot verify what it permits, so it is refused.
+    case scopeMissing
 
     var code: String {
         switch self {
@@ -136,6 +175,9 @@ enum BackupCredentialError: Error, Equatable, Sendable {
         case .unauthorized: return "unauthorized"
         case .keyOutsideOwnerScope: return "scope"
         case .network: return "network"
+        case .expired: return "expired"
+        case .replayed: return "replayed"
+        case .scopeMissing: return "scope-missing"
         }
     }
 }

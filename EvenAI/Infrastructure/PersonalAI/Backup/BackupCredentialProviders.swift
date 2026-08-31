@@ -50,11 +50,23 @@ struct WorkerBackupCredentialProvider: BackupCredentialProviding {
         var url: URL
         var headers: [String: String]?
         var expiresInSeconds: Double
+        /// Optional — a future Worker returns the scope it *authoritatively*
+        /// granted (with the server-derived owner tag). When present it must
+        /// still match what we asked for; when absent the client synthesises
+        /// the scope from the request as defence-in-depth.
+        var grantID: String?
+        var scope: GrantScope?
+        struct GrantScope: Decodable {
+            var ownerTag: String
+            var objectKey: String
+            var operation: String
+        }
     }
 
     func presign(_ operation: BackupObjectOperation, key: String, ownerTag: String) async throws -> PresignedBackupRequest {
-        // Defence in depth: never ask for a URL outside our own prefix.
-        guard key == ownerTag || key.hasPrefix(ownerTag + "/") else {
+        // Defence in depth: never ask for a URL outside our own prefix, and
+        // never for a malformed key.
+        guard BackupAuthorizationScope.keyIsInOwnerNamespace(key, ownerTag: ownerTag) else {
             throw BackupCredentialError.keyOutsideOwnerScope
         }
         var request = URLRequest(url: endpoint)
@@ -81,10 +93,23 @@ struct WorkerBackupCredentialProvider: BackupCredentialProviding {
         guard let body = try? JSONDecoder().decode(PresignResponseBody.self, from: data) else {
             throw BackupCredentialError.network
         }
+
+        // Bind the grant to a scope. If the Worker returned one, it is
+        // authoritative — but it must still be exactly what we asked for
+        // (same operation, same key, same owner tag), or we refuse it.
+        if let s = body.scope {
+            guard s.operation == operation.rawValue, s.objectKey == key, s.ownerTag == ownerTag else {
+                throw BackupCredentialError.keyOutsideOwnerScope
+            }
+        }
+        let scope = BackupAuthorizationScope(ownerTag: ownerTag, objectKey: key, operation: operation)
+
         return PresignedBackupRequest(
             url: body.url,
             headers: body.headers ?? [:],
-            expiresAt: Date().addingTimeInterval(body.expiresInSeconds)
+            expiresAt: Date().addingTimeInterval(body.expiresInSeconds),
+            grantID: body.grantID ?? UUID().uuidString,
+            scope: scope
         )
     }
 }

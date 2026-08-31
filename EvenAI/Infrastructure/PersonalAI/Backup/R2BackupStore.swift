@@ -17,9 +17,18 @@ import Foundation
 /// on-device backup (`LocalDirectoryBackupStore`) is unaffected. Nothing about
 /// R2 is live until a Worker URL is configured — a later, separate step.
 ///
+/// ## Construction is guarded
+///
+/// The raw initializer is **private**. Every `R2BackupStore` is built through
+/// `authorized(credentials:transport:)` or `dormant`, both of which wrap the
+/// credential provider in `BackupAuthorizationClient` — so an ordinary caller
+/// **cannot** construct a remotely-capable store that skips the client-side
+/// authorization guard (expiry / scope / namespace checks). This is enforced
+/// by the compiler, not by documentation.
+///
 /// Object layout (keys are relative; the Worker maps them under the bucket):
 /// ```
-/// <ownerTag>/catalog.json                          the BackupHandle list
+/// <ownerTag>/catalog.json                          the committed BackupHandle list
 /// <ownerTag>/objects/<version>-<tier>-<id>.eapb     one sealed backup each
 /// ```
 /// `<ownerTag>` is a salted hash of the Personal AI user id — never the id.
@@ -29,19 +38,37 @@ struct R2BackupStore: BackupStore {
     private let transport: any BackupObjectTransport
     private let ownerTagger: @Sendable (String) -> String
 
-    init(
+    private init(
         credentials: any BackupCredentialProviding,
         transport: any BackupObjectTransport,
-        ownerTagger: @escaping @Sendable (String) -> String = { BackupOwnerTag.tag($0) }
+        ownerTagger: @escaping @Sendable (String) -> String
     ) {
         self.credentials = credentials
         self.transport = transport
         self.ownerTagger = ownerTagger
     }
 
-    /// Convenience: the production-dormant composition.
-    static var dormant: R2BackupStore {
+    /// The **only** app-facing way to build a remotely-capable store. The
+    /// `credentials` provider is wrapped in `BackupAuthorizationClient`, so
+    /// every operation goes through the expiry / scope / namespace guard.
+    /// Pass a configured `WorkerBackupCredentialProvider` + a live transport
+    /// (a later, separately-approved wiring); pass fakes in tests.
+    static func authorized(
+        credentials: any BackupCredentialProviding,
+        transport: any BackupObjectTransport,
+        ownerTagger: @escaping @Sendable (String) -> String = { BackupOwnerTag.tag($0) }
+    ) -> R2BackupStore {
         R2BackupStore(
+            credentials: BackupAuthorizationClient(wrapping: credentials),
+            transport: transport,
+            ownerTagger: ownerTagger
+        )
+    }
+
+    /// The production-dormant composition — no authorizer, no transport.
+    /// Every call throws `notConfigured`; the guard is still in the chain.
+    static var dormant: R2BackupStore {
+        authorized(
             credentials: NotConfiguredBackupCredentialProvider(),
             transport: DormantBackupObjectTransport()
         )

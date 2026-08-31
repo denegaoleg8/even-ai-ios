@@ -84,18 +84,26 @@ final class InMemoryBackupObjectTransport: BackupObjectTransport, @unchecked Sen
 struct FakePresignProvider: BackupCredentialProviding {
     var isConfigured: Bool = true
     var rejectAllAsUnauthorized = false
+    /// When set, the issued grant's `expiresAt` is `now + this` (negative =
+    /// already expired).
+    var grantTTL: TimeInterval = 300
+    /// When true, the issued grant carries **no** `scope` (models a
+    /// misbehaving provider — `BackupAuthorizationClient` must refuse it).
+    var omitScope = false
 
     func presign(_ operation: BackupObjectOperation, key: String, ownerTag: String) async throws -> PresignedBackupRequest {
         if !isConfigured { throw BackupCredentialError.notConfigured }
         if rejectAllAsUnauthorized { throw BackupCredentialError.unauthorized }
-        guard key == ownerTag || key.hasPrefix(ownerTag + "/") else {
+        guard BackupAuthorizationScope.keyIsInOwnerNamespace(key, ownerTag: ownerTag) else {
             throw BackupCredentialError.keyOutsideOwnerScope
         }
         // The URL is stable per (key) so PUT then GET address the same object.
         return PresignedBackupRequest(
-            url: URL(string: "https://fake.invalid/\(operation == .get || operation == .head ? "" : "")\(key)")!,
+            url: URL(string: "https://fake.invalid/\(key)")!,
             headers: ["x-op": operation.rawValue],
-            expiresAt: Date().addingTimeInterval(300)
+            expiresAt: Date().addingTimeInterval(grantTTL),
+            grantID: "fake-grant-\(UUID().uuidString)",
+            scope: omitScope ? nil : BackupAuthorizationScope(ownerTag: ownerTag, objectKey: key, operation: operation)
         )
     }
 }
@@ -139,7 +147,7 @@ enum FakeR2 {
         transport: InMemoryBackupObjectTransport = InMemoryBackupObjectTransport(),
         configured: Bool = true
     ) -> (store: R2BackupStore, transport: InMemoryBackupObjectTransport) {
-        let store = R2BackupStore(
+        let store = R2BackupStore.authorized(
             credentials: FakePresignProvider(isConfigured: configured),
             transport: transport
         )
