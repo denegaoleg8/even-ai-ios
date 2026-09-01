@@ -168,6 +168,11 @@ enum BackupCredentialError: Error, Equatable, Sendable {
     /// A production provider returned a grant with **no `scope`** — the
     /// client cannot verify what it permits, so it is refused.
     case scopeMissing
+    /// The authoritative (server-derived) grant scope disagrees with the
+    /// request: a different owner than the caller is authenticated as, a
+    /// different operation, or a different object key. The grant is not the
+    /// authority the caller asked for, so it is refused.
+    case scopeMismatch
 
     var code: String {
         switch self {
@@ -178,6 +183,7 @@ enum BackupCredentialError: Error, Equatable, Sendable {
         case .expired: return "expired"
         case .replayed: return "replayed"
         case .scopeMissing: return "scope-missing"
+        case .scopeMismatch: return "scope-mismatch"
         }
     }
 }

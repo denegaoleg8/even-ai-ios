@@ -20,11 +20,16 @@ import Foundation
 /// ## Construction is guarded
 ///
 /// The raw initializer is **private**. Every `R2BackupStore` is built through
-/// `authorized(credentials:transport:)` or `dormant`, both of which wrap the
-/// credential provider in `BackupAuthorizationClient` — so an ordinary caller
-/// **cannot** construct a remotely-capable store that skips the client-side
-/// authorization guard (expiry / scope / namespace checks). This is enforced
-/// by the compiler, not by documentation.
+/// `authorized(credentials:transport:authority:)` or `dormant`, both of which
+/// wrap the credential provider in `BackupAuthorizationClient` — so an ordinary
+/// caller **cannot** construct a remotely-capable store that skips the
+/// client-side authorization guard (expiry / scope / namespace checks).
+///
+/// `authorized` additionally requires a `RemoteBackupCompositionAuthority`,
+/// whose initializer is `fileprivate` to `R2ProductionBackupAdapter.swift`. So
+/// the **only** way any code in the module — production or test — can obtain a
+/// remote-capable store is `R2ProductionBackupAdapter.makeStore(...)`. There is
+/// no other composition path, and that is compiler-enforced, not documented.
 ///
 /// Object layout (keys are relative; the Worker maps them under the bucket):
 /// ```
@@ -48,15 +53,14 @@ struct R2BackupStore: BackupStore {
         self.ownerTagger = ownerTagger
     }
 
-    /// The **only** app-facing way to build a remotely-capable store. The
-    /// `credentials` provider is wrapped in `BackupAuthorizationClient`, so
-    /// every operation goes through the expiry / scope / namespace guard.
-    /// Pass a configured `WorkerBackupCredentialProvider` + a live transport
-    /// (a later, separately-approved wiring); pass fakes in tests.
-    static func authorized(
+    /// Shared composition: always wraps `credentials` in
+    /// `BackupAuthorizationClient`, so every operation goes through the expiry /
+    /// scope / namespace guard. Private — the two entry points below are the
+    /// surface.
+    private static func guarded(
         credentials: any BackupCredentialProviding,
         transport: any BackupObjectTransport,
-        ownerTagger: @escaping @Sendable (String) -> String = { BackupOwnerTag.tag($0) }
+        ownerTagger: @escaping @Sendable (String) -> String
     ) -> R2BackupStore {
         R2BackupStore(
             credentials: BackupAuthorizationClient(wrapping: credentials),
@@ -65,12 +69,32 @@ struct R2BackupStore: BackupStore {
         )
     }
 
+    /// The **only** way to build a remotely-capable store — and only
+    /// `R2ProductionBackupAdapter` can call it, because it alone can mint the
+    /// `RemoteBackupCompositionAuthority` this requires (that type's initializer
+    /// is `fileprivate` to `R2ProductionBackupAdapter.swift`). The `credentials`
+    /// provider is wrapped in `BackupAuthorizationClient`, so every operation
+    /// goes through the expiry / scope / namespace guard. Pass a configured
+    /// `WorkerBackupCredentialProvider` + a live transport (a later,
+    /// separately-approved wiring); tests compose fakes via the same adapter.
+    static func authorized(
+        credentials: any BackupCredentialProviding,
+        transport: any BackupObjectTransport,
+        authority: RemoteBackupCompositionAuthority,
+        ownerTagger: @escaping @Sendable (String) -> String = { BackupOwnerTag.tag($0) }
+    ) -> R2BackupStore {
+        _ = authority   // presence is the capability; nothing to read from it
+        return guarded(credentials: credentials, transport: transport, ownerTagger: ownerTagger)
+    }
+
     /// The production-dormant composition — no authorizer, no transport.
     /// Every call throws `notConfigured`; the guard is still in the chain.
+    /// Reaches no network, so it needs no composition authority.
     static var dormant: R2BackupStore {
-        authorized(
+        guarded(
             credentials: NotConfiguredBackupCredentialProvider(),
-            transport: DormantBackupObjectTransport()
+            transport: DormantBackupObjectTransport(),
+            ownerTagger: { BackupOwnerTag.tag($0) }
         )
     }
 

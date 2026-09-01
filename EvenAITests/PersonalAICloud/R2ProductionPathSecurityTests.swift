@@ -435,12 +435,10 @@ struct R2ProductionPathSecurityTests {
     func guardedFactoryEnforcesAuthorization() async {
         // A provider that issues a scoped-but-expired grant. If the guard were
         // missing, putBackup would try to use it; with the guard, it fails.
-        let expiredProvider = FakePresignProvider(grantTTL: -30)
-        let store = R2BackupStore.authorized(credentials: expiredProvider, transport: InMemoryBackupObjectTransport())
-        await #expect(throws: BackupCredentialError.self) {
-            try await store.putBackup(Data("x".utf8), handle: handle(size: 1), ownerID: "user-A")
-        }
-        // Same through the app-facing adapter API.
+        // `R2ProductionBackupAdapter.makeStore` is the ONLY way to compose a
+        // remote store — `R2BackupStore.authorized` cannot be called elsewhere
+        // (it needs a `RemoteBackupCompositionAuthority`, mintable only in
+        // `R2ProductionBackupAdapter.swift`).
         let viaAdapter = R2ProductionBackupAdapter.makeStore(
             credentials: FakePresignProvider(grantTTL: -30), transport: InMemoryBackupObjectTransport())
         await #expect(throws: BackupCredentialError.self) {
@@ -486,47 +484,85 @@ struct R2ProductionPathSecurityTests {
         #expect(transport.keys().contains { $0.hasSuffix(".eapb") })
     }
 
-    @Test("WorkerBackupCredentialProvider binds the grant to the exact requested scope")
+    /// A Worker `/presign` response modelling a *correct* authorizer: it grants
+    /// exactly `(operation, key)` under the given server-derived `ownerTag`.
+    private func stubWorkerGranting(
+        ownerTag: String,
+        operation: String = "put",
+        key: String,
+        expiresInSeconds: Int = 300
+    ) {
+        let json = """
+        {"url":"https://signed.invalid/\(operation)","expiresInSeconds":\(expiresInSeconds),"grantID":"grant-xyz",
+         "scope":{"ownerTag":"\(ownerTag)","objectKey":"\(key)","operation":"\(operation)"}}
+        """
+        StubURLProtocol.handler = { _ in .init(status: 200, body: Data(json.utf8)) }
+    }
+
+    private func workerProvider(authenticatedUserID: String = "user-A") -> WorkerBackupCredentialProvider {
+        WorkerBackupCredentialProvider(
+            endpoint: URL(string: "https://backup.invalid/presign")!,
+            authenticatedUserID: authenticatedUserID,
+            identityToken: { "test-identity" },
+            session: StubURLProtocol.makeSession()
+        )
+    }
+
+    @Test("WorkerBackupCredentialProvider carries the server's authoritative scope through to the grant")
     func workerProviderProducesScopedGrant() async throws {
         StubURLProtocol.reset()
         defer { StubURLProtocol.reset() }
         let key = "\(tagA)/objects/5-daily-\(UUID().uuidString).eapb"
-        StubURLProtocol.handler = { _ in
-            let json = #"{"url":"https://signed.invalid/put","expiresInSeconds":300}"#
-            return .init(status: 200, body: Data(json.utf8))
-        }
-        let provider = WorkerBackupCredentialProvider(
-            endpoint: URL(string: "https://backup.invalid/presign")!,
-            identityToken: { "test-identity" },
-            session: StubURLProtocol.makeSession()
-        )
+        stubWorkerGranting(ownerTag: tagA, key: key)
+        let provider = workerProvider()
         let grant = try await provider.presign(.put, key: key, ownerTag: tagA)
         #expect(grant.scope?.operation == .put)
         #expect(grant.scope?.objectKey == key)
         #expect(grant.scope?.ownerTag == tagA)
-        #expect(grant.grantID != nil)
+        #expect(grant.grantID == "grant-xyz")
         #expect(grant.covers(.put, key: key, ownerTag: tagA))
         // and the whole thing passes the client guard
         let client = BackupAuthorizationClient(wrapping: provider)
         _ = try await client.presign(.put, key: key, ownerTag: tagA)
     }
 
-    @Test("WorkerBackupCredentialProvider rejects a server-returned scope that disagrees with the request")
+    @Test("WorkerBackupCredentialProvider refuses a response with no scope (never synthesises one)")
+    func workerProviderRefusesUnscopedResponse() async {
+        StubURLProtocol.reset()
+        defer { StubURLProtocol.reset() }
+        StubURLProtocol.handler = { _ in
+            .init(status: 200, body: Data(#"{"url":"https://signed.invalid/put","expiresInSeconds":300}"#.utf8))
+        }
+        let provider = workerProvider()
+        await #expect(throws: BackupCredentialError.scopeMissing) {
+            _ = try await provider.presign(.put, key: "\(tagA)/objects/x.eapb", ownerTag: tagA)
+        }
+    }
+
+    @Test("WorkerBackupCredentialProvider rejects a server-returned scope for a different owner")
     func workerProviderRejectsMismatchedServerScope() async {
         StubURLProtocol.reset()
         defer { StubURLProtocol.reset() }
         StubURLProtocol.handler = { _ in
-            // Server claims a grant for a *different* key.
+            // Server claims a grant under a *different* owner tag.
             let json = #"{"url":"https://signed.invalid/put","expiresInSeconds":300,"scope":{"ownerTag":"OTHER","objectKey":"OTHER/x","operation":"put"}}"#
             return .init(status: 200, body: Data(json.utf8))
         }
-        let provider = WorkerBackupCredentialProvider(
-            endpoint: URL(string: "https://backup.invalid/presign")!,
-            identityToken: { "test-identity" },
-            session: StubURLProtocol.makeSession()
-        )
-        await #expect(throws: BackupCredentialError.self) {
+        let provider = workerProvider()
+        await #expect(throws: BackupCredentialError.scopeMismatch) {
             _ = try await provider.presign(.put, key: "\(tagA)/objects/x.eapb", ownerTag: tagA)
+        }
+    }
+
+    @Test("WorkerBackupCredentialProvider will not sign for an owner it is not authenticated as")
+    func workerProviderRefusesForeignOwnerRequest() async {
+        StubURLProtocol.reset()
+        defer { StubURLProtocol.reset() }
+        stubWorkerGranting(ownerTag: tagB, key: "\(tagB)/objects/x.eapb")
+        let provider = workerProvider(authenticatedUserID: "user-A")   // authenticated as A
+        await #expect(throws: BackupCredentialError.scopeMismatch) {
+            // caller asks to act under B's tag
+            _ = try await provider.presign(.put, key: "\(tagB)/objects/x.eapb", ownerTag: tagB)
         }
     }
 
@@ -545,6 +581,253 @@ struct R2ProductionPathSecurityTests {
                           "CLOUDFLARE_API_TOKEN", "cloudflarestorage.com", "-----BEGIN"] {
                 #expect(!src.contains(token), "\(rel) contains \(token)")
             }
+        }
+    }
+}
+
+// MARK: - R1 / R2 adversarial suite
+
+/// A credential provider that hands back a grant carrying a **caller-chosen**
+/// scope (or none), regardless of what was requested — the stand-in for a
+/// buggy or hostile authorizer. Lets these tests prove that
+/// `BackupAuthorizationClient` is the real enforcement point: the grant scope
+/// and the request are independent inputs, and a disagreement is caught.
+private struct FixedScopeProvider: BackupCredentialProviding {
+    var isConfigured = true
+    var scope: BackupAuthorizationScope?
+    var ttl: TimeInterval = 300
+    func presign(_ operation: BackupObjectOperation, key: String, ownerTag: String) async throws -> PresignedBackupRequest {
+        PresignedBackupRequest(
+            url: URL(string: "https://fixed.invalid/\(key)")!,
+            headers: [:],
+            expiresAt: Date().addingTimeInterval(ttl),
+            grantID: "fixed-grant",
+            scope: scope
+        )
+    }
+}
+
+/// The adversarial cases the hardening work must satisfy: the normal
+/// production API cannot bypass the authorization layer (R1), and the grant
+/// scope is a meaningful, server-authoritative binding — not a copy of the
+/// request (R2).
+@Suite("R2 production path: authorization bypass & scope integrity", .serialized)
+struct R2ProductionPathAuthorizationBypassTests {
+
+    private let tagA = BackupOwnerTag.tag("user-A")
+    private let tagB = BackupOwnerTag.tag("user-B")
+    private let key = "\(BackupOwnerTag.tag("user-A"))/objects/9-daily-fixed.eapb"
+
+    private func handle(size: Int = 4) -> BackupHandle {
+        BackupHandle(id: UUID().uuidString, createdAt: Date(), bundleVersion: 1, sizeBytes: size, checksum: "c", tier: "daily")
+    }
+
+    private func repoRoot() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    }
+
+    // MARK: R1 — the normal production API cannot bypass authorization
+
+    @Test("the remote-store composition authority can be minted ONLY inside R2ProductionBackupAdapter.swift")
+    func compositionAuthorityIsConfined() {
+        let root = repoRoot()
+        var constructions: [String] = []
+        for dir in ["EvenAI", "EvenAITests"] {
+            let base = root.appendingPathComponent(dir)
+            let e = FileManager.default.enumerator(at: base, includingPropertiesForKeys: nil)
+            while let u = e?.nextObject() as? URL {
+                guard u.pathExtension == "swift" else { continue }
+                // This file names the pattern in its own assertions.
+                guard u.lastPathComponent != "R2ProductionPathSecurityTests.swift" else { continue }
+                let src = (try? String(contentsOf: u, encoding: .utf8)) ?? ""
+                let collapsed = src.replacingOccurrences(of: " ", with: "")
+                if collapsed.contains("RemoteBackupCompositionAuthority(") {
+                    constructions.append(u.lastPathComponent)
+                }
+            }
+        }
+        // The type is *named* in a doc comment in R2BackupStore.swift; it is
+        // *constructed* only in the adapter.
+        #expect(constructions == ["R2ProductionBackupAdapter.swift"],
+                "RemoteBackupCompositionAuthority() constructed in unexpected file(s): \(constructions)")
+    }
+
+    @Test("no code calls R2BackupStore.authorized directly — the adapter is the sole entry")
+    func authorizedFactoryNotCalledDirectly() {
+        let root = repoRoot()
+        for dir in ["EvenAI", "EvenAITests"] {
+            let base = root.appendingPathComponent(dir)
+            let e = FileManager.default.enumerator(at: base, includingPropertiesForKeys: nil)
+            while let u = e?.nextObject() as? URL {
+                guard u.pathExtension == "swift" else { continue }
+                // The declaration lives in R2BackupStore.swift; the *only*
+                // permitted call site is R2ProductionBackupAdapter.swift.
+                guard u.lastPathComponent != "R2BackupStore.swift",
+                      u.lastPathComponent != "R2ProductionBackupAdapter.swift",
+                      u.lastPathComponent != "R2ProductionPathSecurityTests.swift" else { continue }
+                let collapsed = ((try? String(contentsOf: u, encoding: .utf8)) ?? "")
+                    .replacingOccurrences(of: " ", with: "").replacingOccurrences(of: "\n", with: "")
+                #expect(!collapsed.contains("R2BackupStore.authorized("),
+                        "\(u.lastPathComponent) calls R2BackupStore.authorized directly")
+            }
+        }
+    }
+
+    @Test("a store built by the normal production API always enforces the authorization guard")
+    func normalProductionAPICannotBypassGuard() async {
+        // Every remote store the app can build comes from makeStore, and every
+        // one of them refuses an expired grant, a mis-scoped grant, and an
+        // unscoped grant — i.e. the BackupAuthorizationClient guard is always
+        // in the chain, unconditionally.
+        let expired = R2ProductionBackupAdapter.makeStore(
+            credentials: FixedScopeProvider(scope: .init(ownerTag: tagA, objectKey: key, operation: .put), ttl: -30),
+            transport: InMemoryBackupObjectTransport())
+        await #expect(throws: BackupCredentialError.self) {
+            try await expired.putBackup(Data("x".utf8), handle: handle(), ownerID: "user-A")
+        }
+
+        let unscoped = R2ProductionBackupAdapter.makeStore(
+            credentials: FixedScopeProvider(scope: nil),
+            transport: InMemoryBackupObjectTransport())
+        await #expect(throws: BackupCredentialError.self) {
+            try await unscoped.putBackup(Data("x".utf8), handle: handle(), ownerID: "user-A")
+        }
+    }
+
+    // MARK: R2 — the grant scope is a meaningful, server-authoritative check
+
+    @Test("exact valid scope succeeds end to end")
+    func exactValidScopeSucceeds() async throws {
+        let client = BackupAuthorizationClient(wrapping: FixedScopeProvider(
+            scope: .init(ownerTag: tagA, objectKey: key, operation: .put)))
+        let grant = try await client.presign(.put, key: key, ownerTag: tagA)
+        #expect(grant.covers(.put, key: key, ownerTag: tagA))
+        #expect(grant.scope?.ownerTag == tagA)
+    }
+
+    @Test("missing scope fails")
+    func missingScopeFails() async {
+        let client = BackupAuthorizationClient(wrapping: FixedScopeProvider(scope: nil))
+        await #expect(throws: BackupCredentialError.scopeMissing) {
+            _ = try await client.presign(.put, key: key, ownerTag: tagA)
+        }
+    }
+
+    @Test("wrong operation fails")
+    func wrongOperationFails() async {
+        let client = BackupAuthorizationClient(wrapping: FixedScopeProvider(
+            scope: .init(ownerTag: tagA, objectKey: key, operation: .delete)))   // granted delete
+        await #expect(throws: BackupCredentialError.scopeMismatch) {
+            _ = try await client.presign(.put, key: key, ownerTag: tagA)          // asked put
+        }
+    }
+
+    @Test("wrong object / backup fails")
+    func wrongObjectFails() async {
+        let client = BackupAuthorizationClient(wrapping: FixedScopeProvider(
+            scope: .init(ownerTag: tagA, objectKey: "\(tagA)/objects/SOMETHING-ELSE.eapb", operation: .put)))
+        await #expect(throws: BackupCredentialError.scopeMismatch) {
+            _ = try await client.presign(.put, key: key, ownerTag: tagA)
+        }
+    }
+
+    @Test("wrong owner fails")
+    func wrongOwnerFails() async {
+        // The caller acts correctly under A's own key, but the authorizer
+        // handed back a grant whose authoritative owner is B. The scope check
+        // — comparing the grant's owner to the caller's — rejects it.
+        let client = BackupAuthorizationClient(wrapping: FixedScopeProvider(
+            scope: .init(ownerTag: tagB, objectKey: key, operation: .put)))
+        await #expect(throws: BackupCredentialError.scopeMismatch) {
+            _ = try await client.presign(.put, key: key, ownerTag: tagA)
+        }
+    }
+
+    @Test("expired scoped grant fails")
+    func expiredScopedGrantFails() async {
+        let client = BackupAuthorizationClient(wrapping: FixedScopeProvider(
+            scope: .init(ownerTag: tagA, objectKey: key, operation: .put), ttl: -1))
+        await #expect(throws: BackupCredentialError.expired) {
+            _ = try await client.presign(.put, key: key, ownerTag: tagA)
+        }
+    }
+
+    // MARK: R2 — credential-provider → request → scope survives end-to-end
+
+    @Test("the server-derived scope survives WorkerProvider → BackupAuthorizationClient unchanged")
+    func scopeSurvivesEndToEnd() async throws {
+        StubURLProtocol.reset()
+        defer { StubURLProtocol.reset() }
+        let k = "\(tagA)/objects/e2e-\(UUID().uuidString).eapb"
+        // The Worker derives A's tag from the verified identity and returns it
+        // as the authoritative scope.
+        let json = """
+        {"url":"https://signed.invalid/put","expiresInSeconds":300,"grantID":"g-e2e",
+         "scope":{"ownerTag":"\(tagA)","objectKey":"\(k)","operation":"put"}}
+        """
+        StubURLProtocol.handler = { _ in .init(status: 200, body: Data(json.utf8)) }
+
+        let provider = WorkerBackupCredentialProvider(
+            endpoint: URL(string: "https://backup.invalid/presign")!,
+            authenticatedUserID: "user-A",
+            identityToken: { "identity-A" },
+            session: StubURLProtocol.makeSession())
+        let client = BackupAuthorizationClient(wrapping: provider)
+
+        let grant = try await client.presign(.put, key: k, ownerTag: tagA)
+        #expect(grant.scope?.ownerTag == tagA)         // server-derived, not caller-synthesised
+        #expect(grant.scope?.objectKey == k)
+        #expect(grant.scope?.operation == .put)
+        #expect(grant.grantID == "g-e2e")
+        #expect(grant.covers(.put, key: k, ownerTag: tagA))
+    }
+
+    @Test("an expired grant from the Worker is rejected by the client")
+    func workerExpiredGrantRejected() async {
+        StubURLProtocol.reset()
+        defer { StubURLProtocol.reset() }
+        let k = "\(tagA)/objects/exp-\(UUID().uuidString).eapb"
+        let json = """
+        {"url":"https://signed.invalid/put","expiresInSeconds":-5,
+         "scope":{"ownerTag":"\(tagA)","objectKey":"\(k)","operation":"put"}}
+        """
+        StubURLProtocol.handler = { _ in .init(status: 200, body: Data(json.utf8)) }
+        let provider = WorkerBackupCredentialProvider(
+            endpoint: URL(string: "https://backup.invalid/presign")!,
+            authenticatedUserID: "user-A",
+            identityToken: { "identity-A" },
+            session: StubURLProtocol.makeSession())
+        let client = BackupAuthorizationClient(wrapping: provider)
+        await #expect(throws: BackupCredentialError.expired) {
+            _ = try await client.presign(.put, key: k, ownerTag: tagA)
+        }
+    }
+
+    // MARK: no secret / no plaintext introduced
+
+    @Test("the R1/R2 changes introduce no R2 credential, endpoint, or private key")
+    func changesIntroduceNoSecret() {
+        let root = repoRoot()
+        for rel in ["EvenAI/Core/Domain/PersonalAI/BackupProviderProtocols.swift",
+                    "EvenAI/Core/Domain/PersonalAI/BackupAuthorization.swift",
+                    "EvenAI/Infrastructure/PersonalAI/Backup/BackupAuthorizationClient.swift",
+                    "EvenAI/Infrastructure/PersonalAI/Backup/BackupCredentialProviders.swift",
+                    "EvenAI/Infrastructure/PersonalAI/Backup/R2BackupStore.swift",
+                    "EvenAI/Infrastructure/PersonalAI/Backup/R2ProductionBackupAdapter.swift"] {
+            let src = (try? String(contentsOf: root.appendingPathComponent(rel), encoding: .utf8)) ?? ""
+            for token in ["AKIA", "aws_secret_access_key", "R2_SECRET", "R2_ACCESS_KEY_ID",
+                          "CLOUDFLARE_API_TOKEN", "cloudflarestorage.com", "-----BEGIN"] {
+                #expect(!src.contains(token), "\(rel) contains \(token)")
+            }
+        }
+        // The credential-provider surface still never takes a decryption key.
+        for rel in ["EvenAI/Infrastructure/PersonalAI/Backup/BackupAuthorizationClient.swift",
+                    "EvenAI/Infrastructure/PersonalAI/Backup/BackupCredentialProviders.swift",
+                    "EvenAI/Infrastructure/PersonalAI/Backup/R2BackupStore.swift",
+                    "EvenAI/Infrastructure/PersonalAI/Backup/R2ProductionBackupAdapter.swift"] {
+            let src = (try? String(contentsOf: root.appendingPathComponent(rel), encoding: .utf8)) ?? ""
+            #expect(!src.contains("SymmetricKey"), "\(rel) references a SymmetricKey")
         }
     }
 }

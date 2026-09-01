@@ -147,7 +147,7 @@ enum FakeR2 {
         transport: InMemoryBackupObjectTransport = InMemoryBackupObjectTransport(),
         configured: Bool = true
     ) -> (store: R2BackupStore, transport: InMemoryBackupObjectTransport) {
-        let store = R2BackupStore.authorized(
+        let store = R2ProductionBackupAdapter.makeStore(
             credentials: FakePresignProvider(isConfigured: configured),
             transport: transport
         )

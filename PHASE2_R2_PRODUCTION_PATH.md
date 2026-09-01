@@ -2,7 +2,13 @@
 
 **Design + local implementation only.** No Cloudflare account, no R2 bucket,
 no Worker, no billing, no credentials, no real network. `PersonalAIContainer.live`
-is unchanged and still wires no off-device backup. Not committed, not pushed.
+is unchanged and still wires no off-device backup.
+
+> **Status (2026-08-31):** §§ 1–13 landed as `ea0ab4f Add production-safe R2
+> backup path`. Uncommitted on top: the **§ 14 R1/R2 hardening** (production
+> Swift + tests) and the **`cloudflare/backup-worker/`** Worker source (server
+> half of the contract — never deployed, KV/R2 simulated in-memory by its
+> local vitest). Nothing committed or pushed in this pass.
 
 - **Baseline:** `3376393 Reference CloudKit unlock checklist`
 - **This workstream:** the secure production boundary needed *before* a real
@@ -143,7 +149,7 @@ Existing seams, extended additively:
 - `PresignedBackupRequest` gains `grantID: String?` and `scope: BackupAuthorizationScope?` (both defaulted `nil` — every existing call site is source-compatible). `covers(_ op:key:ownerTag:)` returns `false` when `scope == nil` — a production grant **must** be scoped.
 - `BackupCredentialError` gains `.expired`, `.replayed`, `.scopeMissing`.
 - `BackupObjectOperation` gains `Codable` (trivial, additive).
-- `WorkerBackupCredentialProvider` now **populates the grant's `scope`** from the request (and validates any server-returned scope against it), and `R2BackupStore`'s raw initializer is **private** — see § 9 (R1/R2 audit fixes).
+- `WorkerBackupCredentialProvider` **carries the authorizer's server-derived `scope` through to the grant verbatim** (and refuses a response that omits it), is bound at construction to the identity it is authenticated as, and `R2BackupStore`'s raw initializer is **private** with the `authorized` factory gated by a capability only `R2ProductionBackupAdapter` can mint — see § 9 and § 14 (R1/R2 hardening).
 
 Cloudflare-specific code stays at the adapter level:
 `R2ProductionBackupAdapter` (Infrastructure) is the **named boundary** — a
@@ -295,8 +301,10 @@ constructed in `PersonalAIContainer.live`.
 | File | Change |
 |---|---|
 | `EvenAI/Core/Domain/PersonalAI/BackupProviderProtocols.swift` | `PresignedBackupRequest` + `grantID` / `scope` (defaulted `nil`) + `covers(_ op:key:ownerTag:)` (false when unscoped); `BackupCredentialError` + `.expired` / `.replayed` / `.scopeMissing`; `BackupObjectOperation: Codable` |
-| `EvenAI/Infrastructure/PersonalAI/Backup/R2BackupStore.swift` | **R1 fix** — the raw initializer is now `private`. `static authorized(credentials:transport:)` (wraps in `BackupAuthorizationClient`) and `static dormant` are the only constructors, so a caller *cannot compile* an unguarded remote store. |
-| `EvenAI/Infrastructure/PersonalAI/Backup/BackupCredentialProviders.swift` | **R2 fix** — `WorkerBackupCredentialProvider` now stamps every grant with `scope = BackupAuthorizationScope(ownerTag, key, operation)` + a `grantID`, and rejects any server-returned scope that disagrees with the request. Namespace guard upgraded to `keyIsInOwnerNamespace` (adds well-formed / traversal rejection). |
+| `EvenAI/Infrastructure/PersonalAI/Backup/R2BackupStore.swift` | **R1 fix** — the raw initializer is `private`; `authorized(...)` additionally requires a `RemoteBackupCompositionAuthority` whose initializer is `fileprivate` to `R2ProductionBackupAdapter.swift`. So `R2ProductionBackupAdapter.makeStore(...)` is the **only** path — production or test — to a remote-capable store, and `.dormant` is the only other form (reaches no network). Compiler-enforced. See § 14. |
+| `EvenAI/Infrastructure/PersonalAI/Backup/BackupCredentialProviders.swift` | **R2 fix** — `WorkerBackupCredentialProvider` is constructed bound to `authenticatedUserID` (the identity it is authenticated as, wired from the same session as `identityToken`). It refuses to sign for any other owner, **requires** the Worker to return the `scope` it authoritatively granted (no scope → `scopeMissing`, never synthesised from the request), checks that server scope's owner is the authenticated identity, and carries that server scope through to the grant — so `BackupAuthorizationClient.covers(...)` compares the authoritative grant against caller intent instead of the request against a copy of itself. See § 14. |
+| `EvenAI/Infrastructure/PersonalAI/Backup/BackupAuthorizationClient.swift` | **R2 fix** — the scope guard now throws `.scopeMismatch` (distinct from the local namespace guard's `.keyOutsideOwnerScope`) when the authoritative grant scope disagrees with the request. |
+| `EvenAI/Core/Domain/PersonalAI/BackupProviderProtocols.swift` | `BackupCredentialError` gains `.scopeMismatch`. |
 
 ### New test files
 
@@ -441,11 +449,11 @@ This item set is mirrored, at a higher level, in
 | **FAILURE SAFETY** | seal fail / put fail / verify fail / dormant provider / 5xx×N / network / corrupt object / wrong key / truncation / expired grant / replayed grant / R2 outage as a composite secondary — every path leaves the local encrypted cache byte-identical and the previous verified backup recoverable; `lastBackupSucceededAt` is never advanced on failure. |
 | **NEW PRODUCTION FILES** | 3 — `EvenAI/Core/Domain/PersonalAI/BackupAuthorization.swift`, `EvenAI/Infrastructure/PersonalAI/Backup/BackupAuthorizationClient.swift`, `EvenAI/Infrastructure/PersonalAI/Backup/R2ProductionBackupAdapter.swift`. Plus 1 modified: `EvenAI/Core/Domain/PersonalAI/BackupProviderProtocols.swift` (+37/−1, additive). |
 | **NEW TEST FILES** | 2 — `EvenAITests/TestDoubles/FakeBackupAuthorizationServer.swift`, `EvenAITests/PersonalAICloud/R2ProductionPathSecurityTests.swift`. |
-| **TEST COUNTS** | `R2ProductionPathSecurityTests`: **33/33**. Backup targeted (6 suites): 76/76. Personal AI (Phase 1 + Phase 2 cloud, 35 suites): **280/280**. Full `EvenAITests`: **98 suites / 760 tests / 760 passed / 0 failed / 0 skipped** (`ProductionEndpointContractTests` excluded — pre-existing untracked, unrelated). |
-| **R1 (raw-store bypass)** | **FIXED** — `R2BackupStore` raw init is `private`; only `.authorized` / `.dormant` build one, both routing through `BackupAuthorizationClient`. Compiler-enforced. Tests: `noRawR2BackupStoreConstruction`, `guardedFactoryEnforcesAuthorization`. |
-| **R2 (scope no-op in prod path)** | **FIXED** — `WorkerBackupCredentialProvider` stamps `scope` on every grant (and rejects a disagreeing server scope); `BackupAuthorizationClient` refuses an unscoped grant (`scopeMissing`) and one scoped to a different op / key / owner. Tests: `unscopedGrantRefused`, `scopeSurvivesProviderToClient`, `workerProviderProducesScopedGrant`, `workerProviderRejectsMismatchedServerScope`. |
+| **TEST COUNTS** | See § 14 for the current run. `R2ProductionPathSecurityTests` 35/35 + `R2ProductionPathAuthorizationBypassTests` 12/12; existing backup suites 34/34; full `EvenAITests` **100 suites / 784 tests / 0 failed** (incl. the pre-existing untracked `ProductionEndpointContractTests`, not modified). |
+| **R1 (raw-store bypass)** | **FIXED (§ 14)** — `R2BackupStore` raw init is `private`; `authorized(...)` needs a `RemoteBackupCompositionAuthority` mintable only inside `R2ProductionBackupAdapter.swift`, so `R2ProductionBackupAdapter.makeStore(...)` is the sole path to a remote-capable store and `BackupAuthorizationClient` is unconditionally in the chain. Compiler-enforced. Tests: `noRawR2BackupStoreConstruction`, `compositionAuthorityIsConfined`, `authorizedFactoryNotCalledDirectly`, `normalProductionAPICannotBypassGuard`, `guardedFactoryEnforcesAuthorization`. |
+| **R2 (scope no-op in prod path)** | **FIXED (§ 14)** — the earlier version synthesised the grant scope from the same `(operation, key, ownerTag)` the client then checked it against, so `covers(...)` was a tautology on the production `WorkerBackupCredentialProvider` path. Now the scope is the authorizer's server-derived scope, carried through verbatim; the provider is bound to its authenticated identity and refuses a foreign owner or a scope-less response; `BackupAuthorizationClient.covers(...)` is a real check against an independent source. Tests: `missingScopeFails`, `wrongOperationFails`, `wrongObjectFails`, `wrongOwnerFails`, `expiredScopedGrantFails`, `exactValidScopeSucceeds`, `scopeSurvivesEndToEnd`, `workerProviderRefusesUnscopedResponse`, `workerProviderRejectsMismatchedServerScope`, `workerProviderRefusesForeignOwnerRequest`. |
 | **R3 (presigned URL is a bearer capability)** | **INHERENT — DOCUMENTED, NOT FIXABLE CLIENT-SIDE.** A signed URL grants whoever holds it until it expires or is spent. Mitigations, all present: short TTL (minutes), single-use for mutation (edge `409`), HTTPS-only, no logging of the URL / token / grant id, and the guarantee that a user can never *obtain* a grant outside its own derived namespace. Full mitigation (per-request binding, IP/again-scoping) is server-side. |
-| **R4 (request-body nonce / replay dedup)** | **NOT IMPLEMENTED LOCALLY / REQUIRES DEPLOYED AUTHORIZATION SERVICE.** `BackupCredentialProviding.presign` carries no nonce; the deployed Worker must record `(identity, nonce)` and reject repeats. Replay protection is **not** production-verified. |
+| **R4 (request-body nonce / replay dedup)** | **REQUIRES A DEPLOYED WORKER — NOT PRODUCTION-VERIFIED.** The `cloudflare/backup-worker/` code includes a coarse KV-backed dedup on `(identity, operation, key)` within the grant-TTL window (`src/replay.ts`) — a *get-then-put*, not an atomic compare-and-swap, and with no client-supplied nonce (the Swift `PresignRequestBody` carries none). This narrows but does not close the window, and **none of it runs anywhere**: the Worker is not deployed, no KV namespace exists, and local tests simulate KV in memory. Replay protection remains a deployment-hardening item, not a solved problem. |
 | **REAL R2 BUCKET** | **NOT CREATED** |
 | **WORKER** | **NOT DEPLOYED** |
 | **REAL AUTH** | **NOT CONFIGURED** |
@@ -494,3 +502,148 @@ added or staged); CloudKit Step 2 stash still present at
 `7efa6d4869353833e4ca02c6ae3baf315b0d9598`; `~/Desktop/cloudkit-step2.patch`
 MD5 still `a80809f705cf73ad24cdf513e41b673a`; `ProductionEndpointContractTests.swift`
 still untracked and untouched. Nothing committed or pushed.
+
+> **Superseded by § 14.** This re-verification's conclusion — "both fixes were
+> already present and already correct, no code changed" — was **wrong about
+> R2**. On the production `WorkerBackupCredentialProvider` path the grant scope
+> was synthesised from the same `(operation, key, ownerTag)` the client then
+> checked it against, making `grant.covers(...)` a tautology. That is the
+> no-op R2 names, and it was still open. § 14 is the pass that actually
+> closed it. (The workstream was later committed as
+> `ea0ab4f Add production-safe R2 backup path`; the § 14 hardening and the
+> `cloudflare/backup-worker/` Worker are the remaining uncommitted work.)
+
+---
+
+## 14. R1 / R2 HARDENING — 2026-08-31 (uncommitted)
+
+Baseline for this pass: `ea0ab4f Add production-safe R2 backup path` (= `HEAD`
+= `origin/main`). This pass changes production Swift + tests only. **No
+Cloudflare account, bucket, Worker deploy, KV namespace, credential, billing,
+or network activation.** Not committed, not pushed.
+
+### R1 — the safe composition path is the *only* path
+
+**Before:** `R2BackupStore`'s raw initializer was `private`, but its
+`static authorized(credentials:transport:)` factory was module-visible, so any
+code could compose a remote-capable store without going through the audited
+`R2ProductionBackupAdapter` boundary. (Every path still wrapped
+`BackupAuthorizationClient`, so it was not a client-guard bypass — but it was
+not a *compositionally* enforced single entry either.)
+
+**Now:**
+
+- `R2BackupStore.authorized(credentials:transport:authority:ownerTagger:)`
+  requires a `RemoteBackupCompositionAuthority`.
+- `RemoteBackupCompositionAuthority`'s initializer is `fileprivate` to
+  `R2ProductionBackupAdapter.swift`. Nothing else in the module — production or
+  test — can mint one.
+- Therefore `R2ProductionBackupAdapter.makeStore(...)` is the **only** way to
+  obtain a remote-capable `R2BackupStore`; `.dormant` (reaches no network) is
+  the only other form. `BackupAuthorizationClient` is unconditionally in the
+  chain of every store that can touch a network.
+- `FakeR2.store` and the security tests were updated to compose via
+  `R2ProductionBackupAdapter.makeStore`.
+
+Enforced by: the compiler (the capability type), plus source-scanning tests
+`compositionAuthorityIsConfined` (the authority is constructed only in the
+adapter file) and `authorizedFactoryNotCalledDirectly` (no other file calls
+`R2BackupStore.authorized(`), plus the runtime test
+`normalProductionAPICannotBypassGuard` (a store from `makeStore` refuses
+expired / unscoped grants).
+
+### R2 — the grant scope is a server-authoritative binding, not a copy of the request
+
+**Before:** on the production `WorkerBackupCredentialProvider` path,
+`presign(op, key, ownerTag)` built
+`scope = BackupAuthorizationScope(ownerTag, key, operation)` from its **own
+arguments**, and any server-returned scope was validated then discarded. The
+client then called `grant.covers(op, key, ownerTag)` with the **same
+arguments** — a tautology. The `covers` / `scope` check was a no-op on the one
+path that matters in production. The scope's owner also came from the
+caller-supplied `ownerTag`, not from an authenticated identity.
+
+**Now `WorkerBackupCredentialProvider`:**
+
+1. is constructed with `authenticatedUserID` — the identity it is
+   authenticated as, wired by the DI container from the **same** signed-in
+   session as `identityToken`. It derives `authenticatedOwnerTag` from that.
+2. treats the per-call `ownerTag` as *intent*: a call for any owner other than
+   `authenticatedOwnerTag` is refused (`scopeMismatch`) before any network
+   call. Caller-supplied identity never overrides authenticated identity.
+3. sends the **authenticated** owner tag to the Worker, not the caller's.
+4. **requires** the Worker response to carry the `scope` it authoritatively
+   granted (server-derived from the verified identity). No scope →
+   `scopeMissing`. The client never synthesises one.
+5. checks that server scope's `ownerTag` is `authenticatedOwnerTag`
+   (`scopeMismatch` otherwise) — a real check: response vs. construction-time
+   identity, independent sources.
+6. carries the **server's** scope (operation + key + owner) through to
+   `PresignedBackupRequest.scope` verbatim.
+
+**And `BackupAuthorizationClient`:** `grant.covers(operation, key, ownerTag)`
+now compares the *server-derived* grant scope against the caller's request —
+two independent inputs — and throws `.scopeMismatch` on any disagreement
+(operation, key, or owner). Missing scope is still `.scopeMissing`; expiry is
+still checked first.
+
+Rejections proven by adversarial tests (`R2ProductionPathAuthorizationBypassTests`,
+plus additions to `R2ProductionPathSecurityTests`): missing scope
+(`missingScopeFails`, `workerProviderRefusesUnscopedResponse`), wrong
+operation (`wrongOperationFails`), wrong object/backup (`wrongObjectFails`),
+wrong owner (`wrongOwnerFails`, `workerProviderRejectsMismatchedServerScope`,
+`workerProviderRefusesForeignOwnerRequest`), expired scoped grant
+(`expiredScopedGrantFails`, `workerExpiredGrantRejected`), exact valid scope
+(`exactValidScopeSucceeds`, `workerProviderProducesScopedGrant`), and
+end-to-end scope survival credential-provider → request → authorization
+(`scopeSurvivesEndToEnd`). No secret / plaintext introduced
+(`changesIntroduceNoSecret`, `fixesIntroduceNoSecretOrPlaintext`).
+
+### R3 / R4 — unchanged, still honest
+
+- **R3** — a presigned URL is a bearer capability for whoever holds it until it
+  expires or (for a mutation) is spent. Inherent to S3/R2 presigned URLs; not
+  fixable client-side. Mitigations unchanged: short TTL, single-use for
+  mutation, HTTPS-only, never logged, and the guarantee a caller can never
+  obtain a grant outside its own derived namespace.
+- **R4** — request-body replay dedup is a **deployed-Worker** requirement. The
+  `cloudflare/backup-worker/src/replay.ts` code is a coarse, non-atomic,
+  nonce-less KV heuristic that **runs nowhere** (Worker not deployed, no KV
+  namespace, tests simulate KV in memory). Not implemented as a real control,
+  not production-verified.
+
+### Files changed in this pass
+
+| File | Change |
+|---|---|
+| `EvenAI/Core/Domain/PersonalAI/BackupProviderProtocols.swift` | `+ BackupCredentialError.scopeMismatch` |
+| `EvenAI/Infrastructure/PersonalAI/Backup/BackupAuthorizationClient.swift` | scope-guard failure → `.scopeMismatch`; comment |
+| `EvenAI/Infrastructure/PersonalAI/Backup/BackupCredentialProviders.swift` | `WorkerBackupCredentialProvider`: `authenticatedUserID` binding; server-authoritative scope; `scopeMissing` on no scope; `409 → replayed` |
+| `EvenAI/Infrastructure/PersonalAI/Backup/R2BackupStore.swift` | `private guarded(...)`; `authorized(...)` requires `RemoteBackupCompositionAuthority`; `.dormant` unchanged behaviour |
+| `EvenAI/Infrastructure/PersonalAI/Backup/R2ProductionBackupAdapter.swift` | `+ RemoteBackupCompositionAuthority` (fileprivate init); `makeStore` mints it |
+| `EvenAITests/PersonalAICloud/R2ProductionPathSecurityTests.swift` | reshaped R1/R2 tests for the new API; `+ R2ProductionPathAuthorizationBypassTests` suite |
+| `EvenAITests/TestDoubles/FakeBackupInfra.swift` | `FakeR2.store` composes via `R2ProductionBackupAdapter.makeStore` |
+| `cloudflare/backup-worker/wrangler.jsonc` | comment corrected: no R2 bucket has been created (it had claimed one existed) |
+
+### Verification (iPhone 17 / iOS 26 simulator, after clean `build` + `build-for-testing`)
+
+| Scope | Result |
+|---|---|
+| `R2ProductionPathSecurityTests` | 35/35 |
+| `R2ProductionPathAuthorizationBypassTests` (new) | 12/12 |
+| Existing backup suites (`R2BackupStoreTests`, `BackupEncryptionTests`, `BackupHardeningTests`, `BackupProviderIndependenceTests`) | 34/34 |
+| Personal AI — `EvenAITests/PersonalAI/` (13 suites) + `EvenAITests/PersonalAICloud/` non-backup (17 suites) + backup/R2 (6 suites) | 70/70 + 143/143 + 81/81 = 294/294 |
+| Critical SwiftData / `AIConversationEngine` (8 `AIConversationEngine*` + `CloudKitAdapterStatePersistenceTests`) | 132/132 |
+| Full `EvenAITests` | **100 suites / 784 tests / 784 passed / 0 failed** |
+| `xcodebuild build` | ** BUILD SUCCEEDED ** |
+| `xcodebuild build-for-testing` | ** TEST BUILD SUCCEEDED ** |
+| `cloudflare/backup-worker` `npm test` (Miniflare, no network) | 31/31 |
+
+Guardrails: `git status` = 2 untracked (`cloudflare/`, `EvenAITests/ProductionEndpointContractTests.swift`)
+before this pass; after, the same 2 plus the modified Swift/doc files above —
+nothing staged, nothing committed, nothing pushed. `HEAD` = `origin/main` =
+`ea0ab4f689192e25ca0ee9223396d1a4cefd31e8`. CloudKit Step 2 stash intact at
+`7efa6d4869353833e4ca02c6ae3baf315b0d9598`; `~/Desktop/cloudkit-step2.patch`
+MD5 `a80809f705cf73ad24cdf513e41b673a`; `ProductionEndpointContractTests.swift`
+untracked and untouched. No CloudKit, G2 runtime, backend, or Railway file
+changed.

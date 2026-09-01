@@ -1,5 +1,21 @@
 import Foundation
 
+/// A compile-time capability: proof that a remote-capable `R2BackupStore`
+/// (one with a live credential provider + transport) is being composed **here**,
+/// at the single audited production boundary.
+///
+/// Its initializer is `fileprivate`, so `R2ProductionBackupAdapter` — defined
+/// in this file — is the only code in the entire module that can mint one.
+/// `R2BackupStore.authorized(...)` requires it, so no other production code and
+/// no test can build a remote-capable store by any other path. `R2BackupStore`
+/// itself has a `private` initializer and its only unauthenticated form
+/// (`.dormant`) reaches no network. Together this makes "you cannot get a
+/// remote-capable backup store except through `R2ProductionBackupAdapter`" a
+/// fact the compiler enforces, not a convention.
+struct RemoteBackupCompositionAuthority {
+    fileprivate init() {}
+}
+
 /// The **named production boundary** for Personal AI disaster-recovery
 /// backups to Cloudflare R2. It is a *composition point only* — it holds no
 /// Cloudflare SDK, no account id, no endpoint constant, no R2 access key, and
@@ -32,7 +48,11 @@ enum R2ProductionBackupAdapter {
         credentials: any BackupCredentialProviding,
         transport: any BackupObjectTransport
     ) -> R2BackupStore {
-        R2BackupStore.authorized(credentials: credentials, transport: transport)
+        R2BackupStore.authorized(
+            credentials: credentials,
+            transport: transport,
+            authority: RemoteBackupCompositionAuthority()
+        )
     }
 
     /// The **only posture a shipping build has today**: no authorizer, no

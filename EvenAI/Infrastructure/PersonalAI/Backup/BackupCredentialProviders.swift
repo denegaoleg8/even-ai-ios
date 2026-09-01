@@ -17,6 +17,26 @@ struct NotConfiguredBackupCredentialProvider: BackupCredentialProviding {
 /// `<ownerTag>/…`. **The R2 access key never leaves the Worker; the app never
 /// holds it.**
 ///
+/// ## The grant scope is server-authoritative
+///
+/// This provider is constructed bound to the Personal AI user id it is
+/// **authenticated as** (`authenticatedOwnerTag`), wired by the DI container
+/// from the *same* signed-in session as `identityToken`. On every `presign`:
+///
+/// 1. The caller-supplied `ownerTag` argument is treated as *intent only* — it
+///    is honoured solely when it equals `authenticatedOwnerTag`. The client
+///    never signs for an owner on the caller's say-so.
+/// 2. The Worker **must** return the `scope` it authoritatively granted
+///    (derived server-side from the verified identity, never from our request
+///    body). A response with no scope is refused (`scopeMissing`) — the client
+///    does not manufacture authority the server did not confer.
+/// 3. That server scope's `ownerTag` must be the identity we are authenticated
+///    as, or the grant is refused (`scopeMismatch`).
+/// 4. The returned `PresignedBackupRequest.scope` is the **server's** scope
+///    verbatim — so the downstream `BackupAuthorizationClient.covers(...)`
+///    check compares the authoritative grant against caller intent (operation
+///    + key), instead of comparing the request to a copy of itself.
+///
 /// Compiled, **not instantiated by any shipping build** — there is no Worker
 /// URL and no identity-token provider configured. Wiring it is a later,
 /// separately-approved step (see PHASE2_R2_INDEPENDENT_BACKUP.md →
@@ -25,16 +45,24 @@ struct WorkerBackupCredentialProvider: BackupCredentialProviding {
 
     /// The Worker's presign endpoint, e.g. `https://backup.evenai.workers.dev/presign`.
     let endpoint: URL
+    /// The salted owner tag of the Personal AI user this provider is
+    /// **authenticated as** — derived from `authenticatedUserID` at
+    /// construction, never from a per-call argument. Every grant this provider
+    /// hands back is bound to this tag.
+    let authenticatedOwnerTag: String
     /// Returns a fresh identity token (short-lived) to prove who is asking.
+    /// Must resolve to the same authenticated session as `authenticatedUserID`.
     let identityToken: @Sendable () async throws -> String
     let session: URLSession
 
     init(
         endpoint: URL,
+        authenticatedUserID: String,
         identityToken: @escaping @Sendable () async throws -> String,
         session: URLSession = .shared
     ) {
         self.endpoint = endpoint
+        self.authenticatedOwnerTag = BackupOwnerTag.tag(authenticatedUserID)
         self.identityToken = identityToken
         self.session = session
     }
@@ -64,9 +92,15 @@ struct WorkerBackupCredentialProvider: BackupCredentialProviding {
     }
 
     func presign(_ operation: BackupObjectOperation, key: String, ownerTag: String) async throws -> PresignedBackupRequest {
-        // Defence in depth: never ask for a URL outside our own prefix, and
-        // never for a malformed key.
-        guard BackupAuthorizationScope.keyIsInOwnerNamespace(key, ownerTag: ownerTag) else {
+        // 1. The caller-supplied `ownerTag` is *intent*, not authority. Honour
+        //    it only when it is the identity we are authenticated as — never
+        //    ask the Worker to sign for another owner because a caller said so.
+        guard ownerTag == authenticatedOwnerTag else {
+            throw BackupCredentialError.scopeMismatch
+        }
+        // 2. Defence in depth: never ask for a malformed key or one outside our
+        //    own namespace.
+        guard BackupAuthorizationScope.keyIsInOwnerNamespace(key, ownerTag: authenticatedOwnerTag) else {
             throw BackupCredentialError.keyOutsideOwnerScope
         }
         var request = URLRequest(url: endpoint)
@@ -75,7 +109,7 @@ struct WorkerBackupCredentialProvider: BackupCredentialProviding {
         let token = try await identityToken()
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.httpBody = try JSONEncoder().encode(
-            PresignRequestBody(operation: operation.rawValue, key: key, ownerTag: ownerTag)
+            PresignRequestBody(operation: operation.rawValue, key: key, ownerTag: authenticatedOwnerTag)
         )
 
         let data: Data
@@ -87,6 +121,7 @@ struct WorkerBackupCredentialProvider: BackupCredentialProviding {
         switch http.statusCode {
         case 200: break
         case 401, 403: throw BackupCredentialError.unauthorized
+        case 409: throw BackupCredentialError.replayed
         default: throw BackupCredentialError.network
         }
 
@@ -94,15 +129,33 @@ struct WorkerBackupCredentialProvider: BackupCredentialProviding {
             throw BackupCredentialError.network
         }
 
-        // Bind the grant to a scope. If the Worker returned one, it is
-        // authoritative — but it must still be exactly what we asked for
-        // (same operation, same key, same owner tag), or we refuse it.
-        if let s = body.scope {
-            guard s.operation == operation.rawValue, s.objectKey == key, s.ownerTag == ownerTag else {
-                throw BackupCredentialError.keyOutsideOwnerScope
-            }
+        // 3. The Worker MUST return the scope it authoritatively granted,
+        //    derived server-side from the verified identity. No scope → the
+        //    grant is unbound → refuse it (never synthesise one from our own
+        //    request — that would make the downstream `covers` check a no-op).
+        guard let serverScope = body.scope,
+              let serverOperation = BackupObjectOperation(rawValue: serverScope.operation) else {
+            throw BackupCredentialError.scopeMissing
         }
-        let scope = BackupAuthorizationScope(ownerTag: ownerTag, objectKey: key, operation: operation)
+
+        // 4. The server-derived owner tag is the authority. It must be the
+        //    identity we are authenticated as — a Worker that derived a
+        //    different tag means our identity token and our owner identity
+        //    disagree, and we must not use the grant.
+        guard serverScope.ownerTag == authenticatedOwnerTag else {
+            throw BackupCredentialError.scopeMismatch
+        }
+
+        // 5. Carry the SERVER's scope through verbatim (operation + key as the
+        //    Worker granted them). `BackupAuthorizationClient.covers(operation,
+        //    key, ownerTag)` then compares this authoritative grant against
+        //    caller intent — a real check, because the two sides now come from
+        //    independent sources (the HTTP response vs. the call arguments).
+        let scope = BackupAuthorizationScope(
+            ownerTag: serverScope.ownerTag,
+            objectKey: serverScope.objectKey,
+            operation: serverOperation
+        )
 
         return PresignedBackupRequest(
             url: body.url,

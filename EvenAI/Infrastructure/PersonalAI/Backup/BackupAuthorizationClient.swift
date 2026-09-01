@@ -49,14 +49,19 @@ struct BackupAuthorizationClient: BackupCredentialProviding {
             throw BackupCredentialError.expired
         }
 
-        // 3. Scope guard — a production grant must be scoped, and to exactly
-        //    what we asked for (operation + key + owner tag). Defense in depth;
-        //    the signed URL's own server-side constraints remain authoritative.
+        // 3. Scope guard — a production grant must be scoped, and the
+        //    authoritative (server-derived) scope must be exactly what we asked
+        //    for (operation + key + owner tag). This is a real check, not a
+        //    tautology: `grant.scope` originates from the authorizer's
+        //    response, an independent source from these call arguments, so a
+        //    grant issued for a different operation, key, or owner is caught
+        //    here. The signed URL's own server-side constraints remain
+        //    authoritative.
         guard grant.scope != nil else {
             throw BackupCredentialError.scopeMissing
         }
         guard grant.covers(operation, key: key, ownerTag: ownerTag) else {
-            throw BackupCredentialError.keyOutsideOwnerScope
+            throw BackupCredentialError.scopeMismatch
         }
 
         return grant

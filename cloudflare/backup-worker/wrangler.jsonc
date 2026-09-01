@@ -1,0 +1,24 @@
+{
+  "name": "evenai-personal-ai-backup-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  // NO R2 BUCKET HAS BEEN CREATED. `evenai-personal-ai-backups` is the
+  // intended name only — creating the bucket is an explicitly-gated action
+  // that needs user approval (see PHASE2_R2_PRODUCTION_PATH.md § 11). This
+  // Worker has never been deployed; local tests via
+  // @cloudflare/vitest-pool-workers simulate R2 entirely in-memory and never
+  // contact a real bucket. The name MUST point at a real bucket before any
+  // real `wrangler deploy`.
+  "r2_buckets": [
+    { "binding": "BACKUP_BUCKET", "bucket_name": "evenai-personal-ai-backups" }
+  ],
+  // No real KV namespace has been created — creating one is a further,
+  // explicitly-gated action (see src/replay.ts's doc comment for the
+  // cost/alternative analysis). This id is a placeholder only; local tests
+  // via @cloudflare/vitest-pool-workers simulate KV entirely in-memory and
+  // never read this value. It MUST be replaced with a real namespace id
+  // before any real `wrangler deploy`.
+  "kv_namespaces": [
+    { "binding": "REPLAY_NONCES", "id": "REPLACE_BEFORE_REAL_DEPLOY" }
+  ]
+}
