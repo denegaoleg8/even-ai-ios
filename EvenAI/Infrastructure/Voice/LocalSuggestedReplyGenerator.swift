@@ -170,6 +170,13 @@ struct FoundationModelsReplyGenerator: SuggestedReplyGenerating {
 
     private static func prompt(for turn: ConversationTurn, context: SuggestedReplyContext) -> String {
         var lines: [String] = []
+        // Phase 3: optional Personal AI enrichment. Already priority-ordered
+        // and token-budgeted upstream; absent (nil) in every fallback case, so
+        // this block is a pure no-op whenever enrichment did not apply.
+        if let personal = context.personalAIContext, !personal.isEmpty {
+            lines.append(personal)
+            lines.append("")
+        }
         let recent = context.recentTurns.suffix(maxRecentTurnsInPrompt)
         if !recent.isEmpty {
             lines.append("Recent conversation, oldest first:")

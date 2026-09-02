@@ -102,7 +102,21 @@ struct EvenAIApp: App {
             // skips display; translation is a completely independent,
             // higher-priority pipeline (§4/§8 of this pass's own
             // requirements).
-            replyGenerator: LocalSuggestedReplyGenerator(),
+            //
+            // Phase 3 — Personal AI → G2: the local reply generator is wrapped
+            // in `PersonalAIContextEnrichingSuggestedReplyGenerator`, injected
+            // through this SAME `SuggestedReplyGenerating` parameter. It reads
+            // the local Personal AI context (`PersonalAIContainer.live` — no
+            // CloudKit, no R2, no network) and folds it into the reply prompt;
+            // every failure path (no memory / memory disabled / timeout /
+            // account switch) delegates to `LocalSuggestedReplyGenerator`
+            // unchanged. `AIConversationEngine` knows nothing about Personal AI.
+            replyGenerator: PersonalAIContextEnrichingSuggestedReplyGenerator(
+                base: LocalSuggestedReplyGenerator(),
+                contextBuilder: PersonalAIContainer.live.contextBuilder,
+                ownerID: { PersonalAIContainer.live.ownerBox.ownerID },
+                conversationProfile: { Self.resolveConversationProfile(defaults: .standard) }
+            ),
             glassesChatProvider: glassesChatProvider
         )
         transcriberRouter.onCloudFallback = { [weak liveTranslation] error in
@@ -149,6 +163,20 @@ struct EvenAIApp: App {
               let mode = TranscriptionProviderMode(rawValue: saved)
         else { return .auto }
         return mode
+    }
+
+    /// Reads the SAME persisted `conversationProfile` key `AIConversationEngine`
+    /// owns (`com.evenai.liveTranslation.conversationProfile`) — so the Phase 3
+    /// Personal AI reply-enrichment decorator can shape its guidance by profile
+    /// without ever holding a reference to the engine (which does not exist yet
+    /// at the point the decorator is constructed). Mirrors
+    /// `resolveTranscriptionProviderMode` exactly.
+    private static func resolveConversationProfile(defaults: UserDefaults) -> ConversationProfile {
+        let key = "com.evenai.liveTranslation.conversationProfile"
+        guard let saved = defaults.string(forKey: key),
+              let profile = ConversationProfile(rawValue: saved)
+        else { return .auto }
+        return profile
     }
 
     var body: some Scene {

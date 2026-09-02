@@ -68,3 +68,55 @@ extension PersonalAIExchange {
         PersonalAIExchange(conversationID: conversationID, surface: .personalChat, timestamp: date, userText: text, userMessageID: messageID)
     }
 }
+
+/// A `PersonalAIContextBuilding` that returns a scripted `PersonalAIContext`,
+/// records every request, and can be made to hang (for enrichment-timeout /
+/// cancellation tests). Used by the Phase 3 G2 reply-enrichment suites.
+actor ScriptedContextBuilder: PersonalAIContextBuilding {
+    private(set) var requests: [PersonalAIContextRequest] = []
+    private(set) var buildStartedCount = 0
+    private(set) var buildFinishedCount = 0
+    private let result: PersonalAIContext
+    /// Delay before returning — model a slow retrieval. `nil` = return at once.
+    private let delay: Duration?
+
+    init(result: PersonalAIContext = .empty, delay: Duration? = nil) {
+        self.result = result
+        self.delay = delay
+    }
+
+    func buildContext(_ request: PersonalAIContextRequest) async -> PersonalAIContext {
+        requests.append(request)
+        buildStartedCount += 1
+        if let delay {
+            // `Task.sleep` is a cancellation point — a cancelled enrichment
+            // stops here rather than spinning for the full delay.
+            try? await Task.sleep(for: delay)
+        }
+        buildFinishedCount += 1
+        return result
+    }
+
+    var surfaces: [PersonalAISurface] { requests.map(\.surface) }
+    var lastRequest: PersonalAIContextRequest? { requests.last }
+
+    // MARK: canned results
+
+    /// A context with genuine personalisation (non-empty rendered block).
+    static func personalised(_ block: String = "Response style: keep it short.") -> PersonalAIContext {
+        PersonalAIContext(
+            activeRules: [], relevantMemories: [], relevantProjects: [], relevantPeople: [],
+            historicalExcerpts: [], styleInstructions: block,
+            systemPromptText: block, memoryDisabled: false, buildTrace: ["scripted"]
+        )
+    }
+
+    /// A context reporting memory globally disabled.
+    static var memoryDisabled: PersonalAIContext {
+        PersonalAIContext(
+            activeRules: [], relevantMemories: [], relevantProjects: [], relevantPeople: [],
+            historicalExcerpts: [], styleInstructions: "",
+            systemPromptText: "Personal memory is turned off …", memoryDisabled: true, buildTrace: ["memoryDisabled"]
+        )
+    }
+}

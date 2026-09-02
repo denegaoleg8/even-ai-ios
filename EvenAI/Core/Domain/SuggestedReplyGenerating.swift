@@ -14,10 +14,29 @@ struct SuggestedReplyContext: Equatable, Sendable {
     var recentTurns: [ConversationTurn]
     /// Notes/pasted text/imported-file references — see `ContextItem`.
     var contextItems: [ContextItem]
+    /// **Optional** Personal AI enrichment (Phase 3, `.g2Replies` surface):
+    /// a compact, already-priority-ordered, already-token-budgeted
+    /// natural-language block a language-model generator can fold into its
+    /// prompt to make replies fit the speaker. Produced by
+    /// `PersonalAIContextEnrichingSuggestedReplyGenerator` from the local
+    /// `PersonalAIContextBuilding` pipeline; `nil` whenever there is nothing
+    /// to personalise with, memory is disabled, enrichment failed, or the
+    /// enrichment budget was exceeded — in every such case a generator must
+    /// behave exactly as it does today. **Never** raw memory records, never
+    /// secrets — it is the same rendered text `PersonalAIContext.systemPromptText`
+    /// already contains, wrapped only with reply-framing guidance. A generator
+    /// that does not build a prompt (the rule-based `LightweightLocalReplyGenerator`)
+    /// simply ignores it.
+    var personalAIContext: String?
 
-    init(recentTurns: [ConversationTurn] = [], contextItems: [ContextItem] = []) {
+    init(
+        recentTurns: [ConversationTurn] = [],
+        contextItems: [ContextItem] = [],
+        personalAIContext: String? = nil
+    ) {
         self.recentTurns = recentTurns
         self.contextItems = contextItems
+        self.personalAIContext = personalAIContext
     }
 }
 
