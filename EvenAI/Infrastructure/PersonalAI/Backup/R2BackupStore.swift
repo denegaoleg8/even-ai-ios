@@ -31,12 +31,15 @@ import Foundation
 /// remote-capable store is `R2ProductionBackupAdapter.makeStore(...)`. There is
 /// no other composition path, and that is compiler-enforced, not documented.
 ///
-/// Object layout (keys are relative; the Worker maps them under the bucket):
+/// Object layout — the canonical **versioned** namespace, defined once in
+/// `BackupObjectNamespace` (no `"backup/v1"` literal here):
 /// ```
-/// <ownerTag>/catalog.json                          the committed BackupHandle list
-/// <ownerTag>/objects/<version>-<tier>-<id>.eapb     one sealed backup each
+/// backup/v1/<ownerTag>/catalog.json                          the committed BackupHandle list
+/// backup/v1/<ownerTag>/objects/<version>-<tier>-<id>.eapb     one sealed backup each
 /// ```
 /// `<ownerTag>` is a salted hash of the Personal AI user id — never the id.
+/// Key generation validates every part (owner tag shape, tier, backup id
+/// safety) and throws rather than emit a malformed / traversable key.
 struct R2BackupStore: BackupStore {
 
     private let credentials: any BackupCredentialProviding
@@ -98,11 +101,18 @@ struct R2BackupStore: BackupStore {
         )
     }
 
-    // MARK: keys
+    // MARK: keys — the canonical versioned namespace (`BackupObjectNamespace`)
 
-    private func catalogKey(_ tag: String) -> String { "\(tag)/catalog.json" }
-    private func objectKey(_ tag: String, _ handle: BackupHandle) -> String {
-        "\(tag)/objects/\(handle.bundleVersion)-\(handle.tier)-\(handle.id).eapb"
+    private func catalogKey(_ tag: String) throws -> String {
+        try BackupObjectNamespace.catalogKey(ownerTag: tag)
+    }
+    private func objectKey(_ tag: String, _ handle: BackupHandle) throws -> String {
+        try BackupObjectNamespace.objectKey(
+            ownerTag: tag,
+            bundleVersion: handle.bundleVersion,
+            tier: handle.tier,
+            backupID: handle.id
+        )
     }
 
     private struct Catalog: Codable, Sendable {
@@ -118,7 +128,7 @@ struct R2BackupStore: BackupStore {
 
         // 1. Upload the sealed object first. A failure here throws and leaves
         //    the catalog — hence every prior backup — completely untouched.
-        let put = try await credentials.presign(.put, key: objectKey(tag, handle), ownerTag: tag)
+        let put = try await credentials.presign(.put, key: try objectKey(tag, handle), ownerTag: tag)
         try await transport.put(sealed, to: put.url, headers: put.headers)
 
         // 2. Publish it by rewriting the catalog. If this fails the new object
@@ -140,7 +150,7 @@ struct R2BackupStore: BackupStore {
     func getBackup(_ handle: BackupHandle, ownerID: String) async throws -> Data {
         try ensureConfigured()
         let tag = ownerTagger(ownerID)
-        let get = try await credentials.presign(.get, key: objectKey(tag, handle), ownerTag: tag)
+        let get = try await credentials.presign(.get, key: try objectKey(tag, handle), ownerTag: tag)
         let data = try await transport.get(get.url)
         guard data.count == handle.sizeBytes || handle.sizeBytes == 0 else {
             throw BackupTransportError.truncated(expected: handle.sizeBytes, got: data.count)
@@ -151,7 +161,7 @@ struct R2BackupStore: BackupStore {
     func deleteBackup(_ handle: BackupHandle, ownerID: String) async throws {
         try ensureConfigured()
         let tag = ownerTagger(ownerID)
-        let del = try await credentials.presign(.delete, key: objectKey(tag, handle), ownerTag: tag)
+        let del = try await credentials.presign(.delete, key: try objectKey(tag, handle), ownerTag: tag)
         try? await transport.delete(del.url)     // object may already be gone
         var catalog = try await loadCatalog(tag: tag)
         catalog.handles.removeAll { $0.id == handle.id }
@@ -161,7 +171,7 @@ struct R2BackupStore: BackupStore {
     // MARK: catalog IO
 
     private func loadCatalog(tag: String) async throws -> Catalog {
-        let get = try await credentials.presign(.get, key: catalogKey(tag), ownerTag: tag)
+        let get = try await credentials.presign(.get, key: try catalogKey(tag), ownerTag: tag)
         do {
             let data = try await transport.get(get.url)
             return (try? JSONDecoder.personalAI.decode(Catalog.self, from: data)) ?? Catalog()
@@ -171,7 +181,7 @@ struct R2BackupStore: BackupStore {
     }
 
     private func writeCatalog(_ catalog: Catalog, tag: String) async throws {
-        let put = try await credentials.presign(.put, key: catalogKey(tag), ownerTag: tag)
+        let put = try await credentials.presign(.put, key: try catalogKey(tag), ownerTag: tag)
         let data = try JSONEncoder.personalAI.encode(catalog)
         try await transport.put(data, to: put.url, headers: put.headers)
     }

@@ -28,6 +28,12 @@ enum BackupEncryptionError: Error, Equatable, Sendable {
     case malformedEnvelope
     case sealFailed
     case openFailed          // wrong key / tampered ciphertext
+    /// A recovery-key open was attempted on a backup that has no recovery slot
+    /// (a legacy or direct-format backup).
+    case recoveryNotAvailable
+    /// The supplied recovery key matches no slot in this backup — e.g. a
+    /// rotated recovery key against a pre-rotation backup.
+    case recoveryKeyMismatch
 
     var code: String {
         switch self {
@@ -37,6 +43,8 @@ enum BackupEncryptionError: Error, Equatable, Sendable {
         case .malformedEnvelope: return "malformed-envelope"
         case .sealFailed: return "seal"
         case .openFailed: return "open"
+        case .recoveryNotAvailable: return "recovery-unavailable"
+        case .recoveryKeyMismatch: return "recovery-key-mismatch"
         }
     }
 }

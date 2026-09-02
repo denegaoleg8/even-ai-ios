@@ -42,6 +42,10 @@ call was created or enabled in producing it.
 | REAL NETWORK BACKUP VERIFIED | **NO** |
 | REAL OFF-DEVICE DURABILITY VERIFIED | **NO** |
 | REAL R2 RESTORE VERIFIED | **NO** |
+| RECOVERY-KEY MECHANISM (local: type + envelope wrapping + tests) | **YES** — see `PHASE2_PERSONAL_AI_RECOVERY_KEY.md` |
+| RECOVERY-KEY CLOUD ESCROW | **NO — deferred** |
+| REAL NEW-IPHONE RESTORE VERIFIED | **NO** |
+| VERSIONED `backup/v1/` OBJECT NAMESPACE (local) | **YES** — `BackupObjectNamespace`, adopted in `R2BackupStore` |
 
 ---
 
@@ -55,7 +59,9 @@ call was created or enabled in producing it.
 | `R2BackupStore` | IMPLEMENTED LOCALLY — private init; `authorized(...)` needs `RemoteBackupCompositionAuthority` (mintable only in `R2ProductionBackupAdapter.swift`); `.dormant` reaches no network |
 | `R2ProductionBackupAdapter` | IMPLEMENTED LOCALLY — the one composition boundary; `.inert` is the shipping posture |
 | `BackupAuthorizationClient` | IMPLEMENTED LOCALLY — client chokepoint: namespace + well-formedness + expiry + **server-authoritative scope** guard (`covers()` is a real check, R2 fix §14 of the companion doc) |
-| `BackupAuthorizationScope` + `keyIsWellFormed` / `keyIsInOwnerNamespace` | IMPLEMENTED LOCALLY — path-traversal / control-char / length / doubled-separator rejection |
+| `BackupAuthorizationScope` + `keyIsWellFormed` / `keyIsInOwnerNamespace` | IMPLEMENTED LOCALLY — path-traversal / control-char / length / doubled-separator rejection; **version-prefix-aware** (strips only a recognised `backup/v<N>/`) |
+| `BackupObjectNamespace` — the one definition of the **versioned** `backup/v1/` layout | IMPLEMENTED + TESTED LOCALLY — validating key generation, a non-guessing parser, unknown-version-fails-safe; `R2BackupStore` uses it for every key |
+| Recovery key (`PersonalAIRecoveryKey`, `BackupKeyWrapping`, `"EAPB2"` wrapped envelope, `RecoveryKeyStore` seam) | IMPLEMENTED + TESTED LOCALLY — see `PHASE2_PERSONAL_AI_RECOVERY_KEY.md`. **Not wired into `PersonalAIContainer.live`; no UI; no escrow; new-iPhone restore not verified.** |
 | `WorkerBackupCredentialProvider` | IMPLEMENTED LOCALLY, **instantiated nowhere in a shipping build** — bound to `authenticatedUserID`; requires the Worker's server-derived scope; refuses foreign owner / scope-less response |
 | `BackupOwnerTag.tag(_:)` | IMPLEMENTED LOCALLY — `ownerTag v1`, canonical (see §4) |
 | Encryption (`AESGCMBackupEncryption`, `EncryptedBackupEnvelope`) | IMPLEMENTED LOCALLY — AES-256-GCM, Keychain device-only key, ciphertext-only off device |
@@ -87,10 +93,9 @@ call was created or enabled in producing it.
 - **Server-side owner-tag secret (HMAC v2)** — deliberately not introduced
   (see §4); a Worker-only secret would only guarantee client/Worker
   disagreement.
-- **Versioned object-key prefix** — the current key layout is
-  `<ownerTag>/…`; adopting a `v1/` segment is a Gate-D task (see §7), not done
-  now, to avoid rewriting committed, green object-layout code before the exact
-  form is locked.
+- **Recovery-key cloud escrow / iCloud-Keychain sync / passphrase KDF /
+  recovery UI** — the recovery-key *mechanism* is implemented (§13.A,
+  `PHASE2_PERSONAL_AI_RECOVERY_KEY.md`); these extensions are deferred.
 
 ---
 
@@ -123,7 +128,7 @@ call was created or enabled in producing it.
 | **PersonalAI user identity** (`canonicalUserID`) | the stable `sub` of the verified token; the SAME string iOS uses as its Personal AI user id | **Worker** derives it from the verified token; iOS uses its local copy only for offline key construction and must accept the Worker's if they differ |
 | **opaque backup owner tag** (`ownerTag`) | `ownerTag v1 = SHA-256(DOMAIN ‖ canonicalUserID)` (§4) | **Worker** (authoritative, from verified subject). iOS may compute a candidate; the Worker's `scope.ownerTag` wins. |
 | **backup ID** | client-generated UUID per snapshot; catalog dedupe key | **iOS** (created on device); immutable once catalogued |
-| **object key** | `<ownerTag>/catalog.json` or `<ownerTag>/objects/<bundleVersion>-<tier>-<backupID>.eapb` (→ §7 for the v1 form) | **iOS** constructs; **Worker** re-validates against the derived `ownerTag` and refuses anything outside it |
+| **object key** | `backup/v1/<ownerTag>/catalog.json` or `backup/v1/<ownerTag>/objects/<bundleVersion>-<tier>-<backupID>.eapb` (§7) | **iOS** constructs via `BackupObjectNamespace` (validating); **Worker** re-validates against the derived `ownerTag` and refuses anything outside it, including an unknown namespace version |
 | **operation scope** | `{ownerTag, objectKey, operation}` — exactly one verb on one key | **Worker** issues it from the verified identity; iOS `BackupAuthorizationClient` refuses to use a grant that does not `cover` the exact request |
 
 **Rule:** a caller-supplied user id / owner tag is *intent*, never authority.
@@ -332,40 +337,52 @@ inherent and is not "fixed".**
 
 ---
 
-## 7. OBJECT NAMESPACE  (current: IMPLEMENTED LOCALLY · v1 prefix: DESIGNED)
+## 7. OBJECT NAMESPACE  (IMPLEMENTED LOCALLY + TESTED LOCALLY — versioned)
 
-### Current (committed) layout
+### Canonical layout — `backup/v1/`
 
 ```
-<ownerTag>/catalog.json                                  the committed BackupHandle list (restore source of truth)
-<ownerTag>/objects/<bundleVersion>-<tier>-<backupID>.eapb one sealed snapshot each
+backup/v1/<ownerTag>/catalog.json                          the committed BackupHandle list (restore source of truth)
+backup/v1/<ownerTag>/objects/<bundleVersion>-<tier>-<backupID>.eapb  one sealed snapshot each
 ```
+
+Defined **once** in `EvenAI/Core/Domain/PersonalAI/BackupObjectNamespace.swift`
+(`currentVersion = 1`, `recognisedVersions = {1}`) — there is no `"backup/v1"`
+string literal elsewhere. `R2BackupStore` builds every key through it; the
+Worker mirrors the version handling in `cloudflare/backup-worker/src/scope.ts`.
 
 - `<ownerTag>` = `ownerTag v1` hex — no PII, no raw user id, no email, no
   memory text, no person/project names.
-- `keyIsWellFormed` / `keyIsInOwnerNamespace` reject: empty, `>512` bytes,
-  control chars, leading `/`, `//`, trailing `/`, `.` / `..` segments — on
-  both the client and the Worker (shared rule, kept in sync by inspection +
-  `scope.test.ts` ↔ `R2DeploymentContractTests`).
+- **Validating generation:** `objectKey(...)` / `catalogKey(...)` *throw*
+  rather than emit a key with a malformed owner tag, an unknown tier, a
+  negative bundle version, or an unsafe `backupID` (path separators real *or*
+  percent-encoded — `%2F` / `%5C` / `%2E` — `.` / `..`, control chars,
+  over-long). Tested: `BackupObjectNamespaceTests.rejectsUnsafeBackupID`,
+  `rejectsMalformedOwnerTag`.
+- **`keyIsWellFormed` / `keyIsInOwnerNamespace`** additionally reject empty,
+  `>512` bytes, leading `/`, `//`, trailing `/`, `.` / `..` segments — on both
+  the client (`BackupAuthorizationScope`) and the Worker (`scope.ts`), kept in
+  sync by inspection + the cross-language vectors in
+  `object-namespace.test.ts` ↔ `BackupObjectNamespaceTests`.
+- **Unknown versions fail safely.** `keyIsInOwnerNamespace` strips only a
+  *recognised* `backup/v<N>/` prefix; a `backup/v2/…` key keeps its prefix,
+  so it can never match the owner namespace and no grant is issued for it.
+  `BackupObjectNamespace.parse` returns `nil` for an unknown version — it is
+  never reinterpreted. Tested: `unknownVersionFailsSafely`,
+  `object-namespace.test.ts`.
+- **Future `backup/v2/` coexistence:** add `2` to `recognisedVersions` on
+  both sides and give it its own reader — v1 keys are undisturbed.
 - Deterministic: `(ownerTag, bundleVersion, tier, backupID)` → one key.
-- No cross-user collision: distinct `sub` → distinct `ownerTag` prefix
+- No cross-user collision: distinct `sub` → distinct `ownerTag` segment
   (injective, §4).
 
-### v1 versioned prefix  (DESIGNED — adopt at Gate D)
+### No migration
 
-```
-backup/v1/<ownerTag>/catalog.json
-backup/v1/<ownerTag>/objects/<bundleVersion>-<tier>-<backupID>.eapb
-```
-
-A leading `backup/v1/` segment makes the namespace explicitly versioned for a
-future migration, while keeping `<ownerTag>` as the isolation boundary the
-authorizer checks. This is a small `R2BackupStore` key-builder change plus the
-matching Worker `keyIsInOwnerNamespace` adjustment (the namespace check must
-look under `backup/v1/<ownerTag>/`, not the bare tag). **Deferred** so the
-committed, green object-layout code is not rewritten before the exact form is
-locked at deployment. When adopted, `R2DeploymentContractTests.objectKeyNamespaceContract`
-is updated in lock-step.
+There is **no production R2 data**, so there is nothing to migrate — the
+versioned layout is simply what every object written from now on uses. A bare
+`<ownerTag>/…` key (no version prefix) is still *accepted* by
+`keyIsInOwnerNamespace` because the test doubles use it and there is no real
+data to break; `R2BackupStore` itself never writes one.
 
 ### Cleanup safety
 
@@ -521,21 +538,38 @@ user requests Personal AI cloud deletion (in-app)
 
 Three **separate** concerns — no key from one class is ever usable for another.
 
-### A. Client encryption key / recovery key
+### A. Client encryption key + recovery key
 
-- AES-256 key in the **Keychain**, `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`,
-  own service, never shared with `AuthTokenStore`.
-- **Never sent to the Worker or R2.** The server only ever sees `.eapb`
-  ciphertext.
-- **Lost key ⇒ backups are unrecoverable** (by design — zero-knowledge to the
-  server). A **user-facing recovery mechanism** (e.g. a recovery phrase the
-  user stores, or key escrow to the user's own iCloud Keychain) is **DESIGNED,
-  NOT IMPLEMENTED** and is a prerequisite for advertising R2 restore as a
-  safety net. Until then, restore-on-new-device only works if the key is
-  present (same iCloud Keychain / migrated).
-- Rotation: a new key class + a re-seal of the latest bundle; old objects
-  under the old key age out via retention. Envelope `encryptionScheme` +
-  `schemeIdentifier` make a scheme change detectable.
+**Device encryption key** — AES-256 in the **Keychain**,
+`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, own service, never shared
+with `AuthTokenStore`, **never sent to the Worker or R2** (the server only
+ever sees `.eapb` ciphertext).
+
+**Recovery key — IMPLEMENTED LOCALLY + TESTED LOCALLY** (full detail in
+`PHASE2_PERSONAL_AI_RECOVERY_KEY.md`):
+
+- A wrapped backup (`"EAPB2"` envelope) seals its payload with a random
+  per-backup **data key (DEK)**; the DEK is wrapped (AES-GCM) once for the
+  device key and once for a 256-bit **`PersonalAIRecoveryKey`**. A new iPhone
+  supplies the recovery key (`recoveryCode` / recovery file, checksum-verified
+  before use) and decrypts locally — the device key is not needed.
+- The recovery key, the device key, and the DEK **never** appear in a log, the
+  `BackupManifest`, the envelope header (only *wrapped* DEK copies +
+  non-reversible `keyID` fingerprints), or any remote payload. Tested.
+- **Rotation:** the next backup wraps for the new key; older backups keep the
+  recovery slot (`keyID`) they were written with. A rotated key against a
+  pre-rotation backup → `recoveryKeyMismatch` (no silent wrong-key attempt);
+  the correct historical key still works.
+- **Still lost key + lost recovery key ⇒ unrecoverable**, by design
+  (zero-knowledge to the server).
+- **NOT implemented / deferred:** cloud key escrow, iCloud-Keychain sync of the
+  recovery key, passphrase-derived keys (need a memory-hard KDF), the recovery
+  UI, and wiring into `PersonalAIContainer.live` (a model seam —
+  `RecoveryKeyStore` — exists). **Restore on a real new iPhone is NOT
+  verified.**
+- Scheme rotation: envelope `encryptionScheme` / format digit / `keyWrapping.version`
+  make a change detectable; a bare legacy `AES.GCM` blob and the `"EAPB1"`
+  direct format still open.
 
 ### B. Worker signing / auth secrets
 
@@ -622,7 +656,7 @@ No cost commitment is made here.
 | **A** | Architecture (this doc §§2–14) reviewed and approved | user review |
 | **B** | Current Cloudflare pricing + free-tier limits re-verified (§15) | live Cloudflare docs |
 | **C** | **User explicitly approves** resource creation + billing implications | user sign-off |
-| **D** | Create the R2 bucket (one region, private, no public access, no custom domain); adopt the `backup/v1/` namespace (§7) | Gate C |
+| **D** | Create the R2 bucket (one region, private, no public access, no custom domain). The `backup/v1/` namespace (§7) is already implemented — just confirm the exact form is still right. | Gate C |
 | **E** | Stand up the atomic idempotency store (D1 table or Durable Object namespace, §5); wire the `idempotencyKey` wire field (Swift + Worker) | Gate D |
 | **F** | `wrangler deploy` to a **dev** environment; R2 binding + S3 credential as Worker secrets; `ALLOW_DEV_IDENTITY` **off** | Gate E |
 | **G** | Configure verified auth: real issuer + JWKS + opaque stable `sub`; prove `canonicalUserID` (client) == verified `sub` (Worker); re-run owner-tag vectors against a real subject | a live EvenAI identity provider (§3) |
@@ -631,7 +665,7 @@ No cost commitment is made here.
 | **J** | Restore the disposable backup onto a clean install; ids/counts/checksum intact | Gate H |
 | **K** | Cross-user security test against the live bucket (user B cannot list/read/delete user A) | Gate J |
 | **L** | Account-deletion test: purge removes every object + metadata, cross-user delete impossible, local data untouched | Gate K |
-| **M** | Recovery test: full backup → device loss → restore cycle; tombstones/revisions intact, no resurrection, no duplication; **recovery-key mechanism (§13.A) in place** | Gate L + §13.A |
+| **M** | Recovery test on a **real second device**: set up a recovery key, back up, lose the first device, restore from the recovery code alone; tombstones/revisions intact, no resurrection, no duplication. (The recovery-key *mechanism* — §13.A — is implemented + unit-tested; this gate is the real-hardware proof.) | Gate L |
 | **N** | **Production enablement explicitly approved**; promote dev → production; enable for a limited cohort first | user sign-off + Gates D–M green |
 
 ---
@@ -678,10 +712,13 @@ Worker route enable/disable, per-cohort allow-list.
 | audit-event redaction allow-list | `auditEventRedactionContract` |
 | no secret / endpoint / plaintext in new artifacts | `newArtifactsIntroduceNoSecret` |
 | Worker owner-tag derivation is secret-free + server-authoritative | `presign.test.ts` "owner-tag derivation is server-authoritative and secret-free" |
+| **versioned `backup/v1/` namespace** — canonical path, determinism, no collisions, no PII, traversal / slash / backslash / percent-encoded-separator / empty-id / malformed-id rejection, **unknown version fails safely**, `R2BackupStore` uses it end-to-end (put / list / delete) | `BackupObjectNamespaceTests` (13) + Worker `object-namespace.test.ts` (7) |
+| **recovery key** — 256-bit entropy, versioned, checksum-protected export round-trips; wrong / corrupted / rotated key rejected; new-device open via recovery key; no raw key in header / manifest / remote payload / logs; failed recovery mutates nothing | `PersonalAIRecoveryKeyTests` (18) |
 
 Plus everything already green in `R2ProductionPathSecurityTests` (35),
-`R2ProductionPathAuthorizationBypassTests` (12), the 4 backup suites (34), and
-the Worker vitest suite.
+`R2ProductionPathAuthorizationBypassTests` (12), the 6 backup suites (65 —
+incl. `PersonalAIRecoveryKeyTests`, `BackupObjectNamespaceTests`), and the
+Worker vitest suite (49). Full `EvenAITests`: **826 / 103 suites / 0 failed**.
 
 ### REAL DEPLOYMENT TEST REQUIRED (cannot be faked)
 
@@ -690,7 +727,9 @@ the Worker vitest suite.
 - real atomic idempotency consume under concurrency (D1 / Durable Object)
 - real token signature verification against a live JWKS
 - real cross-user isolation against a live bucket
-- real durability / restore-on-new-device
+- real durability
+- **real restore on a new iPhone** using the recovery key (the mechanism is
+  unit-tested; a two-device round trip is not)
 - real orphan-sweep Cron
 - real rate-limit enforcement
 
@@ -739,11 +778,16 @@ REAL R2 RESTORE VERIFIED:          NO
    (Gate G). Everything downstream waits on this.
 2. **No atomic idempotency store** — needs D1 or a Durable Object; the
    `idempotencyKey` wire field is unwired (Gate E). R4 is **not** solved.
-3. **No recovery-key mechanism** (§13.A) — restore-on-new-device is not a
-   dependable safety net without it (Gate M).
+3. **Recovery-key mechanism is implemented + unit-tested locally**
+   (`PHASE2_PERSONAL_AI_RECOVERY_KEY.md`), but **restore on a real new iPhone
+   is not verified** (Gate M), and the recovery **UI**, container wiring, and
+   any **cloud escrow** are still deferred.
 4. **Pricing not re-verified** against current Cloudflare docs (Gate B).
-5. Versioned namespace prefix not yet adopted in `R2BackupStore` (Gate D).
-6. All of R2/R3/R4 as documented in the companion doc.
+5. ~~Versioned namespace prefix~~ — **done**: `backup/v1/` is implemented in
+   `BackupObjectNamespace` + `R2BackupStore` + the Worker, with cross-language
+   tests. Confirm the exact form at Gate D.
+6. All of R2/R3/R4 as documented in the companion doc (R4 unchanged; R3
+   inherent).
 
 ## USER APPROVAL REQUIRED BEFORE
 

@@ -81,7 +81,8 @@ struct R2DeploymentContractTests {
         let keys = transport.keys().map { URL(string: $0)!.path.drop(while: { $0 == "/" }) }.map(String.init)
         #expect(!keys.isEmpty)
         for key in keys {
-            #expect(key.hasPrefix(tag + "/"), "key not under owner namespace: \(key)")
+            #expect(key.hasPrefix("backup/v\(BackupObjectNamespace.currentVersion)/\(tag)/"), "key not under versioned owner namespace: \(key)")
+            #expect(BackupObjectNamespace.isCurrentVersionKey(key, ownerTag: tag), "not a canonical current-version key: \(key)")
             #expect(BackupAuthorizationScope.keyIsInOwnerNamespace(key, ownerTag: tag), "malformed/out-of-namespace: \(key)")
             #expect(!key.contains(rawUserID))
             #expect(!key.contains("@"))

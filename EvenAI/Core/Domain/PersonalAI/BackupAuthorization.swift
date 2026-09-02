@@ -44,14 +44,21 @@ struct BackupAuthorizationScope: Codable, Hashable, Sendable {
             && Self.keyIsInOwnerNamespace(key, ownerTag: ownerTag)
     }
 
-    /// True when `key` is **well-formed** and sits at, or strictly under,
-    /// `<ownerTag>/`. Rejects path traversal, empty / over-long keys, doubled
-    /// or leading separators, and control characters — a security primitive,
-    /// enforced client-side (`BackupAuthorizationClient`) and, authoritatively,
-    /// by the authorizer against the *derived* tag.
+    /// True when `key` is **well-formed** and, after stripping a *recognised*
+    /// `backup/v<N>/` version prefix (see `BackupObjectNamespace`), sits at or
+    /// strictly under `<ownerTag>/`. Rejects path traversal, empty / over-long
+    /// keys, doubled or leading separators, control characters, and — crucially
+    /// — an **unrecognised** namespace version (its `backup/vX/` prefix is not
+    /// stripped, so it can't match the owner). A security primitive, enforced
+    /// client-side (`BackupAuthorizationClient`) and, authoritatively, by the
+    /// authorizer against the *derived* tag.
+    ///
+    /// A bare `<ownerTag>/…` key (no version prefix) is still accepted — there
+    /// is no production R2 data, and the test doubles use the bare form.
     static func keyIsInOwnerNamespace(_ key: String, ownerTag: String) -> Bool {
         guard keyIsWellFormed(key) else { return false }
-        return key == ownerTag || key.hasPrefix(ownerTag + "/")
+        let body = BackupObjectNamespace.strippingRecognisedVersionPrefix(key)
+        return body == ownerTag || body.hasPrefix(ownerTag + "/")
     }
 
     /// Structural validity of an object key, independent of owner:

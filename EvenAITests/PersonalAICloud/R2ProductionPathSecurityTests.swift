@@ -240,7 +240,8 @@ struct R2ProductionPathSecurityTests {
         try await a.putBackup(Data("sealed".utf8), handle: handle(size: 6), ownerID: "user-A")
 
         for key in s.committedObjectKeys() {
-            #expect(key.hasPrefix(tagA))
+            #expect(BackupObjectNamespace.isCurrentVersionKey(key, ownerTag: tagA))
+            #expect(key.contains(tagA))
             #expect(!key.contains("user-A"))
             #expect(!key.contains("@"))
             #expect(!key.lowercased().contains("email"))
@@ -292,7 +293,7 @@ struct R2ProductionPathSecurityTests {
         // A's backup is still there, catalogued, and readable.
         #expect(try await a.listBackups(ownerID: "user-A").contains { $0.id == h.id })
         #expect(try await a.getBackup(h, ownerID: "user-A") == Data("keep".utf8))
-        #expect(s.committedObjectKeys().contains { $0.hasPrefix(tagA) && $0.hasSuffix(".eapb") })
+        #expect(s.committedObjectKeys().contains { $0.contains(tagA) && $0.hasSuffix(".eapb") })
     }
 
     @Test("one user deleting all their backups cannot touch another user's")

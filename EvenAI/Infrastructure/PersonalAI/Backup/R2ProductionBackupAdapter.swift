@@ -62,13 +62,17 @@ enum R2ProductionBackupAdapter {
     /// testable.
     static var inert: R2BackupStore { R2BackupStore.dormant }
 
-    /// The object-key layout the Worker maps under the bucket. Documented here
-    /// so the client and the (future) Worker agree without sharing code.
+    /// The object-key layout the Worker maps under the bucket — the canonical
+    /// **versioned** namespace, defined once in `BackupObjectNamespace`. The
+    /// client and the (future) Worker agree on it without sharing code (the
+    /// Worker mirrors it in `cloudflare/backup-worker/src/scope.ts`).
     /// ```
-    /// <ownerTag>/catalog.json                        the committed BackupHandle list
-    /// <ownerTag>/objects/<version>-<tier>-<id>.eapb   one sealed backup each
+    /// backup/v1/<ownerTag>/catalog.json                        the committed BackupHandle list
+    /// backup/v1/<ownerTag>/objects/<version>-<tier>-<id>.eapb   one sealed backup each
     /// ```
     /// `<ownerTag>` is `BackupOwnerTag.tag(personalAIUserID)` — a salted
     /// SHA-256, never the id, never an email or username.
-    static func objectNamespaceRoot(ownerTag: String) -> String { ownerTag }
+    static func objectNamespaceRoot(ownerTag: String) throws -> String {
+        try BackupObjectNamespace.ownerRoot(ownerTag: ownerTag)
+    }
 }

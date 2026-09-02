@@ -19,6 +19,68 @@ struct EncryptedBackupEnvelopeHeader: Codable, Hashable, Sendable {
     /// at rest before a decrypt is even attempted.
     var ciphertextSHA256: String
     var ciphertextLength: Int
+    /// Present only for a **wrapped** (recovery-capable) envelope: the
+    /// per-backup data key, encrypted once per key-encryption key. `nil` means
+    /// the ciphertext is sealed directly with the device key (the original
+    /// format — same-device restore only). **Contains no raw key material** —
+    /// every `wrappedKey` is itself AES-GCM ciphertext, every `keyID` is a
+    /// non-reversible fingerprint.
+    var keyWrapping: BackupKeyWrapping?
+
+    init(
+        encryptionScheme: String,
+        createdAt: Date,
+        ownerTag: String,
+        bundleSchemaVersion: Int,
+        bundleVersion: Int,
+        ciphertextSHA256: String,
+        ciphertextLength: Int,
+        keyWrapping: BackupKeyWrapping? = nil
+    ) {
+        self.encryptionScheme = encryptionScheme
+        self.createdAt = createdAt
+        self.ownerTag = ownerTag
+        self.bundleSchemaVersion = bundleSchemaVersion
+        self.bundleVersion = bundleVersion
+        self.ciphertextSHA256 = ciphertextSHA256
+        self.ciphertextLength = ciphertextLength
+        self.keyWrapping = keyWrapping
+    }
+}
+
+/// Envelope-encryption metadata: the backup ciphertext is sealed with a random
+/// per-backup **data key** (DEK); that DEK is then wrapped (AES-256-GCM) once
+/// for each **key-encryption key** (KEK) that is allowed to open this backup.
+///
+/// Standard key-wrapping — no home-grown crypto. Carries **no plaintext key**:
+/// each `Slot.wrappedKey` is an AES-GCM combined box of the 32-byte DEK, and
+/// each `Slot.keyID` is a truncated SHA-256 fingerprint of its KEK.
+struct BackupKeyWrapping: Codable, Hashable, Sendable {
+    /// Bump if the wrapping scheme changes.
+    var version: Int
+    /// Algorithm the DEK seals the payload with, and the KEKs wrap the DEK
+    /// with — currently both `"AES-GCM-256"`.
+    var algorithm: String
+    var slots: [Slot]
+
+    struct Slot: Codable, Hashable, Sendable {
+        /// `"device"` (the Keychain key on the machine that made the backup) or
+        /// `"recovery"` (a `PersonalAIRecoveryKey`).
+        var kind: String
+        /// Fingerprint of the KEK — `PersonalAIRecoveryKey.keyID` for a
+        /// recovery slot; a device-key fingerprint for a device slot. Selects
+        /// the slot; is not the key.
+        var keyID: String
+        /// AES-GCM combined box of the 32-byte DEK, encrypted under this KEK.
+        var wrappedKey: Data
+    }
+
+    static let deviceKind = "device"
+    static let recoveryKind = "recovery"
+
+    func slot(kind: String, keyID: String? = nil) -> Slot? {
+        slots.first { $0.kind == kind && (keyID == nil || $0.keyID == keyID) }
+    }
 }
 
 /// Binary framing for a sealed backup:
@@ -34,8 +96,9 @@ struct EncryptedBackupEnvelopeHeader: Codable, Hashable, Sendable {
 enum EncryptedBackupEnvelope {
 
     static let magic = Data("EAPB".utf8)
-    static let currentFormatDigit: UInt8 = 0x31 // '1'
-    static let supportedFormatDigits: Set<UInt8> = [0x31]
+    static let currentFormatDigit: UInt8 = 0x31 // '1' — ciphertext sealed directly with the device key
+    static let wrappedFormatDigit: UInt8 = 0x32 // '2' — ciphertext sealed with a wrapped DEK (recovery-capable)
+    static let supportedFormatDigits: Set<UInt8> = [0x31, 0x32]
 
     static func frame(header: EncryptedBackupEnvelopeHeader, ciphertext: Data) throws -> Data {
         guard let headerData = try? JSONEncoder.personalAI.encode(header) else {
@@ -43,7 +106,10 @@ enum EncryptedBackupEnvelope {
         }
         var out = Data()
         out.append(magic)
-        out.append(currentFormatDigit)
+        // The digit follows the header shape: an old reader that only knows '1'
+        // rejects a wrapped envelope cleanly (unsupportedEnvelopeVersion)
+        // instead of failing an AES-GCM open with a confusing error.
+        out.append(header.keyWrapping == nil ? currentFormatDigit : wrappedFormatDigit)
         var len = UInt32(headerData.count).bigEndian
         withUnsafeBytes(of: &len) { out.append(contentsOf: $0) }
         out.append(headerData)

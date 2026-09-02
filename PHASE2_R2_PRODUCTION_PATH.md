@@ -683,3 +683,84 @@ created, no billing, no credential**):
 CREDENTIALS / BILLING / REAL NETWORK BACKUP / REAL DURABILITY / REAL RESTORE`
 — all still **NO**. R3 unchanged. R4 still **not** solved (needs an atomic
 D1/Durable-Object idempotency store — see readiness doc §5).
+
+---
+
+## 16. RECOVERY KEY + VERSIONED NAMESPACE — 2026-09-02 (uncommitted)
+
+The two remaining local-hardenable items from the readiness plan. **Still
+nothing deployed, no Cloudflare resource, no billing, no credential, no real
+network.** Baseline: `ce05bf4 Add R2 deployment readiness plan`.
+
+### Recovery key  (IMPLEMENTED + TESTED LOCALLY — full detail in `PHASE2_PERSONAL_AI_RECOVERY_KEY.md`)
+
+- New `"EAPB2"` **wrapped** envelope: a random per-backup data key seals the
+  payload; that key is wrapped (AES-GCM) once for the device key and once for
+  a 256-bit `PersonalAIRecoveryKey`. A new iPhone opens the backup with the
+  recovery key alone. The original `"EAPB1"` direct format is **byte-for-byte
+  unchanged** and is what every backup still uses until a recovery key is
+  configured.
+- `PersonalAIRecoveryKey`: 256-bit entropy, versioned, checksum-protected
+  `recoveryCode` / recovery-file export, deterministic opaque `keyID`.
+- No raw key material in the envelope header, the `BackupManifest`, any log, or
+  any remote payload — the header carries only *wrapped* (encrypted) key
+  copies + fingerprints. Rotation is `keyID`-matched (a rotated key can't open
+  a pre-rotation backup; the historical key still can).
+- **Deferred:** cloud escrow, iCloud-Keychain sync, passphrase KDF, the
+  recovery UI, `PersonalAIContainer.live` wiring (a `RecoveryKeyStore` model
+  seam exists). **Restore on a real new iPhone is not verified** (Gate M).
+
+### Versioned object namespace  (IMPLEMENTED + TESTED LOCALLY)
+
+- `BackupObjectNamespace` (Core) is the **one** definition of the canonical
+  layout: `backup/v1/<ownerTag>/catalog.json` and
+  `backup/v1/<ownerTag>/objects/<version>-<tier>-<id>.eapb`. No `"backup/v1"`
+  literal anywhere else.
+- Key generation **validates and throws** (owner-tag shape, tier, bundle
+  version, `backupID` safety incl. percent-encoded separators / traversal).
+- `keyIsInOwnerNamespace` (client + Worker `scope.ts`) strips only a
+  **recognised** `backup/v<N>/` prefix — an unknown version keeps its prefix
+  and can never match an owner namespace, so no grant is issued for it. A
+  future `backup/v2/` coexists by being added to `recognisedVersions` on both
+  sides with its own reader.
+- `R2BackupStore` writes / lists / deletes only through it. No production R2
+  data exists → **no migration**.
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `EvenAI/Core/Domain/PersonalAI/BackupObjectNamespace.swift` (new) | the versioned namespace: validating generation + non-guessing parser |
+| `EvenAI/Core/Domain/PersonalAI/BackupAuthorization.swift` | `keyIsInOwnerNamespace` strips a recognised version prefix |
+| `EvenAI/Core/Domain/PersonalAI/BackupProviderProtocols.swift` | `+ BackupEncryptionError.recoveryNotAvailable / .recoveryKeyMismatch` |
+| `EvenAI/Infrastructure/PersonalAI/Backup/PersonalAIRecoveryKey.swift` (new) | the recovery key type + export/import + base32 |
+| `EvenAI/Infrastructure/PersonalAI/Backup/RecoveryKeyStore.swift` (new) | device-side store seam (Keychain + in-memory); **not wired** |
+| `EvenAI/Infrastructure/PersonalAI/Backup/EncryptedBackupEnvelope.swift` | `+ keyWrapping` header field, `BackupKeyWrapping`, `"EAPB2"` framing digit |
+| `EvenAI/Infrastructure/PersonalAI/Backup/AESGCMBackupEncryption.swift` | `"EAPB2"` seal/open + `open(_:using: recoveryKey)` + slot introspection; `"EAPB1"` path unchanged |
+| `EvenAI/Infrastructure/PersonalAI/Backup/R2BackupStore.swift` | keys built via `BackupObjectNamespace` |
+| `EvenAI/Infrastructure/PersonalAI/Backup/R2ProductionBackupAdapter.swift` | `objectNamespaceRoot` → versioned |
+| `cloudflare/backup-worker/src/scope.ts` | version-prefix-aware `keyIsInOwnerNamespace` |
+| `EvenAITests/PersonalAICloud/PersonalAIRecoveryKeyTests.swift` (new, 20) | recovery-key tests |
+| `EvenAITests/PersonalAICloud/BackupObjectNamespaceTests.swift` (new, 11) | namespace tests |
+| `cloudflare/backup-worker/test/object-namespace.test.ts` (new, 7) | cross-language namespace tests |
+| `EvenAITests/PersonalAICloud/R2ProductionPathSecurityTests.swift` / `R2DeploymentContractTests.swift` | key-shape assertions updated for the `backup/v1/` prefix |
+| `PHASE2_PERSONAL_AI_RECOVERY_KEY.md` (new), `PHASE2_R2_DEPLOYMENT_READINESS.md` | docs |
+
+### Verification (iPhone 17 / iOS 26 sim, after clean `build` + `build-for-testing`)
+
+| Scope | Result |
+|---|---|
+| `PersonalAIRecoveryKeyTests` (new) | 18/18 |
+| `BackupObjectNamespaceTests` (new) | 13/13 |
+| Worker `object-namespace.test.ts` (new) | 7/7 |
+| R2 production-path suites (`R2ProductionPathSecurityTests` 35, `…AuthorizationBypassTests` 12, `R2DeploymentContractTests` 11, `R2BackupStoreTests` 8) | 66/66 |
+| Backup + new suites (`BackupEncryptionTests`, `BackupHardeningTests`, `BackupProviderIndependenceTests`, `R2BackupStoreTests`, `PersonalAIRecoveryKeyTests`, `BackupObjectNamespaceTests`) | 65/65 |
+| Personal AI (`EvenAITests/PersonalAI/` + `PersonalAICloud/`, 39 suites) | 336/336 |
+| Critical SwiftData / `AIConversationEngine` (9 suites) | 146/146 |
+| Full `EvenAITests` | **103 suites / 826 tests / 826 passed / 0 failed** |
+| `xcodebuild build` / `build-for-testing` | ** BUILD SUCCEEDED ** / ** TEST BUILD SUCCEEDED ** |
+| `cloudflare/backup-worker` `npm test` / `tsc --noEmit` | 49/49 / clean |
+
+`REAL R2 BUCKET / WORKER DEPLOY / KV·D1·DO / REAL AUTH / REAL CREDENTIALS /
+BILLING / REAL NETWORK BACKUP / REAL DURABILITY / REAL R2 RESTORE / REAL
+NEW-IPHONE RESTORE` — all **NO**. R3 inherent. R4 still not solved.
