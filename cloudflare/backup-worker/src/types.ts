@@ -36,12 +36,11 @@ export interface Env {
   BACKUP_BUCKET: R2Bucket;
   REPLAY_NONCES: KVNamespace;
 
-  // Salted-hash secret used to derive the opaque owner namespace from a
-  // verified identity subject. Must match the algorithm/salt
-  // BackupOwnerTag.tag() uses client-side, or a device's own locally-computed
-  // prefix and the Worker's authoritative one will disagree. Never hardcoded;
-  // set via `wrangler secret put OWNER_TAG_SALT` at deploy time.
-  OWNER_TAG_SALT?: string;
+  // NOTE: owner-tag derivation uses NO secret. It is `ownerTag v1` — a fixed,
+  // compiled-in, domain-separated SHA-256 identical to the iOS client (see
+  // ownerTag.ts and PHASE2_R2_DEPLOYMENT_READINESS.md §4). A Worker-only
+  // secret salt here would only guarantee client/Worker DISAGREEMENT, so there
+  // is deliberately no `OWNER_TAG_SALT` binding.
 
   // R2 S3-compatible API credentials, scoped to exactly the
   // evenai-personal-ai-backups bucket (Object Read & Write only). Required

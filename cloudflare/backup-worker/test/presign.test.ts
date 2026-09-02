@@ -24,8 +24,10 @@ async function presign(
 }
 
 async function ownerTagFor(subject: string): Promise<string> {
-  const { deriveOwnerTag } = await import("../src/ownerTag");
-  return deriveOwnerTag(`dev:${subject}`, env.OWNER_TAG_SALT as string);
+  const { deriveOwnerTagV1 } = await import("../src/ownerTag");
+  // The dev identity path (auth.ts) maps a `dev-test:<x>` bearer to subject
+  // `dev:<x>`, and the Worker derives the owner tag from that verified subject.
+  return deriveOwnerTagV1(`dev:${subject}`);
 }
 
 describe("routing", () => {
@@ -219,16 +221,19 @@ describe("ciphertext-only structural guarantee", () => {
   });
 });
 
-describe("misconfiguration safety", () => {
-  it("refuses to issue a grant if the owner-tag salt is not configured (never falls back to trusting the client)", async () => {
-    // This Worker instance under test always has OWNER_TAG_SALT set (see
-    // vitest.config.ts) — this test documents the expected behavior rather
-    // than re-deriving a differently-configured instance, since env vars are
-    // fixed per Miniflare instance in this pool. The code path itself
-    // (index.ts: `if (!env.OWNER_TAG_SALT) return 500`) is exercised by
-    // TypeScript's own exhaustiveness here; the meaningful guarantee — no
-    // silent trust of a client-claimed tag — is covered by the isolation
-    // tests above.
-    expect(env.OWNER_TAG_SALT).toBeTruthy();
+describe("owner-tag derivation is server-authoritative and secret-free", () => {
+  it("derives the owner tag from the verified subject alone — no secret, no client claim", async () => {
+    // ownerTag v1 takes only the verified subject. There is no OWNER_TAG_SALT
+    // (removed): a Worker-only secret would only guarantee the client and the
+    // Worker DISAGREE. The meaningful guarantee — no silent trust of a
+    // client-claimed tag — is covered by the isolation tests above; the
+    // client/Worker agreement is proven by the shared vectors in
+    // test/owner-tag-vectors.test.ts.
+    const { deriveOwnerTagV1 } = await import("../src/ownerTag");
+    const a = await deriveOwnerTagV1("dev:user-A");
+    const b = await deriveOwnerTagV1("dev:user-B");
+    expect(a).toMatch(/^[0-9a-f]{64}$/);
+    expect(a).not.toBe(b);
+    expect((env as unknown as Record<string, unknown>).OWNER_TAG_SALT).toBeUndefined();
   });
 });

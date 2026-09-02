@@ -401,9 +401,16 @@ explicit user approval first.**
 - [ ] **Production auth provider** — a real identity-token source in the app
       (`WorkerBackupCredentialProvider.identityToken` closure) fed by Sign in
       with Apple / the EvenAI account token.
-- [ ] **Per-user identity mapping** — the Worker's identity → `ownerTag`
-      derivation must match `BackupOwnerTag.tag()` exactly (same salt, same
-      hash), so a device and the Worker agree on the namespace.
+- [x] **Per-user identity mapping — owner-tag algorithm aligned.** One
+      canonical `ownerTag v1` = `SHA-256("evenai.personal-ai.backup.owner-tag.v1"
+      ‖ canonicalUserID)`, **no secret**, byte-identical in `BackupOwnerTag.tag()`
+      and `cloudflare/backup-worker/src/ownerTag.ts` (`deriveOwnerTagV1`),
+      proven by shared cross-language vectors (`R2DeploymentContractTests`
+      ↔ `owner-tag-vectors.test.ts`). The prior `OWNER_TAG_SALT` Worker secret
+      was removed — it would only have guaranteed client/Worker disagreement.
+      **Still open:** proving `canonicalUserID` (client) == verified token
+      `sub` (Worker) against a real identity provider — see
+      `PHASE2_R2_DEPLOYMENT_READINESS.md` §§3–4, Gate G.
 - [ ] **Worker ↔ R2 binding** configured in `wrangler.toml`.
 - [ ] **Rate limits** on `/presign` per identity (Cloudflare rules / a KV
       counter); per-owner object-count and total-byte ceilings.
@@ -647,3 +654,32 @@ nothing staged, nothing committed, nothing pushed. `HEAD` = `origin/main` =
 MD5 `a80809f705cf73ad24cdf513e41b673a`; `ProductionEndpointContractTests.swift`
 untracked and untouched. No CloudKit, G2 runtime, backend, or Railway file
 changed.
+
+---
+
+## 15. DEPLOYMENT READINESS — see `PHASE2_R2_DEPLOYMENT_READINESS.md`
+
+A separate planning pass produced `PHASE2_R2_DEPLOYMENT_READINESS.md`: the
+deployment-time contracts (auth, owner-tag v1, replay/idempotency, presigned
+URL, namespace, finalization, integrity, retention, account deletion, key
+management, observability), a cost/billing gate, a strict Gate A–N sequence,
+a rollback plan, and the local contract tests that pin what is provable
+without infrastructure.
+
+Local changes made in that pass (still **nothing deployed, no resource
+created, no billing, no credential**):
+
+| File | Change |
+|---|---|
+| `cloudflare/backup-worker/src/ownerTag.ts` | replaced the secret-salted derivation with the canonical secret-free `deriveOwnerTagV1` (byte-identical to `BackupOwnerTag.tag`) |
+| `cloudflare/backup-worker/src/index.ts` | uses `deriveOwnerTagV1`; dropped the `OWNER_TAG_SALT` misconfig check |
+| `cloudflare/backup-worker/src/types.ts` / `worker-configuration.d.ts` / `vitest.config.ts` | removed the `OWNER_TAG_SALT` binding |
+| `cloudflare/backup-worker/test/owner-tag-vectors.test.ts` (new) | cross-language owner-tag vectors |
+| `cloudflare/backup-worker/test/presign.test.ts` | updated for the new derivation |
+| `EvenAITests/PersonalAICloud/R2DeploymentContractTests.swift` (new) | local deployment-contract tests (owner-tag vectors, namespace, catalog redaction, scope binding, idempotency-key format, audit redaction) |
+| `PHASE2_R2_DEPLOYMENT_READINESS.md` (new) | the readiness plan |
+
+`REAL R2 BUCKET / WORKER DEPLOY / KV·D1·DO RESOURCE / REAL AUTH / REAL
+CREDENTIALS / BILLING / REAL NETWORK BACKUP / REAL DURABILITY / REAL RESTORE`
+— all still **NO**. R3 unchanged. R4 still **not** solved (needs an atomic
+D1/Durable-Object idempotency store — see readiness doc §5).

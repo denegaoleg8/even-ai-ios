@@ -14,7 +14,6 @@ export default defineConfig({
       miniflare: {
         bindings: {
           ALLOW_DEV_IDENTITY: "true",
-          OWNER_TAG_SALT: "test-only-salt-never-used-outside-this-test-run",
           R2_ACCESS_KEY_ID: "test-access-key-id",
           R2_SECRET_ACCESS_KEY: "test-secret-access-key",
           R2_S3_ENDPOINT: "https://test-account.r2.cloudflarestorage.com",

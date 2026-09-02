@@ -12,7 +12,7 @@
 // over the presigned URL this endpoint returns (BackupObjectTransport), never
 // through this Worker's own request handler.
 import { verifyIdentity, UnauthenticatedError } from "./auth";
-import { deriveOwnerTag } from "./ownerTag";
+import { deriveOwnerTagV1 } from "./ownerTag";
 import { keyIsInOwnerNamespace } from "./scope";
 import { checkAndRecordReplay } from "./replay";
 import { presignR2Url } from "./presign";
@@ -58,14 +58,13 @@ async function handlePresign(request: Request, env: Env): Promise<Response> {
   }
   const operation = body.operation as BackupObjectOperation;
 
-  if (!env.OWNER_TAG_SALT) {
-    return json(errorBody("misconfigured", "server owner-tag salt not set"), 500);
-  }
-  // Authoritative: derived from the VERIFIED identity. The client's claimed
-  // `body.ownerTag` is never used for this decision — only cross-checked
-  // below so a legitimate client gets a clear error if its own local
-  // computation has drifted, rather than a silently-wrong grant.
-  const derivedOwnerTag = await deriveOwnerTag(identity.subject, env.OWNER_TAG_SALT);
+  // Authoritative: derived from the VERIFIED identity via the ONE canonical
+  // algorithm (ownerTag v1 — see ownerTag.ts; byte-identical to the iOS
+  // client). The client's claimed `body.ownerTag` is never used for this
+  // decision — only cross-checked below so a legitimate client whose own local
+  // computation has drifted gets a clear error rather than a silently-wrong
+  // grant. No server secret is involved (and must not be — see ownerTag.ts).
+  const derivedOwnerTag = await deriveOwnerTagV1(identity.subject);
 
   if (!keyIsInOwnerNamespace(body.key, derivedOwnerTag)) {
     // Covers: malformed keys, path traversal, and any key outside the
