@@ -20,6 +20,12 @@ struct MemoryRetriever: Sendable {
         var projectMatch = 0.9
         var personMatch = 0.7
         var pinned = 0.5
+        /// How much a cross-lingual semantic match counts toward a record's
+        /// textual relevance, relative to a perfect lexical match. `< 1` so a
+        /// semantic hit is a genuine but slightly discounted signal — it
+        /// rescues a record the lexical layer missed across a language
+        /// boundary without ever outranking an exact same-language match.
+        var semanticCrossLingual = 0.85
         static let `default` = Weights()
     }
 
@@ -29,7 +35,22 @@ struct MemoryRetriever: Sendable {
         self.weights = weights
     }
 
-    func retrieve(_ query: RetrievalQuery, from records: [MemoryRecord]) -> [ScoredMemory] {
+    /// Precomputed vectors for one retrieval pass. The context builder embeds
+    /// the query once (async) and loads candidate vectors from
+    /// `EmbeddingVectorIndex`, then hands them here so `retrieve` stays a
+    /// synchronous, deterministic pure function. `nil` — the Slice 1 default,
+    /// and whenever the semantic layer is inert or failed — means "score
+    /// every record lexically", i.e. exactly today's behaviour.
+    struct SemanticContext: Sendable {
+        var queryVector: [Float]
+        var recordVectors: [UUID: [Float]]
+    }
+
+    func retrieve(
+        _ query: RetrievalQuery,
+        from records: [MemoryRecord],
+        semantic semanticContext: SemanticContext? = nil
+    ) -> [ScoredMemory] {
         let queryText = ([query.text] + query.recentContext).joined(separator: " ")
         let queryTokens = TextSimilarity.tokenSet(queryText)
 
@@ -46,7 +67,21 @@ struct MemoryRetriever: Sendable {
                 TextSimilarity.semanticSimilarity(query.recentContext.joined(separator: " "), record.canonicalContent)
             let semEntities = record.entities.isEmpty ? 0 :
                 (queryTokens.isDisjoint(with: Set(record.entities.flatMap { TextSimilarity.tokens($0) })) ? 0 : 0.5)
-            let semantic = max(semMain, 0.4 * semContext, semEntities)
+            let lexicalSemantic = max(semMain, 0.4 * semContext, semEntities)
+
+            // Cross-lingual rescue: if a query vector and this record's
+            // vector are both present, fold their cosine in via
+            // `max(lexical, weight · cosine)`. Absent vectors → 0 → identical
+            // to the pure-lexical path.
+            let crossLingual: Double = {
+                guard let semanticContext, let recordVector = semanticContext.recordVectors[record.id] else { return 0 }
+                return SemanticRelevance.cosine(semanticContext.queryVector, recordVector)
+            }()
+            let semantic = SemanticRelevance.blend(
+                lexical: lexicalSemantic,
+                semantic: crossLingual,
+                weight: weights.semanticCrossLingual
+            )
             components["semantic"] = semantic * weights.semantic
 
             // Category prior for this surface.

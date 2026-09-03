@@ -13,15 +13,34 @@ struct DefaultPersonalAIContextBuilder: PersonalAIContextBuilding {
     private let store: any PersonalMemoryStore
     private let retriever: MemoryRetriever
     private let interpreter: CommandInterpreter
+    /// Optional cross-lingual semantic layer. `nil` / inert
+    /// (`NoSemanticScorer`) → retrieval is purely lexical, exactly as
+    /// before. When active, the builder embeds the query and folds a
+    /// semantic score into ranking via `MemoryRetriever.SemanticContext`.
+    private let semanticScorer: (any SemanticMemoryScoring)?
+    /// Derived vector storage for the semantic layer. Rebuildable; never
+    /// authoritative. Only touched when `semanticScorer` is active.
+    private let vectorIndex: EmbeddingVectorIndex?
 
     init(
         store: any PersonalMemoryStore,
         retriever: MemoryRetriever = MemoryRetriever(),
-        interpreter: CommandInterpreter = CommandInterpreter()
+        interpreter: CommandInterpreter = CommandInterpreter(),
+        semanticScorer: (any SemanticMemoryScoring)? = nil,
+        vectorIndex: EmbeddingVectorIndex? = nil
     ) {
         self.store = store
         self.retriever = retriever
         self.interpreter = interpreter
+        self.semanticScorer = semanticScorer
+        self.vectorIndex = vectorIndex
+    }
+
+    /// The wired semantic layer, but only when it is real (non-inert) and
+    /// has vector storage — otherwise `nil` and retrieval stays lexical.
+    private var activeSemantic: (scorer: any SemanticMemoryScoring, index: EmbeddingVectorIndex)? {
+        guard let semanticScorer, semanticScorer.isActive, let vectorIndex else { return nil }
+        return (semanticScorer, vectorIndex)
     }
 
     func buildContext(_ request: PersonalAIContextRequest) async -> PersonalAIContext {
@@ -67,7 +86,19 @@ struct DefaultPersonalAIContextBuilder: PersonalAIContextBuilding {
                 personHints: request.personHints.map { $0.lowercased() },
                 now: request.now
             )
-            scored = retriever.retrieve(query, from: liveRecords)
+
+            // 4a. Cross-lingual semantic layer (additive, best-effort). Only
+            //     runs when a real scorer is wired — never when memory is
+            //     disabled or the conversation is excluded (this whole block
+            //     is already gated on that). Any failure leaves
+            //     `semanticContext == nil` and retrieval is purely lexical.
+            let semanticContext = await Self.semanticContext(
+                for: request.userMessage,
+                candidates: liveRecords.filter { $0.isRetrievable(now: request.now) },
+                using: activeSemantic
+            )
+
+            scored = retriever.retrieve(query, from: liveRecords, semantic: semanticContext)
 
             // Mark retrieved records as used (recency signal for next time).
             let usedIDs = Set(scored.map { $0.record.id })
@@ -132,6 +163,46 @@ struct DefaultPersonalAIContextBuilder: PersonalAIContextBuilding {
     }
 
     // MARK: - Helpers
+
+    /// Time the whole semantic pre-step is allowed before the builder gives
+    /// up and returns purely-lexical results. Independent of (and much
+    /// tighter than) the Phase 3 G2 enrichment timeout — this one protects
+    /// the Personal AI Chat path too, where nothing else bounds the wait.
+    private static let semanticBudget: Duration = .seconds(2)
+
+    /// Embeds the query and loads candidate vectors so `MemoryRetriever` can
+    /// fold in a cross-lingual score. Opportunistically re-embeds up to a
+    /// bounded number of stale candidates and prunes vectors for records
+    /// that are gone — the "lazy re-embed on retrieval touch" from the plan,
+    /// entirely on the read path. Returns `nil` (⇒ lexical-only) whenever the
+    /// semantic layer is absent, inert, times out, or anything throws.
+    private static func semanticContext(
+        for userMessage: String,
+        candidates: [MemoryRecord],
+        using active: (scorer: any SemanticMemoryScoring, index: EmbeddingVectorIndex)?
+    ) async -> MemoryRetriever.SemanticContext? {
+        guard let (scorer, index) = active, !candidates.isEmpty else { return nil }
+
+        let work: @Sendable () async -> MemoryRetriever.SemanticContext? = {
+            // Keep the index tidy; retrieval already filters non-retrievable
+            // records, so this is housekeeping only.
+            await index.pruneMissing(keeping: Set(candidates.map(\.id)))
+            await index.refreshStale(among: candidates, using: scorer, limit: 32)
+
+            guard let queryVector = try? await scorer.embed([userMessage]).first, !queryVector.isEmpty else { return nil }
+            let recordVectors = await index.vectors(for: candidates.map(\.id))
+            guard !recordVectors.isEmpty else { return nil }
+            return MemoryRetriever.SemanticContext(queryVector: queryVector, recordVectors: recordVectors)
+        }
+
+        return await withTaskGroup(of: MemoryRetriever.SemanticContext?.self) { group in
+            group.addTask { await work() }
+            group.addTask { try? await Task.sleep(for: semanticBudget); return nil }
+            let first = await group.next() ?? nil   // whichever finishes first
+            group.cancelAll()
+            return first
+        }
+    }
 
     static func currentInstruction(in message: String, interpreter: CommandInterpreter) -> String? {
         for command in interpreter.interpret(message) {

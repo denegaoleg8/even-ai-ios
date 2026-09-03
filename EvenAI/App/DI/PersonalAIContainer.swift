@@ -82,6 +82,15 @@ struct PersonalAIContainer: Sendable {
 
         let memoryStore = LocalPersonalMemoryStore(fileStore: fileStore)
         let conversationStore = LocalPersonalAIConversationStore(fileStore: fileStore)
+
+        // Cross-lingual semantic retrieval — SEAM ONLY (Slice 1). The scorer
+        // is `NoSemanticScorer` (`modelIdentifier == "none"`), so the builder
+        // never embeds anything and retrieval stays exactly lexical. A real
+        // on-device multilingual encoder drops in here as a one-line swap in
+        // a later slice; the derived index is already wired and encrypted at
+        // rest via the same `fileStore` as memory.
+        let semanticScorer: any SemanticMemoryScoring = NoSemanticScorer()
+        let embeddingIndex = EmbeddingVectorIndex(fileStore: fileStore)
         let dataStore = LocalPersonalDataStore(
             memory: memoryStore,
             conversations: conversationStore,
@@ -113,7 +122,11 @@ struct PersonalAIContainer: Sendable {
         return PersonalAIContainer(
             memoryStore: memoryStore,
             conversationStore: conversationStore,
-            contextBuilder: DefaultPersonalAIContextBuilder(store: memoryStore),
+            contextBuilder: DefaultPersonalAIContextBuilder(
+                store: memoryStore,
+                semanticScorer: semanticScorer,
+                vectorIndex: embeddingIndex
+            ),
             modelProvider: OnDevicePersonalAIModelProvider(),
             dataStore: dataStore,
             syncEngine: syncEngine,

@@ -111,4 +111,64 @@ struct MemoryRetrieverTests {
         )
         #expect(results.isEmpty)
     }
+
+    // MARK: Slice 1 — the cross-lingual semantic blend (additive)
+
+    @Test("passing `semantic: nil` is byte-identical to the no-argument call")
+    func semanticNilIsIdentity() {
+        let retriever = MemoryRetriever()
+        let records = [
+            mem("Building EvenAI for Even G2 smart glasses.", .projects, entities: ["evenai", "g2"], importance: 0.8),
+            mem("I visited Lviv last month.", .episodes),
+        ]
+        let query = RetrievalQuery(text: "How's the EvenAI build going?", surface: .personalChat)
+        let a = retriever.retrieve(query, from: records)
+        let b = retriever.retrieve(query, from: records, semantic: nil)
+        #expect(a.map(\.id) == b.map(\.id))
+        #expect(a.map(\.score) == b.map(\.score))
+    }
+
+    @Test("a semantic vector match rescues a record with zero lexical overlap")
+    func semanticRescuesZeroLexicalOverlap() {
+        let retriever = MemoryRetriever()
+        let record = mem("Prefers espresso without sugar.", .preferences)
+        // No shared tokens → lexically dropped today.
+        let query = RetrievalQuery(text: "Яку каву мені замовити?", surface: .personalChat)
+        #expect(retriever.retrieve(query, from: [record]).isEmpty)
+
+        // With near-parallel vectors the record is retrieved.
+        let sem = MemoryRetriever.SemanticContext(
+            queryVector: [1, 0, 0],
+            recordVectors: [record.id: [0.98, 0.02, 0]]
+        )
+        let rescued = retriever.retrieve(query, from: [record], semantic: sem)
+        #expect(rescued.contains { $0.record.id == record.id })
+    }
+
+    @Test("an orthogonal semantic vector adds nothing — still dropped")
+    func orthogonalSemanticIsInert() {
+        let retriever = MemoryRetriever()
+        let record = mem("Prefers espresso without sugar.", .preferences)
+        let query = RetrievalQuery(text: "Яку каву мені замовити?", surface: .personalChat)
+        let sem = MemoryRetriever.SemanticContext(
+            queryVector: [1, 0, 0],
+            recordVectors: [record.id: [0, 1, 0]]
+        )
+        #expect(retriever.retrieve(query, from: [record], semantic: sem).isEmpty)
+    }
+
+    @Test("a near-exact lexical match still outranks a semantic-only match (weight < 1 keeps the ceiling)")
+    func lexicalMatchOutranksSemanticOnly() {
+        let retriever = MemoryRetriever()
+        let queryText = "The suggested replies keep failing on device."
+        let strong = mem(queryText, .knowledge)                       // lexically identical to the query
+        let weak = mem("Prefers espresso without sugar.", .preferences) // unrelated, but given a perfect vector
+        let query = RetrievalQuery(text: queryText, surface: .personalChat)
+        let sem = MemoryRetriever.SemanticContext(
+            queryVector: [1, 0],
+            recordVectors: [weak.id: [1, 0]]
+        )
+        let results = retriever.retrieve(query, from: [strong, weak], semantic: sem)
+        #expect(results.first?.record.id == strong.id)
+    }
 }

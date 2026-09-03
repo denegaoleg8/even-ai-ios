@@ -84,6 +84,38 @@ struct PersonalAIContextBuilderTests {
 
     // MARK: Token budget
 
+    // MARK: Slice 1 — cross-lingual semantic seam (additive, default-inert)
+
+    @Test("the default builder (no semantic scorer) is unchanged — lexical retrieval only")
+    func defaultBuilderStillLexical() async {
+        let store = await seededStore()
+        let builder = DefaultPersonalAIContextBuilder(store: store)   // no scorer / index
+        let context = await builder.buildContext(PersonalAIContextRequest(
+            surface: .personalChat, userMessage: "I'm having problems with the suggested replies."
+        ))
+        #expect(context.relevantProjects.contains { $0.canonicalContent.contains("EvenAI") })
+    }
+
+    @Test("memory disabled → an active semantic scorer is never invoked")
+    func disabledMemorySkipsSemanticLayer() async throws {
+        let store = await seededStore()
+        await store.setMemoryEnabledGlobally(false)
+        let scorer = ScriptedSemanticScorer(groups: [["I'm having problems with the suggested replies.",
+                                                      "Remember I'm building EvenAI for Even G2 smart glasses — the current focus is on-device transcription, translation, and suggested replies."]])
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("pcb-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let builder = DefaultPersonalAIContextBuilder(
+            store: store, semanticScorer: scorer, vectorIndex: EmbeddingVectorIndex(directory: dir)
+        )
+        let context = await builder.buildContext(PersonalAIContextRequest(
+            surface: .personalChat, userMessage: "I'm having problems with the suggested replies."
+        ))
+        #expect(context.memoryDisabled)
+        #expect(context.relevantMemories.isEmpty)
+        #expect(await scorer.embedCallCount == 0)
+    }
+
     @Test("the rendered context respects the token budget by dropping lowest-priority material first")
     func tokenBudgetTrimsLowestPriorityFirst() async {
         let store = InMemoryPersonalMemoryStore()
