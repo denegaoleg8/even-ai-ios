@@ -1,7 +1,7 @@
 # Personal AI — Cross‑Lingual Memory Retrieval Plan
 
-**Status:** Prompt 1 inert (`9a3e125`); audit (`54e69ed`); static rejected (`d346ab1`, §22); e5-small 2B-i (`8a330cb`, §23); revised acceptance contract §24 (`bfb8dc5`). **Prompt 2B-C done — see §25: E5-small Core ML conversion PASSES. FP16 lossless, int8 (113 MB) near-lossless; 4-bit rejected. `multilingual-e5-small` = ACCEPTED FOR IPHONE BENCHMARK — NOT approved for shipping, NOT production-ready, semantic retrieval NOT active. Selected artifact = `e5_small_int8.mlpackage` (113 MB, outside repo).** Next: Prompt 2B-ii (iPhone benchmark) — mandatory. Production still `NoSemanticScorer`.
-**Baseline:** 2B-C performed against `HEAD == origin/main == bfb8dc5c7d30a6ca39f6080b12697ee649a87f04` (documentation-only change).
+**Status:** Prompt 1 inert (`9a3e125`); audit (`54e69ed`); static rejected (`d346ab1`, §22); e5-small 2B-i (`8a330cb`, §23); revised acceptance contract §24 (`bfb8dc5`); 2B-C Core ML conversion PASS (`57b2720`, §25). **PROMPT 2B-ii STATUS: PARTIAL — SOFTWARE/SYSTEM VALIDATION COMPLETE, PHYSICAL IPHONE BENCHMARK PENDING** (§26): the system-level hybrid gate PASSES strongly (lexical 0/19 cross-lingual recall → hybrid 18/19; coffee surfaced all 4 languages; full `EvenAITests` 938/938); Core ML on Mac PASSES (the iOS16-target int8 MPSGraph crash is fixed by converting at the project's real iOS 18 target); **the physical-iPhone benchmark was NOT executed — no device connected — so on-device latency/RAM/ANE/compute-placement/soak/oldest-device are UNKNOWN.** `multilingual-e5-small` stays **ACCEPTED FOR IPHONE BENCHMARK** — NOT approved for shipping, NOT production-ready, NOT activated. `PersonalAIContainer.live` still `NoSemanticScorer()`.
+**Baseline:** 2B-ii software/system work committed on top of `HEAD == origin/main == 57b2720942965e0e6609ab9479d2588c4e0e9aa7`.
 **Scope of this document:** read‑only architecture audit + implementation plan for making a memory stored in one language retrievable from a semantically equivalent query in another language (uk ↔ en ↔ de ↔ pl ↔ …).
 
 ---
@@ -914,7 +914,7 @@ M1, single-text prediction loop. FP16 (`CPU_AND_GPU`): load ~835 ms, query embed
 | **EXPECTED FUTURE SHIPPING ASSET** (int8 encoder + spm tokenizer) | **≈ 118 MB** (FP16 fallback ≈ 229 MB) |
 | engineering workspace total | ~1.4 GB (`.venv` 473 MB, `src` 470 MB, `e5_small_fp16.mlpackage` 224 MB, `e5_small_int8` pkg+mlmodelc 226 MB) — deletable |
 
-**⚠️ ~118 MB (int8) / ~229 MB (FP16) is a large app-size increase for a cross-lingual recall booster.** This needs explicit product sign-off at the activation review, and is a strong argument to also weigh option §23.10-D (translation-normalization) before committing.
+**⚠️ ~118 MB (int8) / ~229 MB (FP16) is a large app-size increase for a cross-lingual recall booster. → PRODUCT DECISION PENDING.** Not silently approved. Needs explicit product sign-off at the activation review, and is a strong argument to also weigh option §23.10-D (translation-normalization) before committing.
 
 ### 25.10 2B-C decision (§21)
 
@@ -948,3 +948,99 @@ M1, single-text prediction loop. FP16 (`CPU_AND_GPU`): load ~835 ms, query embed
 4. Whether a fixed-shape (pad-to-128) re-conversion, and/or an iOS18-min-target per-block-int8 re-conversion, materially improves device latency or size.
 5. Graceful degradation on OOM / model-unavailable → provider throws → builder falls back to lexical (verify on device).
 6. System-level (§24.5): the real provider wired into a **test** container — does the built `PersonalAIContext` surface the correct memory materially more than lexical-only on a labelled multilingual set, with the full `EvenAITests` green and the `semantic: nil` identity test intact? (This is integration work, gated behind 2B-ii, before any activation review.)
+
+---
+
+## 26. Prompt 2B-ii — system-level hybrid gate + Mac Core ML validation (physical-device benchmark NOT executed)
+
+> **PROMPT 2B-ii STATUS: PARTIAL**
+> - **SOFTWARE / SYSTEM-LEVEL VALIDATION: COMPLETE — PASS** (§26.2–§26.3)
+> - **PHYSICAL IPHONE BENCHMARK: PENDING** — *no physical iPhone was connected/available during the run* (§26.1)
+> - **OVERALL 2B-ii: NOT YET COMPLETE.** Do not read this as "2B-ii PASS".
+> `multilingual-e5-small` remains **ACCEPTED FOR IPHONE BENCHMARK** only — not approved for shipping, not activated. The ~118 MB app-size impact is **PRODUCT DECISION PENDING** (§26.4).
+
+### 26.1 Physical-device benchmark — NOT EXECUTED
+
+`xcrun xctrace list devices` shows both paired iPhones (**"iPhone Oleg" iOS 26.6.1**, **"iPhone Юра" iOS 26.6**) as **Devices Offline** — not connected. Only the Mac (Apple **M1**) and iOS **Simulators** (26.5) were available. The simulator does not use the Apple Neural Engine and its Core ML timing/RAM are not representative of a device. **Therefore the on-device parts of 2B-ii were not run and remain UNKNOWN:** compute-unit / ANE placement, cold / warm / batch latency on device, peak device RAM, on-device soak, MPSGraph-on-iOS reproduction, oldest-supported-device (iOS 18 → A12: iPhone XR/XS class) behaviour. These MUST be measured on hardware before any activation review.
+
+- OLDEST SUPPORTED DEVICE PHYSICAL TEST: **NOT AVAILABLE**.
+- Device tested: **none** (Mac M1 + iOS Simulator only).
+
+### 26.2 System-level hybrid gate (§14 / §15) — device-independent — **PASS**
+
+A **test-only** `PrecomputedEmbeddingScorer` (real `multilingual-e5-small` vectors, rev `614241f…`, torch fp32 — verified identical to onnx fp32 in §25.3) drives the **real** `MemoryRetriever` → `DefaultPersonalAIContextBuilder` → `PersonalAIContextRenderer`. No Core ML model, no Swift tokenizer, no shipping change.
+
+New **test-only** files: `EvenAITests/PersonalAI/E5SystemLevelHybridTests.swift` (9 tests), `EvenAITests/TestDoubles/PrecomputedEmbeddingScorer.swift`, `EvenAITests/PersonalAI/Fixtures/E5Fixtures.swift` (generated — 26 memories across 5 categories + 26 labelled cross-lingual queries covering all 12 language directions + 4 same-language).
+
+**Recall of the relevant memory into the built `PersonalAIContext`** (26 labelled queries):
+
+| | total | cross-lingual (19) | same-language (7) |
+|---|---|---|---|
+| lexical-only | 4/26 | **0/19** | 4/7 |
+| **hybrid** | **25/26** | **18/19** | **7/7** |
+
+**Coffee system-level** (memory `"Я віддаю перевагу еспресо без цукру."`): for all four queries — `"What coffee should I order?"`, `"Welchen Kaffee soll ich bestellen?"`, `"Jaką kawę mam zamówić?"`, `"Яку каву мені замовити?"` — **lexical-only = NOT surfaced, hybrid = surfaced** (present in `relevantMemories` **and** in `systemPromptText`). §15 acceptance: **PASS.**
+
+**Hard-negative containment (§14-D):** the coffee query retrieves 8 memories (= `RetrievalQuery.limit`); **0 are unrelated** — all 8 are beverage / food / preference-domain (espresso pref, sweet desserts, alcohol-free beer, "doesn't drink coffee", peanut allergy, spicy food, tea, espresso machine). The semantic layer pulls in *semantically-adjacent* items, not random ones. **PASS.**
+
+**Fallback / safety (§16–§19):** scorer throws → hybrid context == lexical context ✓; scorer 30 s delay → builder times out at its 2 s budget → == lexical ✓; no scorer → == lexical ✓; **memory disabled** → 0 embed calls, empty `relevantMemories`, absent from prompt ✓; **tombstoned** memory never surfaced and never embedded ✓; **owner isolation** — owner B's build cannot surface owner A's memory ✓.
+
+**Regression:** `E5SystemLevelHybridTests` 9/9 · targeted semantic + Personal AI group 101/101 · **full `EvenAITests` 938/938 (116 suites)** · `MemoryRetriever` `semantic: nil` identity test still green.
+
+### 26.3 Core ML on Mac (labelled MAC-ONLY — **not iPhone**)
+
+| Model | compute units that run (macOS 26 / M1) | retrieval vs HF | Mac load | Mac warm 1-query | soak 250 |
+|---|---|---|---|---|---|
+| FP16 (iOS16 or iOS18 target) | `CPU_ONLY`, `CPU_AND_GPU`, `ALL` | **lossless** (vec cos 1.0; TOP-1/3/8 = HF; coffee `[2,6,3,5]`; coffee-HN `[1,2,2,3]`) | ~950 ms | ~7 ms | no crash, drift −0.1 ms, RSS +0 |
+| int8 per-channel, **`minimum_deployment_target = iOS16`** | **`CPU_ONLY` only** — **crashes on `CPU_AND_GPU` and `ALL`** (`MPSGraphExecutable.mm:5070: failed assertion 'Error: MLIR pass manager failed'`) | near-lossless (cos 0.9999; TOP-1/3/8 = HF; MRR 0.684; coffee identical) | ~524 ms (CPU) | — | — |
+| int8 per-channel, **`minimum_deployment_target = iOS18`** | **`CPU_ONLY` AND `CPU_AND_GPU`** — **crash GONE** | near-lossless (cos 0.9999; ranks identical; MRR 0.684) | ~608 ms | ~11 ms | no crash, drift −0.4 ms, no RSS growth, p95 14 ms |
+| int8 per-block (block 32), iOS18 target | `CPU_ONLY` AND `CPU_AND_GPU` | ranks identical, MRR 0.685 | — | — | — |
+
+**Key finding: the MPSGraph/MLIR crash from §25.7 was a minimum-deployment-target artifact.** The 2B-C conversion used `iOS16`; **the project targets `iOS 18.0`**, and re-converting at `iOS18` makes the quantized model run on the GPU on the Mac with no crash. **The selected artifact must be re-converted at `minimum_deployment_target = iOS18`.** Whether it uses the ANE on a device is still a device-only question.
+
+Serial batch (FP16, M1 `CPU_AND_GPU`): 1 → 9 ms, 8 → 70 ms, 16 → 142 ms, 32 → 282 ms. Tokenize (Rust `tokenizers`, Python): 0.015 ms. **These are Mac numbers — not an iPhone latency claim and not usable to approve the §21.12 headroom criterion.**
+
+### 26.4 Artifact sizes (measured — supersede §25.9 with the iOS18-target numbers)
+
+| Item | Size |
+|---|---|
+| source `model.safetensors` | 470,641,600 B (471 MB) |
+| FP16 `.mlpackage` / `.mlmodelc` (iOS18) | 224 MB / 224 MB (weight.bin 235,026,624 B) |
+| **int8 per-channel `.mlpackage` / `.mlmodelc` (iOS18)** | **113 MB / 113 MB** (weight.bin 118,170,944 B) — **SELECTED** |
+| int8 per-block (block 32) `.mlpackage` (iOS18) | 119 MB (weight.bin 124,927,168 B) |
+| tokenizer future asset | `sentencepiece.bpe.model` 5,069,051 B (~5 MB) |
+| **EXPECTED FUTURE SHIPPING ASSET** (int8 encoder + spm tokenizer) | **≈ 118 MB** (FP16 fallback ≈ 229 MB) |
+
+**Normal app build size vs benchmark build with model:** not measured — the model was **not** added to any Xcode target (no benchmark target was created; the system-level gate needs no model). Incremental install impact ≈ the ~118 MB asset, uncompressed.
+
+### 26.5 2B-ii decision
+
+- **System-level hybrid gate: PASS.** This is the strongest evidence in the whole workstream that the hybrid design works — it converts 0/19 cross-lingual recall into 18/19 through the *real* Swift pipeline, surfaces the coffee preference in all four languages, contains hard negatives, and preserves every fail-open / privacy / isolation guarantee, with the full suite green.
+- **Core ML on Mac: PASS** — FP16 lossless on all compute units; iOS18-target int8 (the correct target) runs on CPU + GPU, retrieval-lossless, stable under a 250-iteration soak. The §25.7 MPSGraph crash is resolved by matching the project's deployment target.
+- **Physical-device benchmark: NOT EXECUTED (no hardware).** On-device latency vs the 2 s / 4 s budgets, peak device RAM, ANE placement, on-device soak, MPSGraph-on-iOS reproduction, and A12-class behaviour are all **UNKNOWN**.
+
+**⇒ 2B-ii RESULT: PARTIAL — system-level validation PASSED; the physical-device benchmark could not be run and remains a hard prerequisite.** `multilingual-e5-small` stays **ACCEPTED FOR IPHONE BENCHMARK** — not approved for shipping, not production-ready, semantic retrieval not active.
+
+### 26.6 Model practical for EvenAI?
+
+**LIKELY YES, pending the on-device numbers.** The semantic geometry clearly delivers the product goal (cross-lingual recall), the hybrid integration is proven end-to-end in the real Swift pipeline with no regression, conversion is clean at the right deployment target, and Mac execution is fast and stable. The two open questions are both device-only: (a) does the iOS18-target int8 model hit the §21.12 latency headroom on an A12-class iPhone, and (b) does it use the ANE or fall back to CPU. The **~118 MB asset size** is the other decision — measured, large, and needs explicit product sign-off.
+
+### 26.7 What must still happen before an activation review
+
+**1. Physical-iPhone benchmark (the pending half of 2B-ii) — no inference about untested hardware is permitted:**
+   - a **real iPhone**, ideally the **oldest supported / A12-class** device (iOS 18 → iPhone XR/XS), plus a **current iPhone** as a second data point if available;
+   - the int8 Core ML model **re-converted with `minimum_deployment_target = iOS18`**;
+   - measure: **cold load**, **warm query**, **tokenizer**, **batch 8 / 16 / 32**, **peak device RAM**, **actual compute-unit placement** (ANE / GPU / CPU);
+   - **reproduction check of the macOS MPSGraph/MLIR assertion on iOS**;
+   - **lexical fallback on model failure** (OOM / model-unavailable) on device;
+   - evaluate against the **2 s builder budget** and **4 s G2 timeout**, requiring **≥ 2× operational headroom** (§21.12) on the oldest device;
+   - a ≥ 100-iteration on-device soak (crash / memory growth / latency drift).
+2. Implement the **shipping Swift tokenizer** (XLM-R SentencePiece + apostrophe normalization via `CommandInterpreter.normalize` + `query: `/`passage: ` prefixes + masked-mean + L2) behind a separately-reviewed seam, validated against `E5Fixtures` / the saved reference vectors.
+3. A **product decision** on the ~118 MB app-size increase (weigh against §23.10-D translation-normalization).
+4. The `SemanticMemoryScoring` production provider + `PersonalAIContainer` wiring behind a build flag, still inert in `.live`.
+5. Full `EvenAITests` green with the real provider wired; `semantic: nil` identity preserved.
+6. A separate, explicit **activation review** to flip `PersonalAIContainer.live` off `NoSemanticScorer`.
+
+### 26.8 Local workspace + repo delta
+
+Workspace `~/Library/Caches/EvenAI/model-work-e5-coreml-2bc/` ≈ 1.9 GB (adds `e5_ios18_fp16/int8/int8blk.mlpackage` + `e5_ios18_int8.mlmodelc` + `PROMPT_2Bii_RESULTS.md`) — outside the repo, deletable. **Repo change (test-only): +3 files** — `EvenAITests/PersonalAI/E5SystemLevelHybridTests.swift`, `EvenAITests/TestDoubles/PrecomputedEmbeddingScorer.swift`, `EvenAITests/PersonalAI/Fixtures/E5Fixtures.swift` (generated, ~197 KB of real E5 vectors). No production Swift, no `project.yml`, no model asset, no `PersonalAIContainer` change.
