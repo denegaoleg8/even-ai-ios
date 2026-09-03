@@ -1,7 +1,7 @@
 # Personal AI — Cross‑Lingual Memory Retrieval Plan
 
-**Status:** Prompt 1 **shipped inert** (`9a3e125`); model audit (`54e69ed`); static model rejected in 2B-i (`d346ab1`, §22). **Prompt 2B-i e5-small pass done — see §23: also fails the acceptance bar as written; both small models do — a DECISION is needed, not another download.** Production still `NoSemanticScorer` (no code/asset/dependency change).
-**Baseline:** e5-small 2B-i pass performed against `HEAD == origin/main == d346ab16cecd0951815d27af97424f2a0103cf2d` (documentation-only change).
+**Status:** Prompt 1 **shipped inert** (`9a3e125`); model audit (`54e69ed`); static model rejected 2B-i (`d346ab1`, §22); e5-small 2B-i (`8a330cb`, §23). **§24 approved: revised acceptance contract (model-level + system-level gates; absolute cosine gate removed). `multilingual-e5-small` = ACCEPTED FOR CORE ML CONVERSION EVALUATION (not shipping, not activated).** Next: Prompt 2B-C (Core ML conversion validation). Production still `NoSemanticScorer` (no code/asset/dependency change).
+**Baseline:** §24 decision recorded against `HEAD == origin/main == 8a330cb4990e1834fbb5cad63dc57ffeec70679e` (documentation-only change).
 **Scope of this document:** read‑only architecture audit + implementation plan for making a memory stored in one language retrievable from a semantically equivalent query in another language (uk ↔ en ↔ de ↔ pl ↔ …).
 
 ---
@@ -497,6 +497,8 @@ Legend: **[V]** verified this session with a cited source · **[K]** from model 
 
 ### 21.11 Prompt 2B benchmark plan (run after selecting one model, before any activation)
 
+> **⚠️ The two "Quality" rows below (absolute `cosine ≥ 0.40`, `precision@1 ≥ 0.80`) are SUPERSEDED by §24.** The 2B-i evaluations (§22, §23) showed those criteria are not achievable by any small multilingual embedding model on short Personal AI memories and that absolute cosine is not model-portable. Use the §24 model-level and system-level gates instead. The latency / size / RAM / device-matrix rows below still stand.
+
 Add a **gated, non‑deterministic** integration target `MultilingualEmbeddingProviderBenchmark` (skipped in CI / normal runs; run manually on a real device). It must record, as **measured** data (never estimated):
 
 | Metric | What to measure | Target (⚠️ = unverified target, to be confirmed/beaten) |
@@ -515,6 +517,8 @@ Add a **gated, non‑deterministic** integration target `MultilingualEmbeddingPr
 The ⚠️ targets are **derived from the budgets already in the code** (2 s builder, 4 s G2) and reasonable mobile expectations — they are **not measurements** and 2B may revise them.
 
 ### 21.12 Acceptance criteria before shipping activation (flipping `PersonalAIContainer` off `NoSemanticScorer`)
+
+> **⚠️ Criterion 1 below is SUPERSEDED by §24** (model-level + system-level gates replace "precision@1 ≥ target"). Criteria 2–7 still stand.
 
 1. 2B quality gate passed (acceptance queries + labeled‑set precision@1 ≥ target) **on the recommended model, on a real device**.
 2. 2B latency: warm query embed + index lookup completes with ≥ 2× headroom under the 2 s builder budget on the oldest supported device.
@@ -736,3 +740,101 @@ Both a small static model **and** a small transformer model fail a strict rank-1
 ### 23.11 Local workspace (nothing in the repo)
 
 `~/Library/Caches/EvenAI/model-work-e5-2bi/` ≈ 624 MB: `src/` (pinned download incl. `onnx/model.onnx` 470 MB), `.venv`, eval scripts (`e5_eval.py`, `e5_supp.py`, `static_same_harness.py`), saved reference embeddings (`ref_mem_emb.npy`, `ref_q_emb.npy` — kept for a future HF↔Core ML comparison), `PROMPT_2Bi_E5_RESULTS.md`. Safe to delete. The static-model workspace `model-work-2bi/` (§22.8) is separate and also deletable.
+
+---
+
+## 24. Decision — revised semantic-retrieval acceptance contract (approved)
+
+**This section supersedes the absolute-cosine / `precision@1` acceptance criteria in §21.11–§21.12.** It is an architectural acceptance-criteria decision only — no code changes here. Evidence: §22 (static model), §23 (e5-small), and the identical-harness comparison in §23.5.
+
+### 24.1 Why the original bar was wrong (not "lowered")
+
+The original bar asked the **semantic encoder alone** to place the relevant memory at **rank 1** with an **absolute `cosine ≥ 0.40`**. Both are the wrong shape of test for this system:
+
+- **The semantic layer is not the final ranker.** `MemoryRetriever` blends `max(lexical, weights.semanticCrossLingual · cosine)` into a score that *also* carries category prior, recency, importance, pinned, and project/person hint boosts, then sorts, applies `minScore`, and truncates to `RetrievalQuery.limit`. `PersonalAIContextRenderer` then emits several retrieved memories in priority order, and a model consumes all of them. A semantic candidate does **not** need to win on cosine alone to be useful — it needs to reliably enter the candidate set without dragging unrelated memories in with it.
+- **Absolute cosine is not model-portable.** §22: the static model's genuine cross-lingual matches sit at `0.30–0.55`. §23: every short e5-small embedding sits at `0.72–0.91`, with relevant/non-relevant distributions overlapping (`rel p10 0.776` < `non-rel p95 0.808`). A single universal cosine constant is meaningless across models and would have to be re-tuned per model/version anyway.
+- Both a small static model **and** a small transformer fail strict rank-1 against short, semantically-adjacent Personal AI memories (§23.5: static TOP-1 0.73 / e5 TOP-1 0.50 on the identical adversarial harness; neither reaches 0.80). The bar was not calibrated to what any deployable small model can do.
+
+### 24.2 The absolute cosine gate is removed
+
+The production acceptance requirement **`cosine ≥ 0.40`** (and any equivalent universal absolute cosine threshold) is **removed**. It is **not** replaced with another arbitrary universal constant. If a semantic score threshold is used at all it must be:
+
+- **rank-relative** (how the candidate compares to the other candidates for *this* query), not an absolute floor;
+- **model- and version-aware** (tied to `modelIdentifier`, §21.13);
+- **evidence-driven** (set from a measured labelled set for that specific model/quantization, not guessed).
+
+The existing `RetrievalQuery.minScore` continues to operate on the **fully-blended, normalized** `MemoryRetriever` score (which already folds in lexical + priors + recency), not on raw cosine — that is unchanged and is fine.
+
+### 24.3 Two distinct quality gates
+
+| Gate | Question | Evaluated against |
+|---|---|---|
+| **MODEL-LEVEL** | Does the semantic encoder bring genuinely-relevant cross-lingual memories into the candidate set (`top-k`) without flooding it with unrelated ones? | the encoder's own ranked output over a labelled multilingual set |
+| **SYSTEM-LEVEL** | Does the complete hybrid (`MemoryRetriever` → `DefaultPersonalAIContextBuilder` → `PersonalAIContextRenderer`) surface the correct memory/context often enough to improve the actual user-visible result vs lexical-only? | the built `PersonalAIContext` (`relevantMemories`, `systemPromptText`) and, where practical, the downstream reply |
+
+**Model-level rank-1 is not a proxy for system quality.** A model can be "only" rank-3 semantically and still produce a better *system* result than lexical-only, because the blend + priors + multi-memory context injection recover the difference.
+
+### 24.4 MODEL-LEVEL acceptance contract
+
+A candidate encoder passes the model-level gate when, on a measured labelled multilingual set:
+
+- **A — Recall.** For known-relevant cross-lingual `(query, memory)` pairs, the relevant memory reliably enters the candidate set, i.e. **rank ≤ k**, where **k = `RetrievalQuery.limit` (currently 8)**. "Reliably" ≈ ≥ ~0.9 of labelled cross-lingual positives, measured, not assumed.
+- **B — Rank-relative separation.** Relevant memories show a **meaningful ranking advantage over unrelated hard negatives** — the relevant item is consistently above *unrelated* memories (topic-mismatched), even if it sits among a few *semantically-adjacent* ones. No requirement to out-rank every adjacent hard negative; no universal rank-1 requirement.
+- **D — Hard-negative containment.** Semantic recall must **not flood `top-k` with unrelated memories**: for a query with one true relevant memory, the other `top-k` slots should be dominated by plausibly-related items, not random ones. Quantify as "unrelated items in `top-k`" on the labelled set.
+- **E — Language coverage.** UK/EN/DE/PL **cross-language** recall (both directions, all pairings) stays part of acceptance — a candidate that only works same-language fails.
+- **F — Fallback.** Encoder failure / absence / timeout / memory-disabled / tombstoned / wrong-owner must preserve exact lexical behaviour (already enforced in code and covered by `CrossLingualRetrievalTests`; re-verify with the real provider).
+
+### 24.5 SYSTEM-LEVEL acceptance contract
+
+Before shipping activation, with the real provider wired into a test container (not `PersonalAIContainer.live`):
+
+- **C — Hybrid result quality.** On a labelled multilingual set, the built `PersonalAIContext` surfaces the correct relevant memory (in `relevantMemories` / `systemPromptText`) **materially more often than lexical-only** for cross-lingual queries, **with no regression** on same-language queries.
+- The full existing `EvenAITests` stays green with the real provider wired; the `semantic: nil` lexical-identity test still holds.
+- Deterministic `CrossLingualRetrievalTests`-style assertions are updated to check **"relevant memory present in `relevantMemories`"** (top-k membership) rather than "ranked first by cosine".
+
+### 24.6 Coffee acceptance case under the revised contract
+
+Stored memory: `"Я віддаю перевагу еспресо без цукру."` · Queries: `"What coffee should I order?"`, `"Welchen Kaffee soll ich bestellen?"`, `"Jaką kawę mam zamówić?"`, `"Яку каву мені замовити?"`
+
+- **MODEL LEVEL:** the memory must **enter `top-k`** for all four queries. *(e5-small, §23.4: `in_top8 = true` for all four in every tested configuration — passes.)*
+- **SYSTEM LEVEL:** the built context must **include the espresso-without-sugar preference ahead of unrelated memories** for all four queries. *(To be measured in the system-level evaluation; not yet done.)*
+- **Not required:** the semantic encoder ranking the memory #1 by cosine on its own.
+
+### 24.7 k = 8 is not a constant
+
+`RetrievalQuery.limit = 8` is the **current** production candidate budget, used here as the model-level recall bar. It is not a fixed model property:
+
+- if `limit` changes, the model-level recall gate must be re-validated at the new k;
+- "rank 8 is always fine" is **not** the contract — a candidate model should still prefer relevant memories **as high as practically achievable**; recall-at-k is a floor, not a target;
+- a model that only clears the bar at rank 7–8 is weaker than one that clears it at rank 1–3 and should be preferred accordingly.
+
+### 24.8 `multilingual-e5-small` status after §24
+
+**ACCEPTED FOR CORE ML CONVERSION EVALUATION.** Not "approved for shipping". Not "semantic retrieval activated". It has cleared the revised **model-level** feasibility gate sufficiently to justify the next engineering experiment (§23: `in_top8` ≈ 100% including the coffee family; TOP-3 0.85; better hybrid fit than the static model; MIT; iOS-reproducible SentencePiece tokenizer).
+
+It still must pass, in order, before any activation:
+
+1. **Prompt 2B-C — Core ML conversion validation** (see §24.9)
+2. HF ↔ Core ML vector / ranking equivalence
+3. iOS tokenizer implementation (XLM-R SentencePiece + apostrophe normalization + role prefixes + masked-mean + L2)
+4. exact asset-size check against the app-size budget
+5. iPhone latency (vs the in-code 2 s builder budget / 4 s G2 timeout) on the oldest supported device
+6. iPhone peak RAM
+7. oldest-supported-device behaviour (incl. graceful fallback on OOM / unavailable)
+8. **system-level** hybrid integration tests (§24.5) + updated `CrossLingualRetrievalTests`
+9. full `EvenAITests` regression with the real provider wired
+10. explicit, separate activation review (flipping `PersonalAIContainer` off `NoSemanticScorer`)
+
+### 24.9 Next step — Prompt 2B-C (Core ML conversion validation)
+
+Separate from the physical-device benchmark. **2B-C will:**
+
+- convert `intfloat/multilingual-e5-small` (rev `614241f622f53c4eeff9890bdc4f31cfecc418b3`) to Core ML — BERT encoder only;
+- preserve **role-prefix** (`query: ` / `passage: `), **tokenization** (XLM-R SentencePiece), **masked-mean pooling**, and **L2 normalization** semantics exactly (tokenizer + pooling + norm stay in host code, not baked into the model, unless proven equivalent);
+- compare HF (onnx fp32 reference, saved as `ref_mem_emb.npy` / `ref_q_emb.npy` in the workspace) vs Core ML — per-vector cosine agreement, top-1 agreement, top-k agreement, on the §23 labelled set;
+- start at fp16, then evaluate 8-bit / 4-bit on the ~96M-param embedding table, re-checking ranking agreement at each step;
+- measure the **exact** Core ML artifact size (`.mlpackage` and compiled `.mlmodelc`) + tokenizer asset;
+- run **on the Mac only** (`MLComputeUnits.cpuAndGPU` / `.all`), clearly labelled — **not** an iPhone measurement;
+- **NOT** add the model to `PersonalAIContainer` or any shipping composition; **NOT** add it to app `Resources`; **NOT** activate semantic retrieval; **NOT** touch G2 / `AIConversationEngine`.
+
+**Only after 2B-C passes:** Prompt 2B-ii — iPhone benchmark (on-device latency / RAM / ANE placement / oldest-device behaviour), still with the provider inert in the shipping container.
