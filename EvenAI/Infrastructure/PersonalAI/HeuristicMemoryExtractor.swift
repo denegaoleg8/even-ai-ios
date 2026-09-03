@@ -102,28 +102,35 @@ struct HeuristicMemoryExtractor: MemoryExtracting {
     }
 
     static func durableFact(in text: String) -> PassiveFact? {
-        let l = text.lowercased()
+        let l = CommandInterpreter.normalize(text.lowercased())
         if Self.isFiller(l) { return nil }
 
         let projectMarkers = ["i'm building", "im building", "i am building", "we're building", "we are building",
                               "i'm working on", "im working on", "i am working on", "we're launching", "we are launching",
-                              "the launch is", "we decided to", "i decided to", "we're shipping", "our goal is", "the deadline is"]
+                              "the launch is", "we decided to", "i decided to", "we're shipping", "our goal is", "the deadline is",
+                              "я будую", "ми будуємо", "я працюю над", "ми працюємо над", "ми запускаємо", "ми вирішили",
+                              "я вирішив", "я вирішила", "наша мета", "наш дедлайн", "дедлайн —", "дедлайн -"]
         if projectMarkers.contains(where: l.contains) {
             return PassiveFact(content: text, category: .projects, importance: 0.7, rationale: "durable project statement")
         }
 
         let profileMarkers = ["my name is", "i live in", "i'm based in", "im based in", "i am based in",
-                              "i work as", "i'm a ", "im a ", "i am a ", "my role is", "my job is", "my timezone is"]
+                              "i work as", "i'm a ", "im a ", "i am a ", "my role is", "my job is", "my timezone is",
+                              "мене звати", "мене звуть", "я живу в", "я живу у", "я мешкаю в", "я мешкаю у",
+                              "я працюю в ", "я працюю у ", "я працюю на посаді", "моя посада —", "моя посада -", "мій часовий пояс"]
         if profileMarkers.contains(where: l.contains) {
             return PassiveFact(content: text, category: .profile, importance: 0.65, rationale: "durable self-fact")
         }
 
-        let preferenceMarkers = ["i prefer ", "i always ", "i never ", "i can't stand ", "i hate ", "i love using ", "i'd rather "]
+        let preferenceMarkers = ["i prefer ", "i always ", "i never ", "i can't stand ", "i hate ", "i love using ", "i'd rather ",
+                                 "я віддаю перевагу", "я надаю перевагу", "я волію", "мені подобається", "мені більше подобається",
+                                 "я люблю ", "я обожнюю ", "я ненавиджу ", "я не люблю ", "терпіти не можу"]
         if preferenceMarkers.contains(where: l.contains) {
             return PassiveFact(content: text, category: .preferences, importance: 0.5, rationale: "stated preference")
         }
 
-        let peopleMarkers = [" is my co-founder", " is my colleague", " is my manager", " is my teammate", " reports to me", " is on my team"]
+        let peopleMarkers = [" is my co-founder", " is my colleague", " is my manager", " is my teammate", " reports to me", " is on my team",
+                             " мій співзасновник", " моя співзасновниця", " мій колега", " мій менеджер", " мій керівник", " у моїй команді"]
         if peopleMarkers.contains(where: l.contains) {
             return PassiveFact(content: text, category: .people, importance: 0.55, rationale: "person context")
         }
@@ -134,7 +141,10 @@ struct HeuristicMemoryExtractor: MemoryExtracting {
     static func isFiller(_ lower: String) -> Bool {
         let fillers = ["thanks", "thank you", "ok", "okay", "cool", "nice", "great", "got it", "sounds good",
                        "hello", "hi", "hey", "good morning", "good night", "lol", "haha", "yes", "no", "sure",
-                       "never mind", "nvm", "test", "testing"]
+                       "never mind", "nvm", "test", "testing",
+                       "дякую", "дуже дякую", "дякую тобі", "привіт", "вітаю", "добрий день", "доброго ранку",
+                       "добрий вечір", "на добраніч", "гаразд", "добре", "зрозуміло", "так", "ні", "клас",
+                       "супер", "тест", "тестування"]
         let stripped = lower.trimmingCharacters(in: CharacterSet(charactersIn: " .!?,"))
         return fillers.contains(stripped) || stripped.count < 4
     }

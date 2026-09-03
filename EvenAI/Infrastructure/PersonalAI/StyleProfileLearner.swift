@@ -27,13 +27,16 @@ struct StyleProfileLearner: Sendable {
             p.evidence[key] = StyleDimensionMeta(source: .explicitCommand, confidence: 0.95, observationCount: 99, updatedAt: now)
         }
 
-        if l.contains("short") || l.contains("brief") || l.contains("concise") || l.contains("terse") {
+        if l.contains("short") || l.contains("brief") || l.contains("concise") || l.contains("terse")
+            || l.contains("коротк") || l.contains("стисл") || l.contains("лаконічн") {
             set("responseLength") { p.responseLength = .short }
         }
-        if l.contains("detailed") || l.contains("thorough") || l.contains("in depth") || l.contains("long") {
+        if l.contains("detailed") || l.contains("thorough") || l.contains("in depth") || l.contains("long")
+            || l.contains("детальн") || l.contains("докладн") || l.contains("розгорнут") {
             set("responseLength") { p.responseLength = .long }
         }
-        if l.contains("direct") || l.contains("blunt") || l.contains("straight") || l.contains("no fluff") {
+        if l.contains("direct") || l.contains("blunt") || l.contains("straight") || l.contains("no fluff")
+            || l.contains("прямо") || l.contains("без води") || l.contains("по суті") {
             set("directness") { p.directness = 0.9 }
         }
         if l.contains("gentle") || l.contains("soft") || l.contains("diplomatic") {
@@ -132,7 +135,8 @@ struct StyleProfileLearner: Sendable {
             ("german", "de"), ("polish", "pl"), ("spanish", "es"),
             ("french", "fr"), ("italian", "it"),
         ]
-        let triggers = ["use ", "speak ", "reply in ", "respond in ", "answer in ", "write in ", "talk to me in ", "speak to me in "]
+        let triggers = ["use ", "speak ", "reply in ", "respond in ", "answer in ", "write in ", "talk to me in ", "speak to me in ",
+                        "відповідай ", "пиши ", "спілкуйся ", "розмовляй "]
         guard triggers.contains(where: lower.contains) else { return nil }
         for (name, code) in map where lower.contains(name) { return code }
         return nil

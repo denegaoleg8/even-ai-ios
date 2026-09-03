@@ -29,6 +29,15 @@ struct CommandInterpreter: Sendable {
             ("don't forget ", .remember),
             ("dont forget ", .remember),
             ("fyi ", .remember),
+            // remember — Ukrainian ("запам'ятай …", also the colon form
+            // "запам'ятай: …"; the three apostrophe encodings are folded to
+            // U+0027 by `normalize`, and a comma / colon after the trigger is
+            // handled by `consumedLength` before the remainder is taken).
+            ("запам'ятай що ", .remember),
+            ("запам'ятай ", .remember),
+            ("запам'ятайте ", .remember),
+            ("зауваж що ", .remember),
+            ("на замітку ", .remember),
             // forget
             ("forget about ", .forget),
             ("forget that ", .forget),
@@ -41,6 +50,12 @@ struct CommandInterpreter: Sendable {
             ("remove the memory about ", .forget),
             ("remove the memory ", .forget),
             ("erase the memory ", .forget),
+            // forget — Ukrainian ("забудь про …", "забудь …").
+            ("забудь про ", .forget),
+            ("забудьте про ", .forget),
+            ("забудь що ", .forget),
+            ("забудь ", .forget),
+            ("забудьте ", .forget),
             // style (checked before generic rules)
             ("keep replies ", .style),
             ("keep your replies ", .style),
@@ -57,6 +72,15 @@ struct CommandInterpreter: Sendable {
             ("be more formal", .style),
             ("use ukrainian", .style),
             ("speak ukrainian", .style),
+            // style — Ukrainian ("відповідай коротко", "відповідай українською").
+            ("відповідай коротко", .style),
+            ("відповідай стисло", .style),
+            ("відповідай лаконічно", .style),
+            ("пиши коротко", .style),
+            ("будь лаконічним", .style),
+            ("відповідай українською", .style),
+            ("відповідай мені українською", .style),
+            ("пиши українською", .style),
             ("speak to me in ", .style),
             ("talk to me in ", .style),
             ("reply in ", .style),
@@ -88,13 +112,35 @@ struct CommandInterpreter: Sendable {
             ("don't ", .rule),
             ("do not ", .rule),
             ("stop ", .rule),
+            // rule — Ukrainian ("завжди …", "ніколи …").
+            ("завжди ", .rule),
+            ("ніколи ", .rule),
+            ("відтепер ", .rule),
+            ("надалі ", .rule),
+            ("з цього моменту ", .rule),
         ]
         return raw.sorted { $0.0.count > $1.0.count }
     }()
 
-    private static let leadingFillers = ["please ", "hey ", "ok ", "okay ", "so ", "also ", "and ", "btw ", "just "]
+    private static let leadingFillers = ["please ", "hey ", "ok ", "okay ", "so ", "also ", "and ", "btw ", "just ",
+                                         "будь ласка ", "будь-ласка "]
 
     init() {}
+
+    /// Single place where surface variation is folded out before any trigger
+    /// matching or clause extraction happens — case is handled separately by
+    /// `lowercased()`. Every substitution replaces one character with one
+    /// character, so string offsets stay valid against the original.
+    ///
+    /// - The three apostrophe encodings a Ukrainian keyboard can produce —
+    ///   U+2019 (’), U+02BC (ʼ) and U+0027 (') — collapse to a single ASCII
+    ///   apostrophe so one set of Cyrillic triggers ("запам'ятай …") matches
+    ///   every variant.
+    static func normalize(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "\u{2019}", with: "'")
+            .replacingOccurrences(of: "\u{02BC}", with: "'")
+    }
 
     /// Interprets every sentence in `message`; returns all non-trivial
     /// commands (usually 0 or 1). Order is preserved.
@@ -113,16 +159,21 @@ struct CommandInterpreter: Sendable {
     }
 
     private func interpretSentence(_ sentence: String) -> MemoryCommand? {
-        var lower = sentence.lowercased().trimmingCharacters(in: .whitespaces)
-        var display = sentence.trimmingCharacters(in: .whitespaces)
+        var lower = Self.normalize(sentence.lowercased()).trimmingCharacters(in: .whitespaces)
+        var display = Self.normalize(sentence).trimmingCharacters(in: .whitespaces)
         for filler in Self.leadingFillers where lower.hasPrefix(filler) {
             lower = String(lower.dropFirst(filler.count))
             display = String(display.dropFirst(filler.count))
         }
 
-        // Tolerate a comma where the trigger expects a space
-        // ("From now on, …" as well as "From now on …").
-        let matchLower = lower.replacingOccurrences(of: ", ", with: " ")
+        // Tolerate a comma OR a colon where the trigger expects a space
+        // ("From now on, …", "Remember: …", "Запам'ятай: …" as well as the
+        // plain space forms). `consumedLength` walks the un-collapsed string
+        // to keep clause offsets exact.
+        let matchLower = lower
+            .replacingOccurrences(of: ", ", with: " ")
+            .replacingOccurrences(of: ": ", with: " ")
+            .replacingOccurrences(of: ":", with: " ")
 
         for (phrase, kind) in Self.triggers where matchLower.hasPrefix(phrase) {
             // The real consumed length can differ from `phrase.count` when a
@@ -166,15 +217,16 @@ struct CommandInterpreter: Sendable {
     // MARK: - Helpers
 
     /// Length of the prefix of `text` that corresponds to `phrase`, treating
-    /// a single "," + space in `text` as equivalent to the space in
-    /// `phrase`. Assumes `phrase` (with ", " collapsed to " ") is already a
-    /// confirmed prefix of the collapsed `text`.
+    /// a single "," or ":" (optionally followed by a space) in `text` as
+    /// equivalent to the space in `phrase`. Assumes `phrase` (with ", " / ": "
+    /// / ":" collapsed to " ") is already a confirmed prefix of the collapsed
+    /// `text`.
     private static func consumedLength(of phrase: String, in text: String) -> Int {
         var ti = text.startIndex
         var pi = phrase.startIndex
         while pi < phrase.endIndex, ti < text.endIndex {
-            if phrase[pi] == " ", text[ti] == "," {
-                // Consume ", " for the single space in the phrase.
+            if phrase[pi] == " ", text[ti] == "," || text[ti] == ":" {
+                // Consume ", " / ": " / ":" for the single space in the phrase.
                 ti = text.index(after: ti)
                 if ti < text.endIndex, text[ti] == " " { ti = text.index(after: ti) }
                 pi = phrase.index(after: pi)
@@ -196,7 +248,8 @@ struct CommandInterpreter: Sendable {
 
     private func normalizeRule(trigger: String, remainder: String, original: String) -> String {
         let t = trigger.trimmingCharacters(in: .whitespaces)
-        let keepTriggerInline = ["always", "never", "don't", "do not", "don't ever", "do not ever", "stop"]
+        let keepTriggerInline = ["always", "never", "don't", "do not", "don't ever", "do not ever", "stop",
+                                 "завжди", "ніколи"]
         let body: String
         if keepTriggerInline.contains(t) {
             body = "\(t.capitalizedFirst) \(remainder)"
@@ -212,11 +265,15 @@ struct CommandInterpreter: Sendable {
 
     /// Best-effort category for a "remember X" statement.
     static func categorize(_ content: String) -> MemoryCategory {
-        let l = content.lowercased()
-        let profileMarkers = ["my name is", "i am ", "i'm ", "i live", "i'm based", "i was born", "my birthday", "i work as", "my job", "my role", "my email", "my phone", "my timezone", "i'm a ", "i am a "]
-        let prefMarkers = ["i prefer", "i like", "i love", "i hate", "i don't like", "i dislike", "i enjoy", "i'd rather", "i want you to", "my favorite", "my favourite"]
-        let projectMarkers = ["project", "building", "launch", "shipping", "deadline", "milestone", "roadmap", "sprint", "we're building", "i'm building", "working on", "the app", "release"]
-        let peopleMarkers = ["is my", "my co-founder", "my colleague", "my manager", "my boss", "my wife", "my husband", "my partner", "my friend", "my brother", "my sister", "reports to", "works with me"]
+        let l = Self.normalize(content.lowercased())
+        let profileMarkers = ["my name is", "i am ", "i'm ", "i live", "i'm based", "i was born", "my birthday", "i work as", "my job", "my role", "my email", "my phone", "my timezone", "i'm a ", "i am a ",
+                              "мене звати", "мене звуть", "я живу", "я мешкаю", "я народив", "мій день народження", "я працюю", "моя посада", "моя робота", "мій часовий пояс", "мій email", "моя електронна", "мій телефон"]
+        let prefMarkers = ["i prefer", "i like", "i love", "i hate", "i don't like", "i dislike", "i enjoy", "i'd rather", "i want you to", "my favorite", "my favourite",
+                           "я віддаю перевагу", "я надаю перевагу", "мені подобається", "мені більше подобається", "я люблю", "я обожнюю", "я ненавиджу", "я не люблю", "мій улюблений", "моя улюблена", "моє улюблене", "я волію"]
+        let projectMarkers = ["project", "building", "launch", "shipping", "deadline", "milestone", "roadmap", "sprint", "we're building", "i'm building", "working on", "the app", "release",
+                              "проект", "проєкт", "я будую", "ми будуємо", "я створюю", "ми запускаємо", "запуск", "дедлайн", "реліз", "працюю над", "дорожня карта", "спринт", "віха"]
+        let peopleMarkers = ["is my", "my co-founder", "my colleague", "my manager", "my boss", "my wife", "my husband", "my partner", "my friend", "my brother", "my sister", "reports to", "works with me",
+                             "мій співзасновник", "моя співзасновниця", "мій колега", "моя колега", "мій менеджер", "мій керівник", "моя дружина", "мій чоловік", "мій партнер", "мій друг", "моя подруга", "мій брат", "моя сестра", "звітує переді мною"]
         if peopleMarkers.contains(where: l.contains) { return .people }
         if projectMarkers.contains(where: l.contains) { return .projects }
         if profileMarkers.contains(where: l.contains) { return .profile }
