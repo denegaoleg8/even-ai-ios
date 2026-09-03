@@ -76,15 +76,16 @@ struct DefaultPersonalAIContextBuilder: PersonalAIContextBuilding {
         // 3. Current-message instruction (highest priority tier).
         let currentInstruction = Self.currentInstruction(in: request.userMessage, interpreter: interpreter)
 
+        // Is this turn asking to recall a stored profile / identity fact
+        // ("what is my name?", "де я живу?")? If so, `.profile` records are
+        // let past retrieval's generic topical-connection gate and rendered
+        // as **known user facts** — a Personal AI must answer identity
+        // questions with no semantic model, even cross-lingually.
+        let profileLookup = !Self.profileQuestions.aspects(in: request.userMessage).isEmpty
+
         // 4. Retrieval.
         var scored: [ScoredMemory] = []
         if !disabled && !conversationExcluded {
-            // Is this turn asking to recall a stored profile / identity fact?
-            // If so, `.profile` records are let past retrieval's generic
-            // topical-connection gate — a Personal AI must be able to answer
-            // "what is my name?" with no semantic model, even cross-lingually.
-            let profileLookup = !Self.profileQuestions.aspects(in: request.userMessage).isEmpty
-
             let query = RetrievalQuery(
                 text: request.userMessage,
                 recentContext: request.recentConversation,
@@ -130,8 +131,15 @@ struct DefaultPersonalAIContextBuilder: PersonalAIContextBuilding {
                 text: $0.record.canonicalContent,
                 relevance: $0.score
             ) }
+        // On a profile question, the retrieved `.profile` facts are the
+        // answer — pull them out so the renderer shows them as known facts,
+        // not buried in "may be relevant" prose. Retrieval has already
+        // enforced active / non-deleted / correct-owner / in-scope / not
+        // expired, and `disabled` suppresses retrieval entirely.
+        let knownProfileFacts = profileLookup ? retrieved.filter { $0.category == .profile } : []
+        let knownProfileIDs = Set(knownProfileFacts.map(\.id))
         let otherMemories = retrieved.filter {
-            ![.projects, .people, .conversationArchive].contains($0.category)
+            ![.projects, .people, .conversationArchive].contains($0.category) && !knownProfileIDs.contains($0.id)
         }
 
         // 5. Style.
@@ -142,6 +150,7 @@ struct DefaultPersonalAIContextBuilder: PersonalAIContextBuilding {
         let rendered = PersonalAIContextRenderer.render(.init(
             currentInstruction: currentInstruction,
             rules: rules,
+            knownProfileFacts: knownProfileFacts,
             projects: projects,
             people: people,
             otherMemories: otherMemories,

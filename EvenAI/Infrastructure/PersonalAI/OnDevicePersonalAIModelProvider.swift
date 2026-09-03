@@ -73,7 +73,11 @@ struct FoundationModelsPersonalAIProvider: PersonalAIModelProviding {
             when it helps. Do not narrate that you are using memory. Never reply with an empty \
             acknowledgement ("thanks for sharing", "that's interesting", "I'm here if you \
             need anything") when you have something substantive to say. Follow every standing \
-            instruction and the stated response style.
+            instruction and the stated response style. \
+            When the user asks a direct question about themselves — their name, where they \
+            live, what they do — and the context lists it as a known fact, answer plainly and \
+            directly from that fact; do not deflect, greet, or ask for information you already \
+            have.
             """
         let session = LanguageModelSession(instructions: instructions)
 

@@ -10,6 +10,12 @@ enum PersonalAIContextRenderer {
     struct Input {
         var currentInstruction: String?      // command detected in this very message
         var rules: [Rule]
+        /// Retrieved `.profile` / identity facts that directly answer *this*
+        /// turn's question ("what is my name?"). Rendered as **known user
+        /// facts**, unhedged, high-priority — never as "may be relevant"
+        /// prose. Only populated when the builder judged this a profile
+        /// question; empty otherwise.
+        var knownProfileFacts: [MemoryRecord] = []
         var projects: [MemoryRecord]
         var people: [MemoryRecord]
         var otherMemories: [MemoryRecord]
@@ -40,6 +46,15 @@ enum PersonalAIContextRenderer {
             let lines = input.rules.prefix(12).map { "• \($0.text)" }.joined(separator: "\n")
             sections.append((1, "Standing instructions from the user (always follow):\n\(lines)"))
             trace.append("rules=\(input.rules.count)")
+        }
+
+        // Known profile / identity facts that answer this very question.
+        // Rendered as fact, not "may be relevant" prose, and placed high so a
+        // small on-device model answers directly instead of greeting.
+        if !input.memoryDisabled, !input.knownProfileFacts.isEmpty {
+            let lines = input.knownProfileFacts.prefix(4).map { "• \($0.canonicalContent)" }.joined(separator: "\n")
+            sections.append((1, "Known facts about the user — the user is asking about themselves; answer directly and plainly from these:\n\(lines)"))
+            trace.append("knownProfile=\(input.knownProfileFacts.count)")
         }
 
         if input.memoryDisabled {
@@ -95,7 +110,7 @@ enum PersonalAIContextRenderer {
         return (text, trace)
     }
 
-    static let antiGenericGuidance = "Use what you know naturally — connect the user's message to relevant context, draw implications, and ask a genuinely useful follow-up when appropriate. Do not narrate that you are using memory, and never reply with empty acknowledgements like \"thanks for sharing\" or \"that's interesting\" when you have something substantive to say."
+    static let antiGenericGuidance = "Use what you know naturally — connect the user's message to relevant context, draw implications, and ask a genuinely useful follow-up when appropriate. Do not narrate that you are using memory, and never reply with empty acknowledgements like \"thanks for sharing\" or \"that's interesting\" when you have something substantive to say. When the user asks a direct question about themselves and a known fact above answers it, state that answer plainly — do not deflect and do not ask for what you already know."
 
     static var antiGenericGuidanceTokens: Int { approxTokens(antiGenericGuidance) }
 
