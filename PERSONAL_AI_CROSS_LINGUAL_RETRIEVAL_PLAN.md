@@ -1,7 +1,7 @@
 # Personal AI — Cross‑Lingual Memory Retrieval Plan
 
-**Status:** Prompt 1 **shipped inert** (`9a3e125`); model audit (`54e69ed`); static model rejected 2B-i (`d346ab1`, §22); e5-small 2B-i (`8a330cb`, §23). **§24 approved: revised acceptance contract (model-level + system-level gates; absolute cosine gate removed). `multilingual-e5-small` = ACCEPTED FOR CORE ML CONVERSION EVALUATION (not shipping, not activated).** Next: Prompt 2B-C (Core ML conversion validation). Production still `NoSemanticScorer` (no code/asset/dependency change).
-**Baseline:** §24 decision recorded against `HEAD == origin/main == 8a330cb4990e1834fbb5cad63dc57ffeec70679e` (documentation-only change).
+**Status:** Prompt 1 inert (`9a3e125`); audit (`54e69ed`); static rejected (`d346ab1`, §22); e5-small 2B-i (`8a330cb`, §23); revised acceptance contract §24 (`bfb8dc5`). **Prompt 2B-C done — see §25: E5-small Core ML conversion PASSES. FP16 lossless, int8 (113 MB) near-lossless; 4-bit rejected. `multilingual-e5-small` = ACCEPTED FOR IPHONE BENCHMARK — NOT approved for shipping, NOT production-ready, semantic retrieval NOT active. Selected artifact = `e5_small_int8.mlpackage` (113 MB, outside repo).** Next: Prompt 2B-ii (iPhone benchmark) — mandatory. Production still `NoSemanticScorer`.
+**Baseline:** 2B-C performed against `HEAD == origin/main == bfb8dc5c7d30a6ca39f6080b12697ee649a87f04` (documentation-only change).
 **Scope of this document:** read‑only architecture audit + implementation plan for making a memory stored in one language retrievable from a semantically equivalent query in another language (uk ↔ en ↔ de ↔ pl ↔ …).
 
 ---
@@ -838,3 +838,113 @@ Separate from the physical-device benchmark. **2B-C will:**
 - **NOT** add the model to `PersonalAIContainer` or any shipping composition; **NOT** add it to app `Resources`; **NOT** activate semantic retrieval; **NOT** touch G2 / `AIConversationEngine`.
 
 **Only after 2B-C passes:** Prompt 2B-ii — iPhone benchmark (on-device latency / RAM / ANE placement / oldest-device behaviour), still with the provider inert in the shipping container.
+
+---
+
+## 25. Prompt 2B-C — E5-small Core ML conversion validation (RESULT: PASS)
+
+**Local / Mac-only. No app-bundle / Swift / project / `PersonalAIContainer` change. No Swift tokenizer built (§17 — Python tokenizer used for equivalence only). Workspace `~/Library/Caches/EvenAI/model-work-e5-coreml-2bc/` (venv + artifacts outside the repo).**
+
+### 25.1 Toolchain (reproducible)
+
+`python 3.9.6` · `macOS 26.6.2` (build 25G83) · Apple **M1** arm64 · `numpy 1.26.4` · `torch 2.5.1` · `transformers 4.45.2` · `coremltools 9.0` · `tokenizers 0.20.3`. Checkpoint `intfloat/multilingual-e5-small` rev `614241f622f53c4eeff9890bdc4f31cfecc418b3`; `model.safetensors` sha256 `1a55775f53449dac10a2bcbc312469fac40b96d53198c407081a831f81c98477` (470,641,600 B); `tokenizer.json` / `config.json` hashes identical to the 2B-i download.
+
+### 25.2 Conversion path + model contract
+
+`transformers` `AutoModel` → wrapper returning only `last_hidden_state` → `torch.jit.trace` → `coremltools.convert(convert_to="mlprogram", minimum_deployment_target=iOS16, compute_precision=FLOAT16)`. All 516 torch ops converted; op histogram is standard BERT (`linear`×72, `gather`×5, `softmax`×12, `add`×38) — **no unsupported ops**.
+
+- **CORE ML INPUTS:** `input_ids`, `attention_mask`, `token_type_ids` — `[1, RangeDim(1…512)]` int32 (matches the ONNX contract; token_type all zeros).
+- **CORE ML OUTPUT:** `last_hidden_state` `[1, S, 384]`.
+- **POOLING LOCATION:** host code (masked mean) — **not** in the Core ML graph. **L2 NORMALIZATION LOCATION:** host code. HF and Core ML are compared at the **same** post-(mean-pool + L2) boundary. No CLS pooling. `"query: "` / `"passage: "` prefixes applied in Python.
+
+### 25.3 Environment consistency (§8)
+
+torch fp32 vs the saved 2B-i onnx fp32 reference (`ref_mem_emb.npy` / `ref_q_emb.npy`): per-vector cosine **mem mean 1.000000 / min 1.000000**, **query mean 1.000000 / min 1.000000**. HF torch rankings reproduce §23 exactly (TOP-1 0.50, TOP-3 0.85, TOP-8 0.96, MRR 0.685; coffee ranks [2,6,3,5]). **HF reference regenerated: YES. Matched saved vectors: YES.**
+
+### 25.4 HF ↔ Core ML equivalence (26-memory / 26-query multilingual corpus, incl. 6 adversarial coffee hard-negatives)
+
+| Artifact | `.mlpackage` | `.mlmodelc` | HF↔model vec cosine mean/min | TOP-1 / TOP-3 / TOP-8 | MRR | ordering vs HF: top-1 / top-8-overlap / max\|rank-diff\| | coffee ranks en,de,pl,uk | coffee-HN outranking |
+|---|---|---|---|---|---|---|---|---|
+| HF (torch fp32 ref) | — | — | — | .50 / .85 / .96 | .685 | — | 2,6,3,5 | 1,2,2,3 |
+| **FP16** | **224 MB** | **224 MB** | **1.00000 / 0.99999** | **.50 / .85 / .96** | **.685** | **1.00 / 1.00 / 0** | **2,6,3,5** | **1,2,2,3** |
+| **int8 linear (per-channel)** | **113 MB** | **113 MB** | **0.99987 / 0.99982** | **.50 / .85 / .96** | **.684** | **1.00 / 0.99 / 1** | **2,6,3,5** | **1,2,2,3** |
+| palettized 8-bit | 112 MB | — | 0.99993 / 0.99989 | .50 / .85 / .96 | .685 | 0.96 / 1.00 / 2 | 2,6,3,5 | 1,2,2,3 |
+| palettized 6-bit | 84 MB | — | 0.99831 / 0.99396 | .54 / .81 / .96 | .702 | 0.88 / 0.94 / 1 | 2,7,4,5 | 0,3,2,3 |
+| palettized 4-bit | 56 MB | — | 0.98288 / 0.96658 | .58 / **.77** / **.88** | .693 | 0.73 / 0.89 / **5** | **7,11,5,4** | **4,4,1,2** |
+
+- **FP16: lossless.** Per-vector cosine ≈ 1.0 across all 52 vectors and all 4 languages; rankings, top-k recall, coffee ranks, and hard-negative ordering **identical** to HF.
+- **int8: near-lossless.** cosine 0.9999; TOP-1/3/8 identical; one query's target rank moves by 1; coffee ranks and coffee-HN outranking **identical** to HF.
+- **8-bit palettization: near-lossless** but no size win over int8.
+- **4-bit palettization: REJECTED** — measurable ranking regression (TOP-3 0.85→0.77, TOP-8 0.96→0.88, coffee ranks and hard-negative behaviour degraded).
+- **Hard-negative regression:** NO (FP16, int8, 8-bit).
+
+### 25.5 Coffee case — HF rank → Core ML rank (full 26-memory set)
+
+| Query | HF rank | FP16 rank | int8 rank |
+|---|---|---|---|
+| "What coffee should I order?" | 2 | 2 | 2 |
+| "Welchen Kaffee soll ich bestellen?" | 6 | 6 | 6 |
+| "Jaką kawę mam zamówić?" | 3 | 3 | 3 |
+| "Яку каву мені замовити?" | 5 | 5 | 5 |
+
+All four **in the retrieved top-8** for HF, FP16 and int8 — the §24.6 model-level bar ("enter top-k") is met and is **preserved by conversion**. (System-level bar is 2B-ii/integration, not this step.)
+
+### 25.6 Compilation (§14)
+
+`xcrun coremlcompiler compile` → `.mlmodelc` **SUCCESS** for FP16 and int8. `storagePrecision Float16`, `specificationVersion 7` (iOS16), output `last_hidden_state` `MultiArray(Float16)`, flexible shape. **No ANE claim** — compute-unit placement is a device question.
+
+### 25.7 Known issues / failure classification
+
+- **`MPSGraph` / MLIR runtime crash** (`MPSGraphExecutable.mm:5070: failed assertion 'Error: MLIR pass manager failed'`) when running the **quantized** (int8 / 8-bit-palett) ML Program on the **`CPU_AND_GPU`** compute unit on this macOS 26 / M1. FP16 runs on all compute units; int8 runs fine on `CPU_ONLY`. **Failure mode J (tooling/OS-runtime)** — not a conversion failure, and not proven to affect iPhone. **2B-ii must explicitly test the int8 model's compute-unit behaviour on device** (`.all` / `.cpuAndNeuralEngine` / `.cpuOnly`).
+- Per-block int8 quantization requires `minimum_deployment_target = iOS18` (this conversion used iOS16). A re-convert at iOS18 could enable smaller/better quant — note for 2B-ii.
+- Flexible sequence (`RangeDim`) was used; ANE generally prefers fixed shapes — 2B-ii should also test a fixed-shape (pad-to-128) variant.
+
+### 25.8 Mac-only performance — **NOT iPhone acceptance**
+
+M1, single-text prediction loop. FP16 (`CPU_AND_GPU`): load ~835 ms, query embed ~6.6 ms, passage embed ~8.8 ms, batch-26 ~237 ms, tokenize ~0.015 ms. int8 (`CPU_ONLY`): load ~524 ms. Comfortably within the in-code 2 s builder / 4 s G2 budgets **on a Mac**. **iPhone ANE/CPU latency + peak RAM + oldest-device behaviour are 2B-ii and are not claimed here.**
+
+### 25.9 Artifact sizes (measured — supersedes the §21 estimates)
+
+| Item | Size |
+|---|---|
+| source checkpoint `model.safetensors` | 470,641,600 B (471 MB) |
+| **FP16** `.mlpackage` / `.mlmodelc` | **224 MB / 224 MB** (weight.bin 235,024,512 B) |
+| **int8** `.mlpackage` / `.mlmodelc` | **113 MB / 113 MB** (weight.bin 118,421,568 B) — **SELECTED** |
+| tokenizer future asset | `sentencepiece.bpe.model` 5,069,051 B (~5 MB) — or `tokenizer.json` 17,082,730 B (~17 MB) |
+| **EXPECTED FUTURE SHIPPING ASSET** (int8 encoder + spm tokenizer) | **≈ 118 MB** (FP16 fallback ≈ 229 MB) |
+| engineering workspace total | ~1.4 GB (`.venv` 473 MB, `src` 470 MB, `e5_small_fp16.mlpackage` 224 MB, `e5_small_int8` pkg+mlmodelc 226 MB) — deletable |
+
+**⚠️ ~118 MB (int8) / ~229 MB (FP16) is a large app-size increase for a cross-lingual recall booster.** This needs explicit product sign-off at the activation review, and is a strong argument to also weigh option §23.10-D (translation-normalization) before committing.
+
+### 25.10 2B-C decision (§21)
+
+| Criterion | Result |
+|---|---|
+| 1. Core ML conversion succeeds | ✅ (FP16, int8, 8-bit palett) |
+| 2. HF ↔ Core ML vector agreement acceptable | ✅ (FP16 cos ≈ 1.0; int8 cos ≈ 0.9999) |
+| 3. multilingual ranking quality materially preserved | ✅ (int8: TOP-1/3/8 identical; max target-rank diff 1) |
+| 4. top-k recall acceptable | ✅ (int8 TOP-8 0.96 = HF) |
+| 5. coffee case acceptable under §24 contract | ✅ (int8 coffee ranks identical to HF; all in top-8) |
+| 6. hard-negative behaviour no material regression | ✅ (int8 coffee-HN outranking identical to HF) |
+| 7. artifact size plausible | ⚠️ 113 MB int8 / 224 MB FP16 — plausible but large; product sign-off required |
+| 8. no mandatory network / API | ✅ |
+
+**⇒ 2B-C PASS.** Selected artifact for the iPhone benchmark: **`e5_small_int8.mlpackage` (113 MB)**; **FP16 (224 MB)** is the lossless fallback if int8's device compute-unit path misbehaves.
+
+**Status after 2B-C: `multilingual-e5-small` is ACCEPTED FOR IPHONE BENCHMARK.** It is **not** "approved for shipping", **not** "production ready", and semantic retrieval is **not** active. Prompt 2B-ii (on-device benchmark) + the §24.5 system-level gate + a separate activation review all remain mandatory before `PersonalAIContainer` is ever flipped off `NoSemanticScorer`.
+
+### 25.11 Selected artifact for Prompt 2B-ii
+
+- **PATH:** `~/Library/Caches/EvenAI/model-work-e5-coreml-2bc/e5_small_int8.mlpackage` (compiled: `e5_small_int8.mlmodelc`)
+- **SIZE:** 113 MB (`.mlpackage`), 113 MB (`.mlmodelc`)
+- **FALLBACK:** `~/Library/Caches/EvenAI/model-work-e5-coreml-2bc/e5_small_fp16.mlpackage` (224 MB)
+- Saved for equivalence re-checks: `hf_mem_emb.npy`, `hf_q_emb.npy`, `cml_mem_emb.npy`, `cml_q_emb.npy`, `S_hf.npy`, `corpus.py`, `val_one.py`.
+
+### 25.12 Remaining iPhone-only unknowns (Prompt 2B-ii)
+
+1. Actual on-device compute-unit placement for the int8 model (ANE / GPU / CPU) and whether the `MPSGraph` crash reproduces on iOS (it is a macOS-runtime assertion).
+2. Cold model load, warm query embed, batch-32 embed, tokenize latency **on the oldest supported iPhone** vs the in-code 2 s builder budget and 4 s G2 enrichment timeout (need ≥ 2× headroom, §21.12).
+3. Peak RAM during a 32-item batch embed on device.
+4. Whether a fixed-shape (pad-to-128) re-conversion, and/or an iOS18-min-target per-block-int8 re-conversion, materially improves device latency or size.
+5. Graceful degradation on OOM / model-unavailable → provider throws → builder falls back to lexical (verify on device).
+6. System-level (§24.5): the real provider wired into a **test** container — does the built `PersonalAIContext` surface the correct memory materially more than lexical-only on a labelled multilingual set, with the full `EvenAITests` green and the `semantic: nil` identity test intact? (This is integration work, gated behind 2B-ii, before any activation review.)
