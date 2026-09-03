@@ -1,7 +1,7 @@
 # Personal AI — Cross‑Lingual Memory Retrieval Plan
 
-**Status:** Prompt 1 / Slice 1 **implemented** (uncommitted, awaiting review). Prompt 2+ not started.
-**Baseline:** built on `HEAD == origin/main == 53d9afa692bf74731ed922e7068c0de9c68b97b0` (`53d9afa`).
+**Status:** Prompt 1 / Slice 1 **shipped inert** in `9a3e125`. Prompt 2A (model-selection audit) done — see §21. Prompt 2B (benchmark) + integration not started; production still `NoSemanticScorer`.
+**Baseline:** Prompt 1 committed as `9a3e125` on top of `53d9afa`. Prompt 2A audit performed against `HEAD == origin/main == 9a3e1251d401817313fb3adccf7da3cc579522ea` (no code change).
 **Scope of this document:** read‑only architecture audit + implementation plan for making a memory stored in one language retrievable from a semantically equivalent query in another language (uk ↔ en ↔ de ↔ pl ↔ …).
 
 ---
@@ -392,3 +392,161 @@ Plus: `xcodebuild build` + `build-for-testing` (production Swift changes).
 - App binary size grows by the bundled model (tens–hundreds of MB depending on checkpoint/quantisation).
 - `NLLanguageRecognizer` detection unreliability is avoided by the embedding approach (no routing on detection), but would resurface if Option B is ever added as an alternate scorer.
 - On‑device compute: older eligible devices embed more slowly; the 4 s G2 budget may fall back to lexical on those until the query cache warms.
+
+---
+
+## 21. Prompt 2A — Multilingual Model Selection Audit
+
+**Read‑only research, done against `9a3e125`. No model downloaded, no asset added, no Swift/project change.**
+
+### 21.1 What a real `SemanticMemoryScoring` provider must supply (from the committed Prompt 1 code)
+
+- `func embed(_ texts: [String]) async throws -> [[Float]]` — **batch**, order‑preserving, one vector per input. Empty array for an entry = "no vector" (caller stays lexical for it).
+- `var modelIdentifier: String` — anything other than `"none"` activates the layer; it is stamped onto `EmbeddingVectorIndex.Entry.modelIdentifier`, and a change triggers a full derived‑index rebuild via `EmbeddingVectorIndex.rebuild(from:using:)`.
+- **Dimension:** not fixed anywhere. `SemanticRelevance.cosine` only requires `a.count == b.count`, so every vector from one provider must share a dimension; the index stores whatever it is. Truncating a Matryoshka model is free.
+- **Normalization:** **not required** — `SemanticRelevance.cosine` divides by both magnitudes itself. L2‑normalizing in the provider is still recommended (stable, and lets a future ANN index use dot‑product).
+- **Symmetry:** the seam calls `embed([query])` and `embed([memoryContent])` on **separate** calls, so a provider *can* apply different prefixes/roles internally — but the current protocol carries no role flag. A prefix‑dependent model (E5) needs either a tiny protocol addition (`embed(_:role:)`) or a provider that assumes "memories = passage, single‑item query calls = query" (fragile). A prefix‑free model avoids this entirely.
+- **Lazy init:** yes — the provider is only ever touched inside `DefaultPersonalAIContextBuilder.semanticContext(...)`, which is already `try?`‑guarded and wrapped in a 2 s budget; a slow first‑call model load just yields a lexical result that turn.
+- **Caching / precompute:** `EmbeddingVectorIndex` already persists per‑record vectors (encrypted, per‑owner), re‑embeds lazily on `revision` change, prunes deleted records, and rebuilds on `modelIdentifier` change. Query‑only inference per request is the steady state.
+- **Index/version:** `EmbeddingVectorIndex.Document.schemaVersion` (currently 1) + per‑entry `modelIdentifier` + `revision`. Changing the model can never corrupt `PersonalMemoryDocument` / canonical memory (proved by `PersonalCloudResilienceTests.embeddingLossIsHarmless` and `EmbeddingVectorIndexTests.corruptFileHarmless`).
+
+### 21.2 Candidates evaluated
+
+Legend: **[V]** verified this session with a cited source · **[K]** from model knowledge, confirm before integration · **[E]** estimated arithmetic (`vocab × dim × bytes` for embedding‑table‑dominated models; `params × bytes/param` otherwise), not measured.
+
+| Model | Params | Emb dim | Tokenizer | Max len | Languages / UK | License | Prefixes | Notes |
+|---|---|---|---|---|---|---|---|---|
+| **`sentence-transformers/static-similarity-mrl-multilingual-v1`** | 0 "active" (token‑embedding averaging) **[V]** | 1024, MRL→512/256/128/64/32 (0.15–0.56% hit) **[V]** | BERT multilingual **uncased** WordPiece, 105 879 vocab **[V]** | n/a (bag of tokens) | 51 langs, **`uk` `de` `pl` `en` explicitly listed** **[V]** | **Apache‑2.0** **[V]** | none **[V]** | "**not intended for retrieval use cases**" (authors) **[V]**; ~92.3% STS / 86.5% classification *relative to* multilingual‑e5‑small **[V]** |
+| **`intfloat/multilingual-e5-small`** | ~118M **[K]** | 384 **[V]** | XLM‑RoBERTa **SentencePiece** (`sentencepiece.bpe.model` ≈ 5 MB), 250 037 vocab **[V]** | 512 **[V]** | ~110, **`uk` `de` `pl` `en` explicitly listed** **[V]** | **MIT** **[V]** | **requires `query: ` / `passage: `** **[V]** (e5 technical report + community) | BertModel encoder, init from Multilingual‑MiniLM‑L12‑H384 **[V]**; e5 family is the multilingual STS/retrieval reference point |
+| `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | ~118M (0.1B) **[V]** | 384 **[V]** | XLM‑RoBERTa SentencePiece, 250 037 vocab **[K]** | 128 **[V]** | "50+" **[V]**; `uk` not listed in card, XLM‑R base covers it **[K]** | **Apache‑2.0** **[V]** | none **[V]** | mean pooling **[V]**; older (2021) sibling of e5‑small, same size, generally weaker multilingual retrieval **[K]** |
+| `setu4993/LEALLA-small` (distilled LaBSE) | 69M **[V]** | 128 **[K]** | cased WordPiece, ~501k vocab (LaBSE vocab) **[K]** | 512 **[K]** | 109, `uk` via LaBSE set **[K]** | **Apache‑2.0** **[V]** | none | "**bi‑text retrieval**" oriented, L2‑norm recommended **[V]**; translation‑pair mining ≠ query↔fact relevance **[K]** |
+| `sentence-transformers/LaBSE` | 500M **[V]** | 768 **[V]** | cased WordPiece, ~501k vocab **[K]** | 512 **[K]** | 109, `uk` **[V]** | **Apache‑2.0** **[V]** | none | general cross‑lingual semantic search **[V]**, but known‑weaker on monolingual STS vs e5/MiniLM **[K]**; size disqualifying |
+| `google/embeddinggemma-300m` | 300M **[V]** | 768, MRL→512/256/128 **[V]** | Gemma **SentencePiece**, 262k vocab **[K]** | 2048 **[K]** | 100+, `uk` **[K]** | **Gemma Terms of Use** (open weights, commercial OK, prohibited‑use policy, must pass through terms + "Gemma" attribution) **[V]** | uses task prompts ("search result", "question answering", …) **[K]** | best‑in‑class small‑model quality **[V]**; community Core ML conversion exists **[V]**; heavy + license friction |
+
+**Size estimates [E]** (asset added to the app bundle; embedding‑table‑dominated numbers assume the table is the whole cost):
+
+| Model | fp16 | int8 | 4‑bit palettized / QAT‑int4 | + tokenizer file |
+|---|---|---|---|---|
+| static‑mrl‑ml **@1024** | ~217 MB | ~108 MB | ~54 MB | +~1.5 MB `vocab.txt` |
+| static‑mrl‑ml **@256** (MRL slice) | **~54 MB** | **~27 MB** | ~14 MB | +~1.5 MB |
+| static‑mrl‑ml **@128** (MRL slice) | ~27 MB | **~14 MB** | ~7 MB | +~1.5 MB |
+| multilingual‑e5‑small | ~236 MB | ~118 MB | ~60 MB | +~5 MB `sentencepiece.bpe.model` |
+| paraphrase‑multilingual‑MiniLM‑L12‑v2 | ~236 MB | ~118 MB | ~60 MB | +~5 MB |
+| LEALLA‑small | ~138 MB | ~69 MB | ~35 MB | +~8 MB `vocab.txt` |
+| LaBSE | ~940 MB | ~470 MB | ~240 MB | +~8 MB |
+| embeddinggemma‑300m | ~600 MB | ~300 MB | ~150–200 MB (official QAT) | +~4 MB |
+
+### 21.3 Rejected candidates + reason
+
+- **LaBSE** — ~470 MB int8 asset for "rescue a cross‑language memory match" is indefensible against the product's size/RAM constraint; also optimised for translation‑pair mining, weaker on monolingual STS than e5/MiniLM.
+- **EmbeddingGemma‑300m (as default)** — best quality, but even the official QAT build is ~150–200 MB, fp16 is ~600 MB, and the **Gemma Terms of Use** (not Apache/MIT) add redistribution obligations (pass‑through terms, prohibited‑use policy, "Gemma" naming). Keep as the *quality‑ceiling fallback* only if a small model measurably fails 2B acceptance.
+- **paraphrase‑multilingual‑MiniLM‑L12‑v2 (as primary)** — same 118M size class as e5‑small with no size advantage, older, generally weaker multilingual retrieval, max‑len 128. Retain only as the *prefix‑free transformer* alternative if E5's `query:`/`passage:` handling proves annoying.
+- **LEALLA‑small (as primary)** — attractive size (69M), but bi‑text‑mining objective (translation‑pair detection), not tuned for "is this fact relevant to this question", and a 500k cased WordPiece vocab. Secondary option if the static model underperforms and e5‑small is too big.
+
+### 21.4 Shortlist
+
+1. **`static-similarity-mrl-multilingual-v1` @ 256‑dim** — smallest by far, Apache‑2.0, prefix‑free, explicit uk/de/pl/en, **no Core ML needed**.
+2. **`intfloat/multilingual-e5-small`** — the quality fallback; strongest small multilingual retriever, MIT, straightforward Core ML BERT‑encoder conversion; costs a `query:`/`passage:` handling wrinkle and ~60–120 MB.
+3. `google/embeddinggemma-300m` (QAT) — only if 1 and 2 both fail acceptance.
+
+### 21.5 Recommended model
+
+> **`sentence-transformers/static-similarity-mrl-multilingual-v1`, Matryoshka‑truncated to 256 dimensions, shipped as an int8 (≈27 MB) or fp16 (≈54 MB) embedding matrix — pending the Prompt 2B quality gate.**
+> If 2B shows it does not reliably rescue the acceptance queries, **fall back to `intfloat/multilingual-e5-small`** (Core ML, ~60 MB palettized, add `embed(_:role:)` to the seam).
+
+**Why this model:**
+- **Size/RAM** — the only candidate that fits comfortably inside a "don't grow the app for a retrieval nicety" budget (≤ ~55 MB, tunable down to ~14 MB at 128‑dim). RAM cost is a single memory‑mapped matrix, not a live transformer.
+- **No Core ML, no attention ops, no conversion risk** — inference is: WordPiece‑tokenize → gather token rows → mean → L2‑norm. Implementable in ~200 lines of pure Swift over a `Data`/`mmap` Float16 blob. No `coremltools`, no unsupported‑op risk, no ANE eligibility questions, fully deterministic (helps testing).
+- **License** — Apache‑2.0, clean for commercial redistribution inside the app bundle, no attribution string, no use‑policy pass‑through.
+- **Coverage** — `uk`, `de`, `pl`, `en` are **explicitly** in the model's own language list; it was distilled with multilingual data into a shared space.
+- **Task fit** — Personal AI memories are short declarative facts ("prefers espresso without sugar", "lives in Kyiv", "co‑founder is Andrii"). Cross‑lingual *concept overlap* on short sentences is what static multilingual embeddings do adequately, and the blend only needs the semantic layer to **rescue** matches the lexical layer missed (`max(lexical, 0.85·cosine)`) — it is not the primary ranker.
+- **Deterministic** — a static lookup table gives identical vectors every run, so Prompt 2B's quality assertions and any future regression tests are stable.
+
+**The real caveat (must be resolved in 2B):** the authors label this model *"not intended for retrieval use cases"* — it is tuned for symmetric STS, and there is a dedicated (English‑only) `static-retrieval-mrl-en-v1` sibling. Our use is closer to short‑sentence STS than classic passage retrieval, but this must be **measured** against the acceptance set before activation. If it fails, e5‑small is the proven retriever.
+
+**Why not LaBSE:** ~470 MB int8, translation‑pair objective, weaker monolingual STS — fails the size constraint outright.
+**Why not the other multilingual‑E5 sizes:** `multilingual-e5-base` (~278M) / `-large` (~560M) are far past budget; `-small` is the only one considered, and it sits behind the static model on size, ahead on quality — hence the fallback slot.
+**Why not paraphrase‑multilingual‑MiniLM‑L12‑v2:** identical 118M size to e5‑small, older, weaker multilingual retrieval, 128‑token cap — no reason to pick it over e5‑small.
+
+### 21.6 Verdicts
+
+- **UK/EN/DE/PL shared semantic space expected:** YES — for both shortlist models (static‑mrl lists all four; e5‑small lists all four and is a proven cross‑lingual retriever). Quality *level* for `uk` specifically is **unverified** and is a 2B measurement.
+- **Mandatory remote API:** NO. **Fully on‑device:** YES (both shortlist models run locally with no network).
+- **Model license verified:** YES for the recommendation — `static-similarity-mrl-multilingual-v1` is **Apache‑2.0** (verified this session). **Redistribution risk:** LOW (Apache‑2.0, bundle the matrix + `vocab.txt`; include the license text in the app's acknowledgements).
+
+### 21.7 Tokenizer implementation strategy
+
+- **Recommended model:** BERT‑multilingual **uncased WordPiece**, 105 879 tokens. Ship `vocab.txt` (~1.5 MB). Implement a self‑contained `WordPieceTokenizer` in Swift (NFD normalize → strip accents / control chars per the "uncased" recipe → lowercase → whitespace + punctuation split → greedy longest‑match WordPiece with `##` continuation, `[UNK]` fallback). No `[CLS]`/`[SEP]` needed (mean pooling over content tokens only); no attention mask needed (bag of tokens); no token‑type IDs. **Tokenizer complexity: LOW.** Optionally use `swift-transformers` (1.0, has WordPiece) instead of hand‑rolling — but a ~200‑line dependency‑free tokenizer is preferable for this narrow use.
+- **E5 fallback:** XLM‑RoBERTa **SentencePiece unigram**, 250 037 tokens. Ship `sentencepiece.bpe.model` (~5 MB) or the fast `tokenizer.json`. Needs `swift-transformers` `UnigramTokenizer` (available in 1.0; a recent release fixed its O(N²) → O(N) perf) or linking the C++ `sentencepiece` lib. Special tokens `<s>`/`</s>`, padding to batch max, real attention mask required. Plus the `query: ` / `passage: ` prefixes. **Tokenizer complexity: MEDIUM.**
+
+### 21.8 Core ML conversion strategy
+
+- **Recommended model:** **none required.** It is an embedding‑matrix lookup + mean + L2‑norm. Ship the matrix as a little‑endian Float16 (or int8 + scale) blob, `mmap` it, do the math with `Accelerate`/`vDSP`. This side‑steps every Core ML risk (unsupported ops, flexible shapes, ANE eligibility, `coremltools` version drift).
+- **E5 fallback (if chosen):** `transformers` → `coremltools` on the BERT encoder only. Keep **tokenizer outside** the model (Swift). Keep **mean pooling + L2‑norm outside** the model (or fold pooling in with a fixed op; normalization trivially in Swift). Static input shape `[1, 128]` (pad/truncate to 128) plus a batched variant `[B, 128]`, or an enumerated‑shapes model. Precision: fp16 first; try `coremltools` 8‑bit **linear quantization** or **palettization (4‑bit)** on the 96M‑param embedding table (the bulk) and measure quality delta in 2B. ANE: BERT‑base‑H384 encoders generally place well on ANE but verify with `MLComputeUnits.all` and a coremltools performance report on a real device. **Conversion feasibility: HIGH** (well‑trodden path), but it is genuine work and adds `coremltools` to the build toolchain (not the app).
+
+### 21.9 Quantization strategy
+
+- **Recommended model:** ship **int8 rows + per‑matrix (or per‑row) scale** for ~27 MB @256‑dim, or **fp16** for ~54 MB @256‑dim with zero quality question. Compare int8 vs fp16 vs 128‑dim‑fp16 in 2B; pick the smallest that clears the quality gate.
+- **E5 fallback:** fp16 baseline; then `coremltools` 8‑bit linear quant, then 4‑bit palettization of the embedding table, measuring precision@1 on the acceptance set at each step.
+
+### 21.10 Model asset size
+
+- **KNOWN:** the recommended model's on‑disk form at full 1024‑dim safetensors is ~434 MB fp32 **[E from 105 879 × 1024 × 4]**; HuggingFace reports the same order.
+- **ESTIMATED (target if selected):** **≈27 MB (int8 @256‑dim)** or **≈54 MB (fp16 @256‑dim)**, + ~1.5 MB `vocab.txt`. **UNKNOWN until built:** exact bytes after MRL slicing + quantization + any container overhead.
+- **Real‑device latency measured:** NO — nothing in this audit is benchmarked.
+
+### 21.11 Prompt 2B benchmark plan (run after selecting one model, before any activation)
+
+Add a **gated, non‑deterministic** integration target `MultilingualEmbeddingProviderBenchmark` (skipped in CI / normal runs; run manually on a real device). It must record, as **measured** data (never estimated):
+
+| Metric | What to measure | Target (⚠️ = unverified target, to be confirmed/beaten) |
+|---|---|---|
+| Model asset size | bytes added to the `.ipa` (matrix + vocab) | ⚠️ ≤ 55 MB; strongly prefer ≤ 30 MB |
+| Cold load | first `embed` call incl. `mmap` + vocab parse | ⚠️ < 300 ms |
+| Warm query embed | one short sentence, model resident | ⚠️ < 50 ms (must leave headroom under the builder's **2 s** budget and the G2 **4 s** enrichment timeout — both already in code) |
+| Batch memory embed | 32 short memories (the `refreshStale` limit) | ⚠️ < 1.0 s |
+| Tokenizer only | tokenize one short sentence | ⚠️ < 5 ms |
+| Peak extra RAM | during a 32‑item batch | ⚠️ < 80 MB resident |
+| Device matrix | iPhone SE (3rd gen) / iPhone 12‑class ↔ current | all complete within budget; on failure/OOM the provider throws → builder already falls back to lexical (verified in `CrossLingualRetrievalTests`) |
+| **Quality — acceptance queries** | stored UA "Віддає перевагу еспресо без цукру."; queries UA/EN/DE/PL "what coffee should I order?" equivalents | each retrieves the memory with `cosine ≥ 0.40` **and** an unrelated memory ("Runs 10k every Sunday.") scores below it |
+| **Quality — labeled set** | ~24 hand‑labeled `(query, relevant‑memory, distractor)` triples spread across uk/en/de/pl and the 5 memory categories (preference / profile / project / person / rule) | precision@1 ⚠️ ≥ 0.80; no distractor within 0.05 cosine of the true match |
+| Same‑language non‑regression | run the full existing `EvenAITests` with the real provider wired | 929/929 still green; lexical‑only cases unchanged |
+
+The ⚠️ targets are **derived from the budgets already in the code** (2 s builder, 4 s G2) and reasonable mobile expectations — they are **not measurements** and 2B may revise them.
+
+### 21.12 Acceptance criteria before shipping activation (flipping `PersonalAIContainer` off `NoSemanticScorer`)
+
+1. 2B quality gate passed (acceptance queries + labeled‑set precision@1 ≥ target) **on the recommended model, on a real device**.
+2. 2B latency: warm query embed + index lookup completes with ≥ 2× headroom under the 2 s builder budget on the oldest supported device.
+3. Asset size signed off against the then‑current app‑size budget.
+4. Full `EvenAITests` green with the real provider wired (same‑language behaviour unchanged; `semantic: nil` identity test still holds for the lexical path).
+5. `modelIdentifier` string finalised (see §21.13) and `EmbeddingVectorIndex` rebuild‑on‑change verified end‑to‑end with a real re‑embed.
+6. Fail‑open re‑verified with the real provider: model‑absent, model‑throws, model‑times‑out, memory‑disabled, tombstoned, wrong‑owner → all fall back to lexical, none leak.
+7. License acknowledgement added to the app's open‑source notices.
+
+### 21.13 Model versioning strategy
+
+`modelIdentifier` becomes a compound, greppable string — any change forces `EmbeddingVectorIndex.rebuild` (derived data only; canonical memory untouched):
+
+```
+<model-slug>/d<dim>/<norm>/tok<tokver>/pp<preprocver>
+e.g.  static-mrl-ml-v1/d256/l2/tokwp1/pp1
+```
+
+- `model-slug` — the checkpoint + our conversion revision.
+- `d<dim>` — output dimension after MRL truncation.
+- `<norm>` — `l2` or `raw`.
+- `tok<n>` — tokenizer implementation version (vocab file + normalization recipe).
+- `pp<n>` — text preprocessing version (casing, accent strip, any prefixes).
+
+Also bump `EmbeddingVectorIndex.Document.schemaVersion` if the on‑disk entry shape changes. `MemoryRecord.embeddingModelVersion` mirrors `modelIdentifier` per record for staleness. **Nothing here touches `PersonalMemoryDocument`, sync, backup, or export** — vectors remain derived and rebuildable.
+
+### 21.14 Remaining unknowns (all resolved by measurement in 2B, not by more research)
+
+- Whether `static-similarity-mrl-multilingual-v1` clears the retrieval quality bar despite the authors' "not for retrieval" caveat — **the pivotal unknown**.
+- Ukrainian‑specific cross‑lingual quality for either shortlist model (both list `uk`; neither publishes per‑language retrieval numbers for uk).
+- Exact quantized asset size and any decode/`mmap` overhead.
+- Real cold/warm latency and RAM on the oldest supported device.
+- For the E5 fallback only: whether folding the `query:`/`passage:` distinction into the seam (`embed(_:role:)`) is worth the quality vs. picking a prefix‑free model.
+- Whether 256‑dim is the right MRL cut or 128 suffices (smaller index, faster cosine).
+
