@@ -1,7 +1,7 @@
 # Personal AI — Cross‑Lingual Memory Retrieval Plan
 
-**Status:** Prompt 1 / Slice 1 **shipped inert** in `9a3e125`. Prompt 2A (model-selection audit) done — see §21. Prompt 2B (benchmark) + integration not started; production still `NoSemanticScorer`.
-**Baseline:** Prompt 1 committed as `9a3e125` on top of `53d9afa`. Prompt 2A audit performed against `HEAD == origin/main == 9a3e1251d401817313fb3adccf7da3cc579522ea` (no code change).
+**Status:** Prompt 1 **shipped inert** in `9a3e125`; Prompt 2A model audit committed `54e69ed`. **Prompt 2B-i (local eval) done — see §22: the §21 primary model is REJECTED; fallback `multilingual-e5-small` is next.** Production still `NoSemanticScorer` (no code/asset change).
+**Baseline:** Prompt 2B-i performed against `HEAD == origin/main == 54e69ed1ba639a9dbdf6fd1405c4c9354d5d0b42` (documentation-only change).
 **Scope of this document:** read‑only architecture audit + implementation plan for making a memory stored in one language retrievable from a semantically equivalent query in another language (uk ↔ en ↔ de ↔ pl ↔ …).
 
 ---
@@ -550,3 +550,88 @@ Also bump `EmbeddingVectorIndex.Document.schemaVersion` if the on‑disk entry s
 - For the E5 fallback only: whether folding the `query:`/`passage:` distinction into the seam (`embed(_:role:)`) is worth the quality vs. picking a prefix‑free model.
 - Whether 256‑dim is the right MRL cut or 128 suffices (smaller index, faster cosine).
 
+
+---
+
+## 22. Prompt 2B-i — local model engineering & evaluation (RESULT: primary rejected)
+
+**Offline/local step. No app-bundle change, no Swift change, no `PersonalAIContainer` change, no dependency added to the project. Not committed as code.** Work done in an isolated, un-stageable workspace: `~/Library/Caches/EvenAI/model-work-2bi/` (Python venv: `numpy` + `safetensors` + `tokenizers` + `huggingface_hub`; **no torch** — a static model needs none).
+
+### 22.1 Source integrity
+
+| Item | Value |
+|---|---|
+| Model | `sentence-transformers/static-similarity-mrl-multilingual-v1` (the §21.5 primary) |
+| Pinned revision | `b68f4122911bcffcd6e1f695f2d99cd6788972d8` |
+| License (HF model API) | `apache-2.0` — **matches the audit** |
+| `0_StaticEmbedding/model.safetensors` | 433,680,480 B · sha256 `8245ab78ee71dded845a82d2270fcb9e785b29dad0e1619f69d5390c47d9ba00` |
+| `0_StaticEmbedding/tokenizer.json` | 2,563,370 B · sha256 `11aaf894a4ccf3d95e8830e27c0f8152791fbbff2b988e29a265580b86edd216` |
+| `modules.json` | sha256 `bbae5b9edb81bf37718a6b45d921a404d129ccafb5918d2dc13146ef0e8ede34` |
+| `config_sentence_transformers.json` | sha256 `01b2222cc3c92acb38035fa5a036a82bf10c19cc93f0b1472b33f9002129fff8` |
+
+### 22.2 What the model actually is (verified from files + `train.py` + `StaticEmbedding` v3.3.0 source)
+
+- **One tensor:** `embedding.weight` F32 `[105879, 1024]`. The entire "model" is an `nn.EmbeddingBag(mode="mean")` over that matrix. No transformer, no dense head, no MRL projection layer.
+- **Inference (faithful reproduction):** `ids = tokenizer.encode(text, add_special_tokens=False).ids` → `vec = weight[ids].mean(0)` → MRL slice `vec[:D]` → L2-normalize for cosine. (`StaticEmbedding.tokenize` uses `add_special_tokens=False`; `forward` is a plain mean `EmbeddingBag`; no `Normalize` module in `modules.json`.)
+- **Tokenizer:** WordPiece, 105,879 vocab, `[UNK]=100`, `##` continuation, base `google-bert/bert-base-multilingual-uncased`. Normalizer `BertNormalizer{clean_text, handle_chinese_chars, lowercase:true, strip_accents:null→follows lowercase ⇒ **accents stripped**}`, then `BertPreTokenizer`.
+- **Training:** `MatryoshkaLoss` dims `[32,64,128,256,512,1024]` + `MultipleNegativesRankingLoss` over parallel-sentence corpora (wikititles, tatoeba, talks, europarl, global-voices, jw300, muse). So MRL slicing to 256 is the documented procedure, and the objective *is* contrastive/retrieval-style (despite the card's "not intended for retrieval" note).
+
+### 22.3 Conversion / slicing / quantization — all fine
+
+- MRL slice to D∈{128,256,512}: leading dims (documented). Normalize after slicing.
+- Quantization vs fp32 reference @D=256: **fp16** → per-sentence cosine `1.0000`, rank-1 agreement `1.00`, exact-rank agreement `1.00`. **int8** (per-row symmetric + fp32 scale) → cosine `1.0000`, rank-1 `1.00`, exact-rank `0.96`. **No meaningful degradation from quantization.**
+- Candidate artifact sizes (measured filesystem bytes; `+ tokenizer.json 2.5 MB`):
+
+| D | fp16 | int8 (+row scale) |
+|---|---|---|
+| 128 | 27,105,024 B (~27 MB) | 13,976,028 B (~14 MB) |
+| 256 | 54,210,048 B (~54 MB) | 27,528,540 B (~28 MB) |
+| 512 | 108,420,096 B (~108 MB) | 54,633,564 B (~55 MB) |
+
+### 22.4 Tokenizer validation (real assets, uk/en/de/pl, zero crashes)
+
+- `"Запам'ятай: я п'ю каву"` → apostrophe is its own token; `й`→`и`, `ї`→`і` (accent strip): `таи`, `киів`.
+- `"Fußgängerübergang, Größe, Straße."` → `['fuß','##ganger','##ube','##rgan','##g',',','große',',','straße','.']` — `ü`→`u`, `ä`→`a`; **`ß` kept, `ß` ≠ `ss`**.
+- `"Zażółć gęślą jaźń; łódź"` → `ó`→`o`, `ż/ź`→`z`, `ę`→`e`, `ć`→`c`; **`ł` kept**.
+- `"—"` (em dash) → `[UNK]` (rare punctuation). `""` → `[]` ⇒ emit "no vector".
+- Case-folds (`"Київ" == "КИЇВ"` → `киів`). No special tokens on our path.
+- **iOS reproduction:** BertNormalizer (clean_text + NFD → drop combining marks + lowercase) → BertPreTokenizer (whitespace + isolate punctuation) → greedy longest-match WordPiece with `##`/`[UNK]`. Complexity **LOW–MEDIUM** (accent strip via NFD is the only fiddly part). The `й/ї → и/і` folding is a mild Ukrainian-quality risk to note.
+
+### 22.5 Semantic quality — **the coffee acceptance case FAILS**
+
+Pipeline is sound (translation-pair sanity, cosine @D=256): "Живе в Києві…" ~ "Lives in Kyiv…" `0.69`; "Wohnt in Berlin…" ~ "Mieszka w Berlinie…" `0.69`; "Я віддаю перевагу еспресо без цукру." ~ "I prefer espresso without sugar." `0.54`, ~ German `0.43`, ~ Polish `0.44`; "Андрій — співзасновник…" ~ "Andrii is the co-founder…" `0.32`.
+
+**Required acceptance case** — memory `"Я віддаю перевагу еспресо без цукру."` in a 7-memory pool:
+
+| Query | target cosine | rank |
+|---|---|---|
+| "What coffee should I order?" | **−0.011** | 4–9 |
+| "Welchen Kaffee soll ich bestellen?" | **−0.002** | 9–15 |
+| "Jaką kawę mam zamówić?" | 0.060 | 3–6 |
+| "Яку каву мені замовити?" (**same language**) | 0.10 | 3 |
+| "I prefer espresso without sugar." (near-paraphrase) | 0.54 | **1** |
+
+It fails in every phrasing **including the same-language Ukrainian query**, and at native D=1024 too (rank 7–10) — so it is **not** a slicing/quantization artifact. Root cause: a static mean-of-subword-embeddings model cannot bridge "what should I order" (a decision question) → "prefers espresso without sugar" (a stated preference), nor "coffee" → "espresso". This is inferential retrieval, which static embeddings do poorly.
+
+**Broader eval** (22 cross-lingual query→memory cases, 18-memory pool, threshold-free): D=256 rank-1 `17/22 = 0.77`, rank≤2 `0.82`, MRR `0.828` (D=512 marginally better, D=128 slightly worse). **Every miss is the coffee family**; non-coffee cross-lingual near-paraphrase is roughly fine. But absolute cosine for genuine cross-lingual matches sits at **0.30–0.55**, so the §21.11 fixed `cosine ≥ 0.40` gate is frequently unmet even when the rank is right.
+
+### 22.6 Mac measurement — **NOT iPhone performance**
+
+Host: `macOS 26.6 arm64` (Apple Silicon). Cold load (mmap 434 MB safetensors + parse `tokenizer.json`): ~106 ms warm-fs / ~600 ms cold-fs. Warm 1-query embed with matrix resident (tokenize + gather + mean + norm): **~0.025 ms**. Tokenize only: ~0.015 ms. Compute is negligible; **no iPhone claim is made — that is Prompt 2B-ii**.
+
+### 22.7 Verdict
+
+**CANDIDATE NOT ACCEPTED for Prompt 2B-ii.**
+- **Blocker:** fails the required cross-lingual coffee acceptance case (all four languages, incl. same-language Ukrainian); weak on inferential "question → stated preference" retrieval generally; genuine cross-lingual cosines too low (0.3–0.5) for a stable absolute gate.
+- **Not blockers:** license (Apache-2.0 ✓), conversion (trivial, no Core ML ✓), quantization (fp16/int8 near-lossless ✓), tokenizer (reproducible on iOS ✓), size (~28–57 MB ✓), speed (negligible ✓).
+- **Fallback (per §21.5):** `intfloat/multilingual-e5-small` — a real transformer encoder (Core ML conversion + `query:`/`passage:` prefix handling, ~60–120 MB). Evaluate it in a **subsequent, separately-approved 2B-i pass**; do not pivot silently.
+
+### 22.8 Local workspace state (nothing in the repo)
+
+`~/Library/Caches/EvenAI/model-work-2bi/` — `~478 MB`: `src/` (pinned download, 416 MB), `.venv` (62 MB), eval scripts, `PROMPT_2Bi_RESULTS.md`. The derived candidate blobs (`candidate/…`, ~273 MB) were **deleted** (regenerable; candidate rejected). Safe to delete the whole workspace; it will be replaced when the e5-small pass runs.
+
+### 22.9 Remaining unknowns / next step
+
+- Whether `multilingual-e5-small` clears the same acceptance case (its retrieval objective + prefixes should help; unmeasured).
+- If e5-small also underperforms on the "decision-question → preference" leap, reconsider whether the acceptance query set itself is too demanding for *any* embedding model, and whether the blend threshold (`§21.11`) should be rank-relative rather than an absolute cosine.
+- **Next step: Prompt 2B-i (e5-small pass)** — download `intfloat/multilingual-e5-small` at a pinned revision, run the same evaluation harness with `query:`/`passage:` prefixes, then decide. **Not started.**
