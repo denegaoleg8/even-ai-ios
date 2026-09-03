@@ -20,6 +20,18 @@ struct HeuristicPersonalAIModelProvider: PersonalAIModelProviding {
             return PersonalAIGenerationResult(text: "What would you like to talk about?", provider: .heuristic, usedPersonalization: false)
         }
 
+        // 0. Direct answer to a stored profile / identity question ("what is
+        //    my name?"). No cloud model, no Apple Intelligence. If the fact
+        //    isn't on file we do NOT fabricate one — fall through to the
+        //    normal safe behaviour.
+        let asks = ProfileQuestionDetector().aspects(in: message)
+        if !asks.isEmpty, !context.memoryDisabled {
+            let profileFacts = context.relevantMemories.filter { $0.category == .profile }
+            if let answer = Self.directProfileAnswer(asks: asks, facts: profileFacts) {
+                return PersonalAIGenerationResult(text: answer, provider: .heuristic, usedPersonalization: true)
+            }
+        }
+
         var lines: [String] = []
         var usedPersonalization = false
 
@@ -59,6 +71,67 @@ struct HeuristicPersonalAIModelProvider: PersonalAIModelProviding {
             provider: .heuristic,
             usedPersonalization: usedPersonalization || !context.activeRules.isEmpty
         )
+    }
+
+    // MARK: - Direct profile answers
+
+    /// Answers a profile question from the retrieved `.profile` facts. Returns
+    /// `nil` when nothing on file matches — the caller must not invent a value.
+    static func directProfileAnswer(asks: Set<ProfileAspect>, facts: [MemoryRecord]) -> String? {
+        guard !facts.isEmpty else { return nil }
+        var parts: [String] = []
+        // Deterministic order so a multi-aspect question reads sensibly.
+        for aspect in [ProfileAspect.name, .occupation, .location, .language] where asks.contains(aspect) {
+            guard let fact = factMatching(aspect, in: facts) ?? soleFact(facts, whenAsking: asks) else { continue }
+            let value = valueFor(aspect, in: fact.canonicalContent)
+            switch aspect {
+            case .name:       parts.append(value.map { "Your name is \($0)." } ?? onFile(fact))
+            case .location:   parts.append(value.map { "You live in \($0)." } ?? onFile(fact))
+            case .occupation: parts.append(value.map { "You work as \($0)." } ?? onFile(fact))
+            case .language:   parts.append(value.map { "You speak \($0)." } ?? onFile(fact))
+            }
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " ")
+    }
+
+    private static func onFile(_ fact: MemoryRecord) -> String {
+        "From what you've told me: \(shortRef(fact.canonicalContent))"
+    }
+
+    /// The single profile fact to fall back to when only one aspect is asked
+    /// and there is exactly one profile fact stored.
+    private static func soleFact(_ facts: [MemoryRecord], whenAsking asks: Set<ProfileAspect>) -> MemoryRecord? {
+        (asks.count == 1 && facts.count == 1) ? facts.first : nil
+    }
+
+    private static func factMatching(_ aspect: ProfileAspect, in facts: [MemoryRecord]) -> MemoryRecord? {
+        let markers = ProfileQuestionDetector.storageMarkers(for: aspect)
+        return facts.first { fact in
+            let l = CommandInterpreter.normalize(fact.canonicalContent.lowercased())
+            return markers.contains(where: l.contains)
+        }
+    }
+
+    /// Best-effort extraction of the value that follows a storage marker,
+    /// mapping the match back onto the original-cased string.
+    static func valueFor(_ aspect: ProfileAspect, in content: String) -> String? {
+        let lower = CommandInterpreter.normalize(content.lowercased())
+        for marker in ProfileQuestionDetector.storageMarkers(for: aspect) {
+            guard let r = lower.range(of: marker) else { continue }
+            let offset = lower.distance(from: lower.startIndex, to: r.upperBound)
+            guard offset <= content.count else { continue }
+            let start = content.index(content.startIndex, offsetBy: offset)
+            var rest = String(content[start...])
+                .trimmingCharacters(in: CharacterSet(charactersIn: " ,.!?;:—–-\"'"))
+            // Drop a leading connector word ("є", "is", "to", "a", "an", "als").
+            for connector in ["is ", "a ", "an ", "als ", "to ", "як ", "є "] where rest.lowercased().hasPrefix(connector) {
+                rest = String(rest.dropFirst(connector.count))
+            }
+            rest = rest.trimmingCharacters(in: CharacterSet(charactersIn: " ,.!?;:—–-\"'"))
+            guard !rest.isEmpty, rest.count <= 60 else { return rest.isEmpty ? nil : String(rest.prefix(60)) }
+            return rest
+        }
+        return nil
     }
 
     // MARK: - Shaping

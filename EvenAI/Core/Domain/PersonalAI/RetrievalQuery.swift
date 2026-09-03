@@ -24,6 +24,15 @@ struct RetrievalQuery: Hashable, Sendable {
     /// keeps unrelated memory (last week's travel note) out of an unrelated
     /// prompt.
     var minScore: Double
+    /// The message is asking to recall a stored **profile / identity** fact
+    /// ("what is my name?", "де я живу?", "was mache ich beruflich?"). Set by
+    /// the context builder from `ProfileQuestionDetector`. When true,
+    /// `.profile` records are let past retrieval's generic topical-connection
+    /// gate for this turn — they still obey `minScore`, `isRetrievable`,
+    /// scope and owner — so a Personal AI can answer identity questions with
+    /// no semantic model, even cross-lingually. `false` ⇒ retrieval is
+    /// exactly as before.
+    var profileLookup: Bool
 
     init(
         text: String,
@@ -33,7 +42,8 @@ struct RetrievalQuery: Hashable, Sendable {
         personHints: [String] = [],
         now: Date = .now,
         limit: Int = 8,
-        minScore: Double = 0.12
+        minScore: Double = 0.12,
+        profileLookup: Bool = false
     ) {
         self.text = text
         self.recentContext = recentContext
@@ -43,6 +53,7 @@ struct RetrievalQuery: Hashable, Sendable {
         self.now = now
         self.limit = limit
         self.minScore = minScore
+        self.profileLookup = profileLookup
     }
 }
 

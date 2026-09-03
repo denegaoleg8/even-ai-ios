@@ -115,10 +115,19 @@ struct MemoryRetriever: Sendable {
                 components["personMatch"] = weights.personMatch
             }
 
+            // The user's own profile / identity facts ("my name is…", "I
+            // live in…") are always eligible when this turn is a profile
+            // question (`RetrievalQuery.profileLookup`) — a Personal AI must
+            // be able to answer "what is my name?" with no semantic model,
+            // even when the fact is stored in another language. They still
+            // obey `minScore` (below), `isRetrievable`, scope and owner, and
+            // this never fires for non-profile-question turns.
+            let profileLookupHit = query.profileLookup && record.category == .profile
+
             // A record with genuinely zero topical connection is never
             // carried by importance/recency alone — that is the "don't
             // pollute the prompt" guarantee.
-            let hasTopicalConnection = semantic > 0.05 || projectHit || personHit
+            let hasTopicalConnection = semantic > 0.05 || projectHit || personHit || profileLookupHit
             guard hasTopicalConnection else { return nil }
 
             let raw = components.values.reduce(0, +)

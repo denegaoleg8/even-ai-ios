@@ -13,6 +13,7 @@ struct DefaultPersonalAIContextBuilder: PersonalAIContextBuilding {
     private let store: any PersonalMemoryStore
     private let retriever: MemoryRetriever
     private let interpreter: CommandInterpreter
+    private static let profileQuestions = ProfileQuestionDetector()
     /// Optional cross-lingual semantic layer. `nil` / inert
     /// (`NoSemanticScorer`) → retrieval is purely lexical, exactly as
     /// before. When active, the builder embeds the query and folds a
@@ -78,13 +79,20 @@ struct DefaultPersonalAIContextBuilder: PersonalAIContextBuilding {
         // 4. Retrieval.
         var scored: [ScoredMemory] = []
         if !disabled && !conversationExcluded {
+            // Is this turn asking to recall a stored profile / identity fact?
+            // If so, `.profile` records are let past retrieval's generic
+            // topical-connection gate — a Personal AI must be able to answer
+            // "what is my name?" with no semantic model, even cross-lingually.
+            let profileLookup = !Self.profileQuestions.aspects(in: request.userMessage).isEmpty
+
             let query = RetrievalQuery(
                 text: request.userMessage,
                 recentContext: request.recentConversation,
                 surface: request.surface,
                 projectHints: request.projectHints.map { $0.lowercased() },
                 personHints: request.personHints.map { $0.lowercased() },
-                now: request.now
+                now: request.now,
+                profileLookup: profileLookup
             )
 
             // 4a. Cross-lingual semantic layer (additive, best-effort). Only
