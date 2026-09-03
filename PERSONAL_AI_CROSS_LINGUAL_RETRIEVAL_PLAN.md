@@ -1,7 +1,7 @@
 # Personal AI — Cross‑Lingual Memory Retrieval Plan
 
-**Status:** Prompt 1 **shipped inert** in `9a3e125`; Prompt 2A model audit committed `54e69ed`. **Prompt 2B-i (local eval) done — see §22: the §21 primary model is REJECTED; fallback `multilingual-e5-small` is next.** Production still `NoSemanticScorer` (no code/asset change).
-**Baseline:** Prompt 2B-i performed against `HEAD == origin/main == 54e69ed1ba639a9dbdf6fd1405c4c9354d5d0b42` (documentation-only change).
+**Status:** Prompt 1 **shipped inert** (`9a3e125`); model audit (`54e69ed`); static model rejected in 2B-i (`d346ab1`, §22). **Prompt 2B-i e5-small pass done — see §23: also fails the acceptance bar as written; both small models do — a DECISION is needed, not another download.** Production still `NoSemanticScorer` (no code/asset/dependency change).
+**Baseline:** e5-small 2B-i pass performed against `HEAD == origin/main == d346ab16cecd0951815d27af97424f2a0103cf2d` (documentation-only change).
 **Scope of this document:** read‑only architecture audit + implementation plan for making a memory stored in one language retrievable from a semantically equivalent query in another language (uk ↔ en ↔ de ↔ pl ↔ …).
 
 ---
@@ -635,3 +635,104 @@ Host: `macOS 26.6 arm64` (Apple Silicon). Cold load (mmap 434 MB safetensors + p
 - Whether `multilingual-e5-small` clears the same acceptance case (its retrieval objective + prefixes should help; unmeasured).
 - If e5-small also underperforms on the "decision-question → preference" leap, reconsider whether the acceptance query set itself is too demanding for *any* embedding model, and whether the blend threshold (`§21.11`) should be rank-relative rather than an absolute cosine.
 - **Next step: Prompt 2B-i (e5-small pass)** — download `intfloat/multilingual-e5-small` at a pinned revision, run the same evaluation harness with `query:`/`passage:` prefixes, then decide. **Not started.**
+
+---
+
+## 23. Prompt 2B-i — `intfloat/multilingual-e5-small` local evaluation (RESULT: reference does not pass the bar as written; decision required)
+
+**Offline/local step in `~/Library/Caches/EvenAI/model-work-e5-2bi/` (venv: `numpy` + `tokenizers` + `onnxruntime` + `huggingface_hub`; no torch). No app-bundle / Swift / project / `PersonalAIContainer` change. Core ML conversion NOT attempted (§14 — reference did not cleanly pass).**
+
+### 23.1 Source integrity
+
+| Item | Value |
+|---|---|
+| Model | `intfloat/multilingual-e5-small` |
+| Pinned revision | `614241f622f53c4eeff9890bdc4f31cfecc418b3` |
+| License (HF model API) | `mit` — **matches the audit** |
+| `onnx/model.onnx` (reference runtime, fp32) | 470,268,510 B · sha256 `ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665` |
+| `tokenizer.json` | 17,082,730 B · sha256 `0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39` |
+| `sentencepiece.bpe.model` | 5,069,051 B · sha256 `cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865` |
+
+### 23.2 Model facts (verified from files)
+
+BertModel 12L / H384 / 12 heads / intermediate 1536, vocab 250,037, max_seq 512, `type_vocab_size` 2 (zeros in use). **Pooling = masked mean** (`1_Pooling/config.json`). Normalize = L2. ONNX inputs `input_ids`/`attention_mask`/`token_type_ids` (int64), output `last_hidden_state [B,S,384]`. Tokenizer = XLM-RoBERTa SentencePiece unigram; `<s>=0 </s>=2 <pad>=1 <unk>=3`; adds `<s> … </s>`. **Exact strings fed:** memories → `"passage: " + text`, queries → `"query: " + text`.
+
+### 23.3 Reference retrieval quality — **fails the bar as written**
+
+26 memories (incl. 6 adversarial coffee hard-negatives: *likes tea without sugar*, *owns an espresso machine*, *project codenamed Espresso*, *prefers sweet desserts*, *doesn't drink coffee*, *coffee meeting tomorrow*) · 26 cross-lingual queries covering all 12 language directions + 4 same-language.
+
+| Metric | E5-small (onnx fp32) |
+|---|---|
+| **TOP-1** | **13/26 = 0.50** (target ≥ 0.80) |
+| TOP-3 | 22/26 = 0.85 |
+| MRR | 0.685 · mean rank 2.42 |
+| rank-1 by direction | `uk>pl 2/2`, `uk>uk 2/3`, `en>en 2/2`, `en>de 2/3`, `de>de 1/1`, `de>pl 1/1`, `pl>de 1/1`, `pl>pl 1/1` — but **`en>uk 0/2`, `de>uk 0/2`, `pl>uk 0/2`, `uk>en 0/1`, `uk>de 0/1`, `de>en 0/1`, `pl>en 0/1`** |
+| rank-1 by category | `PREF 6/11`, `PROFILE 4/5`, `PROJECT 2/4`, `PEOPLE 1/4`, `STYLE 0/2` |
+| score distribution | relevant mean `0.824` / min `0.724` / p10 `0.776`; non-relevant mean `0.749` / max `0.851` / p90 `0.797` |
+
+**⇒ No usable absolute score gate.** rel p10 `0.776` < non-rel p95 `0.808` — the two distributions overlap heavily. Everything a short E5 embedding touches lands in cosine `0.72–0.91`. This confirms the §11 / §21.14 concern: an absolute `cosine ≥ 0.40` threshold (§21.11) is meaningless here (always true), and any threshold that catches most true positives also catches most hard negatives.
+
+### 23.4 Coffee acceptance case — memory `"Я віддаю перевагу еспресо без цукру."`
+
+| Query | FULL (20, adversarial HNs) | REALISTIC (19) | MINI (10, realistic store) |
+|---|---|---|---|
+| "What coffee should I order?" | rank **2** (cos .810) | rank 1 | rank **1** (+.013) |
+| "Welchen Kaffee soll ich bestellen?" | rank **5** (cos .772) | rank 4 | rank **1** (+.016) |
+| "Jaką kawę mam zamówić?" | rank **3** (cos .781) | rank 3 | rank **1** (+.010) |
+| "Яку каву мені замовити?" (same language) | rank **5** (cos .811) | rank 4 | rank **2** (−.013) |
+
+- **`in_top5 = TRUE` and `in_top8 = TRUE` for all four queries in every configuration.**
+- What outranks it in the FULL set: `"project codenamed Espresso"` (3×, an artificial memory), `"coffee meeting tomorrow"` (2×), `"owns espresso machine"`, `"alcohol-free beer"`, `"sweet desserts"`, `"doesn't drink coffee"`, `"spicy Asian food"` (1× each).
+- **⇒ FAILS a strict rank-1 acceptance bar; PASSES a "target in the retrieved top-8" bar; is rank-1 in a realistic-size store.**
+
+### 23.5 Apples-to-apples vs the rejected static model (identical 26-query / 26-memory harness)
+
+| | TOP-1 | TOP-3 | in_top8 | MRR | coffee ranks (en, de, pl, uk) |
+|---|---|---|---|---|---|
+| static `static-similarity-mrl-multilingual-v1` @256 | **0.73** | 0.81 | 24/26 | 0.795 | **[14, 9, 6, 4]** |
+| `multilingual-e5-small` (onnx fp32) | 0.50 | **0.85** | **~26/26** | 0.685 | **[2, 6, 3, 5]** |
+
+The static model is **sharper** (higher TOP-1; when wrong it is badly wrong — rank ~14). E5 is **compressed** (lower TOP-1; the target is almost always in the top 3–8; coffee is much better and always in the retrieved top-8). **Neither small model passes a strict rank-1 bar.** For the hybrid *"rescue the missed memory into the top-8 retrieved set"* design, **E5-small is the better fit** (comparison is on ranking, not cosine magnitude — the spaces differ).
+
+### 23.6 Tokenizer validation (XLM-R SentencePiece; uk/en/de/pl; **0 UNK on all real text**)
+
+- **Ukrainian apostrophes** `'` (U+0027), `’` (U+2019), `ʼ` (U+02BC): all tokenize with 0 UNK **but produce different token ids** ⇒ the iOS embedding provider **must normalize apostrophes before tokenizing**. `CommandInterpreter.normalize` already folds U+2019/U+02BC → U+0027 — reuse it.
+- de `"Fußgängerübergang, Größe, schön, Straße."` → 16 tok, 0 UNK (`ß/ä/ö/ü` **preserved**, not stripped — unlike the static model's tokenizer).
+- pl `"Zażółć gęślą jaźń; łódź, ślimak, źdźbło."` → 29 tok, 0 UNK (all diacritics preserved).
+- uk `"Ґ ї є й — Львів, Київ, щастя."` → 17 tok, 0 UNK.
+- Empty string → `[<s>, ▁passage, :, ▁, </s>]` (the prefix survives — special-case empty upstream, or emit "no vector").
+- Specials `<s>`/`</s>`, real attention mask, token_type all-zero, pad=1.
+- **iOS reproduction:** `swift-transformers` `UnigramTokenizer` (ships in 1.0) or link `sentencepiece`; ship `tokenizer.json` (~17 MB) or `sentencepiece.bpe.model` (~5 MB). **Complexity MEDIUM.**
+
+### 23.7 Mac measurement — **NOT iPhone performance**
+
+Host `macOS 26.6 arm64` (Apple Silicon), onnxruntime CPU. Cold load (onnx session + tokenizer): ~520 ms. Warm 1-query embed (tokenize + 12-layer forward + mean + L2): **~3.7 ms**. Tokenize only: ~0.013 ms. Batch-26 memories in one onnx call: ~90 ms. Compute is fine on a Mac CPU; **iPhone Core ML / ANE latency is a separate 2B-ii measurement and is not claimed here**.
+
+### 23.8 Core ML feasibility
+
+**NOT attempted** — per §14, conversion is done only after the reference passes the quality gate, and it did not cleanly pass (coffee rank 2–5 on the full set; TOP-1 0.50; no usable absolute threshold). If a revised acceptance bar (§23.10 option A) is approved, the conversion path is unchanged from §21.8: `transformers` → `coremltools` on the BERT encoder only; tokenizer + masked-mean + L2 in Swift; static `[1,128]` + batched shapes; fp16 reference then 8-bit / 4-bit on the 96M-param embedding table; verify HF↔Core ML rank agreement on the saved `ref_*_emb.npy`.
+
+### 23.9 Decision gate (§19) — result
+
+| Criterion | Result |
+|---|---|
+| 1. reference semantic quality passes | **BORDERLINE FAIL** — TOP-1 0.50 |
+| 2. UK/EN/DE/PL directions meaningfully supported | **PARTIAL** — strong same-language + several cross directions; `*>uk` and `uk>*`/`*>en` rank-1 are weak, but TOP-3 is 0.85 |
+| 3. coffee acceptance passes (rank-1) | **FAIL** (rank 2–5 full set); PASS on a top-8 bar |
+| 4. hard-negative behaviour / usable threshold | **FAIL** — rel/non-rel cosine distributions overlap |
+| 5–9 (Core ML, size, tokenizer, no network) | not evaluated — 3 & 4 gate the rest |
+
+**⇒ E5-small is NOT accepted for Prompt 2B-ii on the acceptance criteria as written.**
+
+### 23.10 Recommended next step — a decision, not another model download
+
+Both a small static model **and** a small transformer model fail a strict rank-1 + absolute-cosine bar against short, semantically-adjacent Personal AI memories. That is the real finding. Options, for explicit sign-off:
+
+- **(A) Revise the acceptance bar** (§21.11 / §21.12) from *"rank-1 + absolute cosine ≥ 0.40"* to *"relevant memory in the retrieved top-k (k = `RetrievalQuery.limit` = 8) + rank-relative separation, no absolute cosine gate"*. Under that bar **E5-small passes** (coffee in top-8 in every config; TOP-3 0.85) → proceed to Core ML conversion + 2B-ii. This matches how the hybrid actually works: the semantic layer only needs to get the memory into the retrieved set; the `max(lexical, 0.85·cos)` blend + category/recency/importance + the LLM consuming multiple retrieved memories do the rest. **Recommended.**
+- **(B) Evaluate `multilingual-e5-base`** (~278M, ~110 MB int8) — likely sharper, but over the current app-size budget; needs its own approval.
+- **(C) Accept the semantic layer as a recall booster, not a precision ranker** — proceed with E5-small as-is; the blend already tolerates extra retrieved memories.
+- **(D) Drop embeddings** — keep lexical-only; optionally add translation-normalization (audit Option B) as a targeted cross-lingual bridge, accepting its coupling cost.
+
+### 23.11 Local workspace (nothing in the repo)
+
+`~/Library/Caches/EvenAI/model-work-e5-2bi/` ≈ 624 MB: `src/` (pinned download incl. `onnx/model.onnx` 470 MB), `.venv`, eval scripts (`e5_eval.py`, `e5_supp.py`, `static_same_harness.py`), saved reference embeddings (`ref_mem_emb.npy`, `ref_q_emb.npy` — kept for a future HF↔Core ML comparison), `PROMPT_2Bi_E5_RESULTS.md`. Safe to delete. The static-model workspace `model-work-2bi/` (§22.8) is separate and also deletable.
