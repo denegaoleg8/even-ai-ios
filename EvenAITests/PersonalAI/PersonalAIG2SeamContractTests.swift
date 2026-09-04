@@ -91,7 +91,7 @@ struct PersonalAIG2SeamContractTests {
 
     // MARK: Scenario 24 — local fallback reply behaviour remains intact
 
-    @Test("the on-device model provider falls back to the heuristic tier and still produces a non-empty, context-using reply")
+    @Test("the shipping provider router falls back from a failing on-device tier to heuristic and still produces a non-empty, context-using reply")
     func localFallbackRemainsIntact() async throws {
         let store = InMemoryPersonalMemoryStore()
         _ = await MemoryCommandProcessor().process(message: "Remember I'm building EvenAI for G2 glasses, and I'm currently stuck on the suggested replies.", conversationID: UUID(), messageID: UUID(), store: store)
@@ -99,11 +99,17 @@ struct PersonalAIG2SeamContractTests {
             PersonalAIContextRequest(surface: .personalChat, userMessage: "The suggested replies are broken.")
         )
 
-        // Force the on-device tier to fail; the provider must fall back.
-        let provider = OnDevicePersonalAIModelProvider(
-            onDeviceOverride: FakePersonalAIModelProvider(error: FakePersonalAIError(message: "fm unavailable"))
-        )
-        let result = try await provider.generate(PersonalAIGenerationRequest(
+        // Force the on-device tier to fail; the router (not the on-device
+        // provider itself any more — see `FallbackPersonalAIModelProvider`)
+        // must fall through to heuristic. Same shipping composition as
+        // `PersonalAIContainer.live`.
+        let router = FallbackPersonalAIModelProvider(tiers: [
+            .init(.onDeviceFoundationModel, OnDevicePersonalAIModelProvider(
+                onDeviceOverride: FakePersonalAIModelProvider(error: FakePersonalAIError(message: "fm unavailable"))
+            )),
+            .init(.heuristic, HeuristicPersonalAIModelProvider())
+        ])
+        let result = try await router.generate(PersonalAIGenerationRequest(
             personalContext: context, messages: [], userMessage: "The suggested replies are broken."
         ))
         #expect(result.provider == .heuristic)

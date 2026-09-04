@@ -127,7 +127,18 @@ struct PersonalAIContainer: Sendable {
                 semanticScorer: semanticScorer,
                 vectorIndex: embeddingIndex
             ),
-            modelProvider: OnDevicePersonalAIModelProvider(),
+            // Provider router — shipping behavior today is exactly what
+            // `OnDevicePersonalAIModelProvider` alone used to do (Apple
+            // Foundation Models, else heuristic), but expressed as ordered,
+            // interchangeable tiers instead of one hardcoded 2-step chain.
+            // A future capable tier (remote or local) slots in between
+            // these two without touching `PersonalAIService` or anything
+            // memory-related — heuristic stays the last, always-succeeds
+            // tier no matter how many capable tiers precede it.
+            modelProvider: FallbackPersonalAIModelProvider(tiers: [
+                .init(.onDeviceFoundationModel, OnDevicePersonalAIModelProvider()),
+                .init(.heuristic, HeuristicPersonalAIModelProvider())
+            ]),
             dataStore: dataStore,
             syncEngine: syncEngine,
             backupCoordinator: backupCoordinator,

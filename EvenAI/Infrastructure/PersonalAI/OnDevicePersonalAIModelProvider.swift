@@ -1,48 +1,81 @@
 import Foundation
 import FoundationModels
 
-/// The production `PersonalAIModelProviding`. Tries, in order:
+/// The Foundation Models tier of the Personal AI provider router — Apple
+/// on-device `LanguageModelSession`, and **only** that. Unlike its previous
+/// shape, this type no longer falls back to `HeuristicPersonalAIModelProvider`
+/// itself: on any failure it logs a content-free, Foundation-Models-specific
+/// diagnostic and **rethrows**, so a `FallbackPersonalAIModelProvider`
+/// composing this alongside other tiers (see that type) decides what happens
+/// next — the same failure here can fall through to a future remote/local
+/// tier before ever reaching heuristic, not just straight to it.
 ///
-/// 1. Apple `FoundationModels` on-device (`LanguageModelSession`), if truly
-///    available right now (iOS 26+, device eligible, Apple Intelligence on,
-///    model ready).
-/// 2. `HeuristicPersonalAIModelProvider` — always works, offline, no Apple
-///    Intelligence needed.
-///
-/// **No cloud tier.** A future cloud provider is an explicit, opt-in
-/// `PersonalAIModelProviding` wired elsewhere — this stack never silently
-/// reaches for a network. Same shape as `LocalSuggestedReplyGenerator`,
-/// including the testability override.
+/// Same shape as `LocalSuggestedReplyGenerator`, including the testability
+/// override.
 struct OnDevicePersonalAIModelProvider: PersonalAIModelProviding {
 
-    private let fallback: HeuristicPersonalAIModelProvider
     /// Test seam only — production is `nil` and uses the real
     /// `#available`-gated FoundationModels path.
     private let onDeviceOverride: (any PersonalAIModelProviding)?
 
-    init(
-        fallback: HeuristicPersonalAIModelProvider = HeuristicPersonalAIModelProvider(),
-        onDeviceOverride: (any PersonalAIModelProviding)? = nil
-    ) {
-        self.fallback = fallback
+    init(onDeviceOverride: (any PersonalAIModelProviding)? = nil) {
         self.onDeviceOverride = onDeviceOverride
     }
 
     func generate(_ request: PersonalAIGenerationRequest) async throws -> PersonalAIGenerationResult {
         if let onDeviceOverride {
-            do { return try await onDeviceOverride.generate(request) }
-            catch { return try await fallback.generate(request) }
+            return try await onDeviceOverride.generate(request)
         }
         if #available(iOS 26.0, *) {
             do {
                 return try await FoundationModelsPersonalAIProvider().generate(request)
             } catch {
-                DiagnosticTrace.log("PERSONAL_AI_MODEL_FALLBACK", "reason=\(type(of: error))")
-                return try await fallback.generate(request)
+                Self.logFailure(error)
+                throw error
             }
         }
-        DiagnosticTrace.log("PERSONAL_AI_MODEL_FALLBACK", "reason=osVersionTooOld")
-        return try await fallback.generate(request)
+        DiagnosticTrace.log(
+            "PERSONAL_AI_FM_PROVIDER",
+            "provider=onDeviceFoundationModel failureStage=osVersionCheck availability=n/a underlyingErrorType=n/a mappedError=osVersionTooOld"
+        )
+        throw PersonalAIError.modelUnavailable(reason: "this iOS version doesn't support Apple Intelligence")
+    }
+
+    /// Content-free diagnosis of *why* the real Foundation Models tier
+    /// didn't answer — structural facts only, never the prompt, memory, or
+    /// reply text. Kept inside this type deliberately: Foundation
+    /// Models-specific detail (`SystemLanguageModel.default.availability`)
+    /// belongs to the Foundation Models provider's own diagnostic boundary,
+    /// not the provider-neutral router's (see `FallbackPersonalAIModelProvider`,
+    /// which logs generic tier/outcome/category only).
+    ///
+    /// `FoundationModelsPersonalAIProvider.generate` has exactly two places
+    /// that can throw: the availability switch at its top (always surfaces
+    /// as `PersonalAIError.modelUnavailable`, built from four fixed,
+    /// app-authored `reason:` strings hardcoded right there — safe to print
+    /// in full) and `session.respond` (anything else). There is no
+    /// throwing session-creation or prompt-construction step in this SDK
+    /// usage, so this binary split is exhaustive for the current code, not
+    /// a guess.
+    ///
+    /// For a non-`PersonalAIError` (i.e. `session.respond`) failure, only
+    /// the Swift *type name* is logged — a FoundationModels SDK error's
+    /// full description is not proven free of prompt content, but a type
+    /// name is compiler-derived and cannot carry any of it.
+    @available(iOS 26.0, *)
+    private static func logFailure(_ error: Error) {
+        let availability = "\(SystemLanguageModel.default.availability)"
+        if let mapped = error as? PersonalAIError {
+            DiagnosticTrace.log(
+                "PERSONAL_AI_FM_PROVIDER",
+                "provider=onDeviceFoundationModel failureStage=availabilityCheck availability=\(availability) underlyingErrorType=\(type(of: error)) mappedError=\(mapped)"
+            )
+        } else {
+            DiagnosticTrace.log(
+                "PERSONAL_AI_FM_PROVIDER",
+                "provider=onDeviceFoundationModel failureStage=sessionRespond availability=\(availability) underlyingErrorType=\(type(of: error)) mappedError=none"
+            )
+        }
     }
 }
 

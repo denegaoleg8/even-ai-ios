@@ -75,7 +75,10 @@ final class PersonalAIService {
     init(
         store: any PersonalMemoryStore,
         contextBuilder: (any PersonalAIContextBuilding)? = nil,
-        modelProvider: any PersonalAIModelProviding = OnDevicePersonalAIModelProvider(),
+        modelProvider: any PersonalAIModelProviding = FallbackPersonalAIModelProvider(tiers: [
+            .init(.onDeviceFoundationModel, OnDevicePersonalAIModelProvider()),
+            .init(.heuristic, HeuristicPersonalAIModelProvider())
+        ]),
         conversationStore: any PersonalAIConversationStore = InMemoryPersonalAIConversationStore(),
         commandProcessor: MemoryCommandProcessor = MemoryCommandProcessor(),
         extractor: any MemoryExtracting = HeuristicMemoryExtractor(),
@@ -376,6 +379,19 @@ final class PersonalAIService {
             await conversationStore.append(assistantMessage, conversationID: conversationID)
             lastProvider = result.provider
             status = .idle
+
+            // Success-path diagnostic — content-free: which provider actually
+            // answered, whether memory was on, and the builder's own
+            // content-free trace (already just section names / counts, e.g.
+            // "retrieved=1/5", "knownProfile=1") — never user text, memory
+            // content, or the assembled system prompt. Lets a physical-device
+            // failure be distinguished as "nothing retrieved" vs "retrieved
+            // but the provider still didn't use it" without reading personal
+            // data.
+            DiagnosticTrace.log(
+                "PERSONAL_AI_CHAT",
+                "success messageID=\(userMessage.id) provider=\(result.provider.rawValue) memoryEnabled=\(memoryEnabled ? "yes" : "no") \(context.buildTrace.joined(separator: " "))"
+            )
 
             // 4. Passive extraction — only for eligible turns. This runs
             //    after the response is already visible (Phase 1 ordering),

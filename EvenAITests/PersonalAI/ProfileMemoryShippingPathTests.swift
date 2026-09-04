@@ -229,4 +229,31 @@ struct ProfileMemoryShippingPathTests {
         #expect(reply.localizedCaseInsensitiveContains("your name is") == false)
         #expect(reply.isEmpty == false)
     }
+
+    // MARK: - success-path diagnostic (content-free)
+
+    @Test("a successful turn emits a content-free PERSONAL_AI_CHAT diagnostic: provider + buildTrace metadata, never raw memory or user text")
+    func successfulTurnEmitsContentFreeDiagnostic() async throws {
+        let store = try tempStore()
+        let svc = service(store: store, provider: HeuristicPersonalAIModelProvider())
+        await svc.send("Запам'ятай: мене звати Олег.")
+        await svc.startNewConversation()
+
+        let captured = await StdoutCapture.capture {
+            await svc.send("What is my name?")
+        }
+
+        // the event fired, naming the provider that actually answered
+        #expect(captured.contains("PERSONAL_AI_CHAT"))
+        #expect(captured.contains("provider=heuristic"))
+        #expect(captured.contains("memoryEnabled=yes"))
+        // the builder's own content-free trace made it into the line
+        #expect(captured.contains("knownProfile=1"))
+        #expect(captured.range(of: #"retrieved=\d+/\d+"#, options: .regularExpression) != nil)
+
+        // never the raw fact, never the raw question, never the assembled prompt
+        #expect(captured.localizedCaseInsensitiveContains("Олег") == false)
+        #expect(captured.contains("What is my name") == false)
+        #expect(captured.contains("Known facts about the user") == false)
+    }
 }
