@@ -1,0 +1,15 @@
+{
+  "name": "evenai-personal-ai-proxy",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  // Config only — this Worker has never been deployed (`wrangler deploy`
+  // has not been run against it from this codebase). All tests run via
+  // plain `vitest` against a fake `fetch`, never Cloudflare infrastructure.
+  //
+  // OPENAI_API_KEY is a secret, never a var here — it must be set with
+  // `wrangler secret put OPENAI_API_KEY` at real-deploy time, never
+  // committed to this file or any other. APP_PROXY_SHARED_SECRET is the
+  // (dev-only, pre-production-identity) app→proxy credential described in
+  // src/auth.ts — also a secret, also never a literal value in this repo.
+  "vars": {}
+}
