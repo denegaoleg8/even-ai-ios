@@ -17,17 +17,21 @@ export interface Env {
 
 /**
  * The request body this proxy accepts — the OpenAI Responses API shape,
- * built client-side by the iOS app's `OpenAIResponsesTransport` (this
- * proxy is intentionally "thin": it authenticates, validates size, adds
- * the OpenAI key, forwards, and maps errors — it does not reshape the
- * payload). Only the fields this proxy actually inspects are declared;
- * everything else passes through in the raw body text untouched.
+ * built client-side by the iOS app's `OpenAIResponsesTransport`. `model`
+ * and `max_output_tokens` are declared `unknown`, not `string`/`number`:
+ * this proxy does not trust either from the client at all — both are
+ * resolved server-side by `src/requestPolicy.ts` regardless of what (if
+ * anything) is present here, and the outbound OpenAI request is *rebuilt*
+ * from the resolved values, never forwarded as raw body text (see
+ * `buildOutboundBody` in `src/index.ts`). Everything else in this shape
+ * (`instructions`, `input`) passes through unchanged — this proxy is
+ * otherwise intentionally "thin."
  */
 export interface OpenAIResponsesRequestBody {
-  model: string;
+  model?: unknown;
   instructions?: string;
   input: { role: string; content: string }[];
-  max_output_tokens?: number;
+  max_output_tokens?: unknown;
 }
 
 export type ProviderNeutralErrorCategory =

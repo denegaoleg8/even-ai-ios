@@ -2,15 +2,21 @@ import type { Env, OpenAIResponsesRequestBody } from "./types";
 import { isAuthorized } from "./auth";
 import { callOpenAI } from "./openai";
 import { categorizeOpenAIStatus, errorResponse, statusForCategory } from "./errors";
+import { resolveMaxOutputTokens, resolveModel } from "./requestPolicy";
 
 /**
  * `POST /personal-ai/generate` — the app-facing, provider-neutral (in
  * name and error shape) endpoint. Deliberately "thin": it authenticates
- * the app, validates size limits, forwards the already OpenAI-shaped body
- * (built by iOS's `OpenAIResponsesTransport`) to OpenAI with the real key
- * attached server-side only, and maps errors — it does not reshape the
- * request or response payload. **Never deployed from this codebase** —
- * `wrangler deploy` has not been run; all tests use a fake `fetchImpl`.
+ * the app, validates size limits, forwards the OpenAI-shaped body (built
+ * by iOS's `OpenAIResponsesTransport`) to OpenAI with the real key
+ * attached server-side only, and maps errors. It is *not* a raw
+ * pass-through for `model`/`max_output_tokens`: those two fields are
+ * always resolved server-side via `src/requestPolicy.ts` and the outbound
+ * body is rebuilt from the resolved values — the client cannot select an
+ * arbitrary vendor model or an unbounded output-token cap. Everything
+ * else in the payload passes through unreshaped. **Never deployed from
+ * this codebase** — `wrangler deploy` has not been run; all tests use a
+ * fake `fetchImpl`.
  */
 
 const MAX_REQUEST_BYTES = 32 * 1024; // generous for a chat turn + rendered context; far below a memory dump
@@ -51,14 +57,21 @@ export async function handle(request: Request, env: Env, fetchImpl: typeof fetch
   } catch {
     return errorResponse({ category: "hardFailure", reason: "malformed request body" });
   }
-  if (typeof parsed.model !== "string" || !Array.isArray(parsed.input)) {
+  if (!Array.isArray(parsed.input)) {
     return errorResponse({ category: "hardFailure", reason: "malformed request body" });
   }
+
+  // Server-side request policy applied here, and only here — see
+  // src/requestPolicy.ts. `parsed.model`/`parsed.max_output_tokens`
+  // (whatever, if anything, the client sent) are read exactly once, by
+  // `resolveModel`/`resolveMaxOutputTokens`, and never appear in the
+  // outbound body except as their resolved, policy-approved values.
+  const outboundBody = buildOutboundBody(parsed);
 
   const startedAt = Date.now();
   let result;
   try {
-    result = await callOpenAI(bodyText, env, fetchImpl);
+    result = await callOpenAI(outboundBody, env, fetchImpl);
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
       logSafely(request, statusForCategory("transientFailure"), startedAt, bodyText.length, 0);
@@ -83,6 +96,28 @@ export async function handle(request: Request, env: Env, fetchImpl: typeof fetch
 
 function byteLength(s: string): number {
   return new TextEncoder().encode(s).length;
+}
+
+/**
+ * The one place the outbound OpenAI request body is assembled — a
+ * code-level guard against ever accidentally forwarding the client's raw
+ * `model`/`max_output_tokens`. `model` and `max_output_tokens` are
+ * destructured out of `parsed` and discarded (`_clientModel`,
+ * `_clientMaxOutputTokens` are intentionally unused); `...rest` therefore
+ * cannot carry either through even if this function is edited later,
+ * and the two fields are re-added immediately after, exclusively from
+ * `resolveModel`/`resolveMaxOutputTokens`. `instructions`/`input` (and
+ * any other field the client sent) pass through in `rest` unchanged —
+ * this proxy stays a thin relay for everything except the two fields
+ * server policy owns.
+ */
+function buildOutboundBody(parsed: OpenAIResponsesRequestBody): string {
+  const { model: _clientModel, max_output_tokens: _clientMaxOutputTokens, ...rest } = parsed;
+  return JSON.stringify({
+    ...rest,
+    model: resolveModel(parsed.model),
+    max_output_tokens: resolveMaxOutputTokens(parsed.max_output_tokens)
+  });
 }
 
 /**

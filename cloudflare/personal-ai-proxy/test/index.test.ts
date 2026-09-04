@@ -129,3 +129,64 @@ describe("POST /personal-ai/generate — thin proxy contract", () => {
     expect(joined).not.toContain("dev-secret");
   });
 });
+
+describe("POST /personal-ai/generate — server-side model/output-cap policy applied to the outbound OpenAI request", () => {
+  function capturingOpenAI(text = "ok") {
+    const calls: RequestInit[] = [];
+    const fn = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      calls.push(init ?? {});
+      return new Response(
+        JSON.stringify({ output: [{ type: "message", content: [{ type: "output_text", text }] }] }),
+        { status: 200 }
+      );
+    });
+    return { fn, calls };
+  }
+
+  it("no model in the client body -> the outbound OpenAI request uses the approved default", async () => {
+    const { fn, calls } = capturingOpenAI();
+    const body = { input: [{ role: "user", content: "hi" }] }; // no `model` at all
+    const res = await handle(req(body), env, fn as unknown as typeof fetch);
+    expect(res.status).toBe(200);
+    const sent = JSON.parse(String(calls[0]?.body ?? "{}"));
+    expect(sent.model).toBe("gpt-5.4-mini");
+  });
+
+  it("an unapproved/expensive model string in the client body never reaches the outbound OpenAI request", async () => {
+    const { fn, calls } = capturingOpenAI();
+    const body = { model: "gpt-5.4-EXPENSIVE-UNAPPROVED", input: [{ role: "user", content: "hi" }] };
+    const res = await handle(req(body), env, fn as unknown as typeof fetch);
+    expect(res.status).toBe(200);
+    const sentBody = String(calls[0]?.body ?? "");
+    expect(sentBody).not.toContain("EXPENSIVE-UNAPPROVED");
+    const sent = JSON.parse(sentBody);
+    expect(sent.model).toBe("gpt-5.4-mini");
+  });
+
+  it("the approved model, explicitly sent, is honored as-is in the outbound request", async () => {
+    const { fn, calls } = capturingOpenAI();
+    const res = await handle(req(validBody), env, fn as unknown as typeof fetch);
+    expect(res.status).toBe(200);
+    const sent = JSON.parse(String(calls[0]?.body ?? "{}"));
+    expect(sent.model).toBe("gpt-5.4-mini");
+  });
+
+  it("a huge client-requested max_output_tokens is clamped in the outbound OpenAI request, never passed through", async () => {
+    const { fn, calls } = capturingOpenAI();
+    const body = { model: "gpt-5.4-mini", max_output_tokens: 1_000_000, input: [{ role: "user", content: "hi" }] };
+    const res = await handle(req(body), env, fn as unknown as typeof fetch);
+    expect(res.status).toBe(200);
+    const sent = JSON.parse(String(calls[0]?.body ?? "{}"));
+    expect(sent.max_output_tokens).toBeLessThanOrEqual(1000);
+    expect(sent.max_output_tokens).not.toBe(1_000_000);
+  });
+
+  it("instructions and input pass through to the outbound request unchanged — only model/max_output_tokens are policy-controlled", async () => {
+    const { fn, calls } = capturingOpenAI();
+    const body = { model: "gpt-5.4-mini", instructions: "known facts block", input: [{ role: "user", content: "the question" }] };
+    await handle(req(body), env, fn as unknown as typeof fetch);
+    const sent = JSON.parse(String(calls[0]?.body ?? "{}"));
+    expect(sent.instructions).toBe("known facts block");
+    expect(sent.input).toEqual([{ role: "user", content: "the question" }]);
+  });
+});
