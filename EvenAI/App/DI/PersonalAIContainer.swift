@@ -127,18 +127,22 @@ struct PersonalAIContainer: Sendable {
                 semanticScorer: semanticScorer,
                 vectorIndex: embeddingIndex
             ),
-            // Provider router — shipping behavior today is exactly what
-            // `OnDevicePersonalAIModelProvider` alone used to do (Apple
-            // Foundation Models, else heuristic), but expressed as ordered,
-            // interchangeable tiers instead of one hardcoded 2-step chain.
-            // A future capable tier (remote or local) slots in between
-            // these two without touching `PersonalAIService` or anything
-            // memory-related — heuristic stays the last, always-succeeds
-            // tier no matter how many capable tiers precede it.
-            modelProvider: FallbackPersonalAIModelProvider(tiers: [
-                .init(.onDeviceFoundationModel, OnDevicePersonalAIModelProvider()),
-                .init(.heuristic, HeuristicPersonalAIModelProvider())
-            ]),
+            // Provider router — shipping behavior is exactly Apple
+            // Foundation Models, else heuristic, UNLESS the DEBUG-only
+            // `PersonalAIRemoteDevFlag` is explicitly enabled (never true
+            // in Release; off by default in DEBUG too — see that type's
+            // doc comment), in which case a remote OpenAI tier (via the
+            // already-deployed, already end-to-end-tested proxy Worker)
+            // is tried between the two. `PersonalAIProviderComposition`
+            // owns the actual tier-building logic — this call site never
+            // needs to change again for a future capable tier.
+            modelProvider: FallbackPersonalAIModelProvider(tiers: PersonalAIProviderComposition.tiers(
+                appleProvider: OnDevicePersonalAIModelProvider(),
+                remoteEnabled: PersonalAIRemoteDevFlag.isEnabled,
+                remoteAuth: PersonalAIRemoteDevFlag.auth,
+                remoteTransport: PersonalAIRemoteDevFlag.transport,
+                heuristicProvider: HeuristicPersonalAIModelProvider()
+            )),
             dataStore: dataStore,
             syncEngine: syncEngine,
             backupCoordinator: backupCoordinator,
